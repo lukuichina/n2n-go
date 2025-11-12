@@ -3,11 +3,14 @@
 package tuntap
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"strings"
 	"syscall" // Keep for syscall.Errno check if needed
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows" // Import the windows package
@@ -21,12 +24,13 @@ import (
 // Local constants only for things not in the package (like IOCTLs or specific formats).
 const (
 	// Registry keys/values/ComponentId
-	networkAdaptersRegKey = `SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}`
-	componentIDRegValue   = "ComponentId"
-	netCfgInstanceIDValue = "NetCfgInstanceID"
-	networkAddressValue   = "NetworkAddress"
-	tapWindowsComponentID = "TAP0901" // User specified exact ComponentId
-	tapDevicePathFormat   = `\\.\Global\%s.tap`
+	networkAdaptersRegKey   = `SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}`
+	componentIDRegValue     = "ComponentId"
+	netCfgInstanceIDValue   = "NetCfgInstanceID"
+	networkAddressValue     = "NetworkAddress"
+	tapWindows11ComponentID = "tap0901" // User specified exact ComponentId
+	tapWindows10ComponentID = "root\\tap0901"
+	tapDevicePathFormat     = `\\.\Global\%s.tap`
 
 	// Address families (also in windows pkg, aliasing here is optional)
 	// AF_UNSPEC = windows.AF_UNSPEC // Use windows.AF_UNSPEC directly
@@ -168,7 +172,15 @@ func findInterfaceIndexAndInfoByGUID(guid string) (ifIndex uint32, macAddr net.H
 // findAndConfigureTapDevice (unchanged logic, check prefixes implicitly applied below)
 func findAndConfigureTapDevice(config Config) (devPath, instanceID string, ifIdx uint32, currentMAC net.HardwareAddr, err error) {
 	targetMAC := ""
+	var desiredMAC net.HardwareAddr
 	if config.MACAddress != "" {
+		desiredMAC, err = net.ParseMAC(config.MACAddress)
+		if err != nil {
+			return "", "", 0, nil, fmt.Errorf("invalid target MAC '%s': %w", config.MACAddress, err)
+		}
+		if len(desiredMAC) != 6 {
+			return "", "", 0, nil, fmt.Errorf("parsed MAC address '%s' is not 6 bytes long", config.MACAddress)
+		}
 		targetMAC, err = formatMACForRegistry(config.MACAddress)
 		if err != nil {
 			return "", "", 0, nil, fmt.Errorf("invalid target MAC: %w", err)
@@ -207,7 +219,7 @@ func findAndConfigureTapDevice(config Config) (devPath, instanceID string, ifIdx
 			continue
 		}
 		compID, _, errComp := subkey.GetStringValue(componentIDRegValue)
-		if errComp == nil && compID == tapWindowsComponentID {
+		if errComp == nil && (compID == tapWindows11ComponentID || compID == tapWindows10ComponentID) {
 			guid, _, errGuid := subkey.GetStringValue(netCfgInstanceIDValue)
 			if errGuid != nil {
 				log.Printf("Warning: Found TAP key '%s' failed get GUID: %v", subkeyName, errGuid)
@@ -223,7 +235,7 @@ func findAndConfigureTapDevice(config Config) (devPath, instanceID string, ifIdx
 		subkey.Close()
 	}
 	if !foundInRegistry {
-		return "", "", 0, nil, errors.New("no TAP adapter (ComponentId=" + tapWindowsComponentID + ") found in registry")
+		return "", "", 0, nil, errors.New("no TAP adapter (ComponentId=" + tapWindows10ComponentID + " or ComponentId=" + tapWindows10ComponentID + ") found in registry")
 	}
 	ifIdx, currentMAC, err = findInterfaceIndexAndInfoByGUID(instanceID)
 	if err != nil {
@@ -234,18 +246,83 @@ func findAndConfigureTapDevice(config Config) (devPath, instanceID string, ifIdx
 		if errOpenWrite != nil {
 			return "", "", 0, nil, fmt.Errorf("failed open key %s for write access: %w. Admin?", foundSubkeyName, errOpenWrite)
 		}
-		defer subkeyWrite.Close()
+
 		errSet := subkeyWrite.SetStringValue(networkAddressValue, targetMAC)
+		subkeyWrite.Close()
 		if errSet != nil {
 			return "", "", 0, nil, fmt.Errorf("failed write NetworkAddress=%s to key %s: %w", targetMAC, foundSubkeyName, errSet)
 		}
+
 		log.Printf("Successfully wrote NetworkAddress=%s to registry key %s.", targetMAC, foundSubkeyName)
+
+		if err := restartTapWindows(); err != nil {
+			log.Printf("Warning: failed to restart TAP adapter automatically. Error: %v", err)
+		} else {
+			var lastErr error
+			for attempt := 0; attempt < 10; attempt++ {
+				time.Sleep(600 * time.Millisecond)
+				refreshedIfIdx, refreshedMAC, lookupErr := findInterfaceIndexAndInfoByGUID(instanceID)
+				if lookupErr != nil {
+					lastErr = lookupErr
+					continue
+				}
+				if len(refreshedMAC) == 0 {
+					lastErr = fmt.Errorf("adapter GUID %s returned empty MAC during refresh", instanceID)
+					continue
+				}
+				if desiredMAC != nil && !bytes.Equal(refreshedMAC, desiredMAC) {
+					lastErr = fmt.Errorf("adapter GUID %s still reports MAC %s (expecting %s)", instanceID, refreshedMAC.String(), desiredMAC.String())
+					continue
+				}
+				ifIdx = refreshedIfIdx
+				currentMAC = refreshedMAC
+				lastErr = nil
+				log.Printf("confirmed TAP adapter GUID %s now reports MAC %s", instanceID, refreshedMAC.String())
+				break
+			}
+			if lastErr != nil {
+				log.Printf("could not confirm MAC update for TAP adapter GUID %s: %v", instanceID, lastErr)
+				if desiredMAC != nil {
+					currentMAC = append(net.HardwareAddr(nil), desiredMAC...)
+				}
+			}
+		}
 	}
 	devPath = fmt.Sprintf(tapDevicePathFormat, instanceID)
 	if devPath == "" || instanceID == "" || ifIdx == 0 {
 		return "", "", 0, nil, errors.New("internal error finalizing path/GUID/IfIndex")
 	}
 	return devPath, instanceID, ifIdx, currentMAC, nil
+}
+
+// restart tap to apply config
+func restartTapWindows() error {
+	cmd := exec.Command("powershell", "-Command",
+		`Get-NetAdapter | Where-Object {$_.InterfaceDescription -like "*TAP-Windows*"} | Select-Object -ExpandProperty Name`)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to list adapters: %v", err)
+	}
+
+	name := strings.TrimSpace(out.String())
+	if name == "" {
+		return fmt.Errorf("no TAP-Windows adapter found")
+	}
+
+	disableCmd := exec.Command("netsh", "interface", "set", "interface",
+		fmt.Sprintf("name=%s", name), "admin=disabled")
+	if err := disableCmd.Run(); err != nil {
+		return fmt.Errorf("failed to disable adapter: %v", err)
+	}
+	time.Sleep(5000)
+	enableCmd := exec.Command("netsh", "interface", "set", "interface",
+		fmt.Sprintf("name=%s", name), "admin=enabled")
+	if err := enableCmd.Run(); err != nil {
+		return fmt.Errorf("failed to enable adapter: %v", err)
+	}
+	time.Sleep(10000)
+	return nil
 }
 
 /*
