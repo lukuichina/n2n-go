@@ -12,6 +12,11 @@ import (
 )
 
 func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPWriteStrategy) (*net.UDPAddr, error) {
+	// If using WSS, always route through supernode
+	if e.WSSTransport != nil {
+		return e.SupernodeAddr, nil
+	}
+
 	var udpSocket *net.UDPAddr
 	switch strategy {
 	case p2p.UDPEnforceSupernode:
@@ -68,9 +73,21 @@ func (e *EdgeClient) WritePacket(pt spec.PacketType, dst net.HardwareAddr, paylo
 	header := e.EdgeHeader(pt, dst)
 	e.PacketsSent.Add(1)
 
-	_, err = e.Conn.WriteToUDP(protocol.PackProtoVDatagram(header, payload), udpSocket)
+	packet := protocol.PackProtoVDatagram(header, payload)
+
+	// Use WSS transport if available
+	if e.WSSTransport != nil {
+		_, err = e.WSSTransport.Write(packet, nil)
+		if err != nil {
+			return fmt.Errorf("failed to send WSS packet: %w", err)
+		}
+		return nil
+	}
+
+	// Use UDP
+	_, err = e.Conn.WriteToUDP(packet, udpSocket)
 	if err != nil {
-		return fmt.Errorf(" failed to send packet: %w", err)
+		return fmt.Errorf("failed to send UDP packet: %w", err)
 	}
 	return nil
 }
@@ -88,9 +105,21 @@ func (e *EdgeClient) SendStruct(s netstruct.PacketTyped, dst net.HardwareAddr, s
 		return err
 	}
 
-	_, err = e.Conn.WriteToUDP(protocol.PackProtoVDatagram(header, payload), udpSocket)
+	packet := protocol.PackProtoVDatagram(header, payload)
+
+	// Use WSS transport if available
+	if e.WSSTransport != nil {
+		_, err = e.WSSTransport.Write(packet, nil)
+		if err != nil {
+			return fmt.Errorf("failed to send WSS packet: %w", err)
+		}
+		return nil
+	}
+
+	// Use UDP
+	_, err = e.Conn.WriteToUDP(packet, udpSocket)
 	if err != nil {
-		return fmt.Errorf(" failed to send packet: %w", err)
+		return fmt.Errorf("failed to send UDP packet: %w", err)
 	}
 	return nil
 }
@@ -107,6 +136,17 @@ func (e *EdgeClient) SendVFuze(dst net.HardwareAddr, n int, payload []byte, stra
 	copy(packet[0:7], vfuzh[0:7])
 	copy(packet[7:], payload)
 	e.PacketsSent.Add(1)
+
+	// Use WSS transport if available
+	if e.WSSTransport != nil {
+		_, err = e.WSSTransport.Write(packet, nil)
+		if err != nil {
+			return fmt.Errorf("failed to send WSS packet: %w", err)
+		}
+		return nil
+	}
+
+	// Use UDP
 	_, err = e.Conn.WriteToUDP(packet[:totalLen], udpSocket)
 	if err != nil {
 		return err

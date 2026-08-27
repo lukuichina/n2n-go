@@ -17,6 +17,7 @@ import (
 	"n2n-go/pkg/syshosts"
 	transform "n2n-go/pkg/tranform"
 	"n2n-go/pkg/tuntap"
+	"n2n-go/pkg/transport"
 	"net"
 	"runtime"
 	"sync"
@@ -34,6 +35,7 @@ type EdgeClient struct {
 	Community     string
 	SupernodeAddr *net.UDPAddr
 	Conn          *net.UDPConn
+	WSSTransport *transport.WSSTransport
 	TAP           *tuntap.Interface
 	seq           uint32
 
@@ -140,7 +142,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		log.Fatalf("hosts file: access-denied for writing into hostsfile (community entries)")
 	}
 
-	conn, tap, snAddr, err := setupNetworkComponents(cfg, tapcfg)
+	conn, wssTransport, tap, snAddr, err := setupNetworkComponents(cfg, tapcfg)
 	if err != nil {
 		return nil, err
 	}
@@ -202,6 +204,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		Community:         cfg.Community,
 		SupernodeAddr:     snAddr,
 		Conn:              conn,
+		WSSTransport:      wssTransport,
 		TAP:               tap,
 		Mgmt:              mgmtServer,
 		seq:               0,
@@ -279,6 +282,12 @@ func (e *EdgeClient) Close() {
 	e.cancel()
 
 	// Force read operations to unblock
+	if e.WSSTransport != nil {
+		if err := e.WSSTransport.Close(); err != nil {
+			log.Printf("Error closing WSS transport: %v", err)
+		}
+	}
+
 	if e.Conn != nil {
 		e.Conn.SetReadDeadline(time.Now())
 	}
@@ -290,6 +299,12 @@ func (e *EdgeClient) Close() {
 	if e.TAP != nil {
 		if err := e.TAP.Close(); err != nil {
 			log.Printf("Error closing TAP interface: %v", err)
+		}
+	}
+
+	if e.WSSTransport != nil {
+		if err := e.WSSTransport.Close(); err != nil {
+			log.Printf("Error closing WSS transport: %v", err)
 		}
 	}
 
@@ -334,4 +349,25 @@ func (e *EdgeClient) ProcessOutgoingPayload(payload []byte) ([]byte, error) {
 
 func (e *EdgeClient) ProcessIncomingPayload(payload []byte) ([]byte, error) {
 	return e.payloadProcessor.ParseInput(payload)
+}
+// EdgeClient helper methods for WSS/UDP compatibility
+
+func (e *EdgeClient) setReadDeadline(t time.Time) error {
+	if e.WSSTransport != nil {
+		return e.WSSTransport.SetReadDeadline(t)
+	}
+	if e.Conn != nil {
+		return e.Conn.SetReadDeadline(t)
+	}
+	return fmt.Errorf("no transport available")
+}
+
+func (e *EdgeClient) readPacket(buf []byte) (int, net.Addr, error) {
+	if e.WSSTransport != nil {
+		return e.WSSTransport.Read(buf)
+	}
+	if e.Conn != nil {
+		return e.Conn.ReadFromUDP(buf)
+	}
+	return 0, nil, fmt.Errorf("no transport available")
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/urfave/cli/v2"
@@ -31,6 +32,27 @@ var (
 				Name:    "stdout-log",
 				Aliases: []string{"l"},
 				Usage:   "stdout-log",
+			},
+			&cli.StringFlag{
+				Name:    "supernode-url",
+				Aliases: []string{"u"},
+				Usage:   "Supernode URL (ws:// or wss://)",
+			},
+			&cli.StringFlag{
+				Name:    "wss-cert",
+				Usage:   "WSS client certificate file",
+			},
+			&cli.StringFlag{
+				Name:    "wss-key",
+				Usage:   "WSS client key file",
+			},
+			&cli.BoolFlag{
+				Name:    "wss",
+				Usage:   "Enable WSS connection to supernode",
+			},
+			&cli.BoolFlag{
+				Name:    "ws",
+				Usage:   "Enable WS connection to supernode",
 			},
 			// --- Common Options ---
 
@@ -72,6 +94,29 @@ func up(c *cli.Context) {
 		}
 	}
 
+	// Override config with CLI flags if set
+	if c.IsSet("supernode-url") {
+		cfg.SupernodeURL = c.String("supernode-url")
+		// Auto-enable WS/WSS when SupernodeURL is set via CLI
+		if strings.HasPrefix(cfg.SupernodeURL, "wss://") {
+			cfg.WSSEnabled = true
+		} else if strings.HasPrefix(cfg.SupernodeURL, "ws://") {
+			cfg.WSEnabled = true
+		}
+	}
+	if c.IsSet("wss-cert") {
+		cfg.WSSCert = c.String("wss-cert")
+	}
+	if c.IsSet("wss-key") {
+		cfg.WSSKey = c.String("wss-key")
+	}
+	if c.IsSet("ws") {
+		cfg.WSEnabled = c.Bool("ws")
+	}
+	if c.IsSet("wss") {
+		cfg.WSSEnabled = c.Bool("wss")
+	}
+
 	client, err := edge.NewEdgeClient(*cfg) // Pass the config struct
 	if err != nil {
 		log.Fatalf("Failed to create edge client: %v", err)
@@ -92,9 +137,16 @@ func up(c *cli.Context) {
 		os.Exit(127)
 	}
 	log.Printf("edge setup successful")
-	udpPort := client.Conn.LocalAddr().(*net.UDPAddr).Port
-	log.Printf("edge %s registered on local UDP port %d. TAP interface: %s",
-		cfg.EdgeID, udpPort, cfg.TapName)
+	
+	if client.WSSTransport != nil {
+		log.Printf("edge %s registered via WSS to %s. TAP interface: %s",
+			cfg.EdgeID, cfg.SupernodeURL, cfg.TapName)
+	} else {
+		udpPort := client.Conn.LocalAddr().(*net.UDPAddr).Port
+		log.Printf("edge %s registered on local UDP port %d. TAP interface: %s",
+			cfg.EdgeID, udpPort, cfg.TapName)
+	}
+	
 	headerFormat := "protoV"
 	log.Printf("Using %s header format - protocol v%d", headerFormat, client.ProtocolVersion())
 	log.Printf("edge node is running. Press Ctrl+C to stop.")

@@ -2,15 +2,21 @@ package supernode
 
 import (
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+
 	"n2n-go/pkg/buffers"
 	"n2n-go/pkg/crypto"
 	"n2n-go/pkg/log"
 	"n2n-go/pkg/protocol"
 	"n2n-go/pkg/protocol/spec"
-	"net"
-	"strings"
-	"sync"
-	"time"
+	"n2n-go/pkg/transport"
 )
 
 // Supernode holds registered edges, VIP pools, and a MAC-to-edge mapping.
@@ -42,6 +48,10 @@ type Supernode struct {
 	SnMessageHandlers protocol.MessageHandlerMap
 
 	SNSecrets *crypto.SNSecrets
+
+	// WSS support
+	wssConnections    map[string]*transport.WSSTransport
+	wssConnectionsMu  sync.RWMutex
 }
 
 func (s *Supernode) MacADDR() net.HardwareAddr {
@@ -87,6 +97,9 @@ func NewSupernodeWithConfig(conn *net.UDPConn, config *Config) *Supernode {
 		packetBufPool:     buffers.PacketBufferPool,
 		SnMessageHandlers: make(protocol.MessageHandlerMap),
 		SNSecrets:         secrets,
+
+		// WSS support
+		wssConnections: make(map[string]*transport.WSSTransport),
 	}
 
 	sn.SnMessageHandlers[spec.TypeRegisterRequest] = sn.handleRegisterMessage
@@ -117,7 +130,7 @@ func (s *Supernode) debugLog(format string, args ...interface{}) {
 }
 
 // ProcessPacket processes an incoming packet
-func (s *Supernode) ProcessPacket(packet []byte, addr *net.UDPAddr) {
+func (s *Supernode) ProcessPacket(packet []byte, addr net.Addr) {
 
 	s.stats.PacketsProcessed.Add(1)
 	if packet[0] == protocol.VersionVFuze {
@@ -139,8 +152,12 @@ func (s *Supernode) ProcessPacket(packet []byte, addr *net.UDPAddr) {
 			log.Printf("Supernode: Error from SnMessageHandler[%s]: %v", rawMsg.Header.PacketType.String(), err)
 		}
 		if errors.Is(err, ErrCommunityUnknownEdge) || errors.Is(err, ErrCommunityNotFound) {
-			log.Printf("Supernode: sending RetryRegisterRequest to addr:%s", addr.IP)
-			s.WritePacket(spec.TypeRetryRegisterRequest, "", nil, nil, addr)
+			log.Printf("Supernode: sending RetryRegisterRequest to addr:%s", addr.String())
+			if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		s.WritePacket(spec.TypeRetryRegisterRequest, "", nil, nil, udpAddr)
+	} else {
+		log.Printf("Supernode: cannot send packet to non-UDP address: %T", addr)
+	}
 		}
 	}
 }
@@ -199,6 +216,16 @@ func (s *Supernode) Listen() {
 		}
 	}()
 
+	// Start WS listener if enabled
+	if s.config.WSEnabled {
+		go s.startWSListener()
+	}
+
+	// Start WSS listener if enabled
+	if s.config.WSSEnabled {
+		go s.startWSSListener()
+	}
+
 	// Block until shutdown
 	<-s.shutdownCh
 }
@@ -210,9 +237,147 @@ type packetData struct {
 	addr *net.UDPAddr
 }
 
+// startWSSListener starts the WSS listener
+func (s *Supernode) startWSSListener() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		s.handleWSSUpgrade(w, r)
+	})
+
+	server := &http.Server{
+		Addr:    s.config.WSSListenAddr,
+		Handler: mux,
+	}
+
+	log.Printf("Supernode: Starting WSS listener on %s", s.config.WSSListenAddr)
+	if err := server.ListenAndServeTLS(s.config.WSSCert, s.config.WSSKey); err != nil {
+		log.Printf("Supernode: WSS listener error: %v", err)
+	}
+}
+
+// startWSListener starts the WS (plain text) listener
+func (s *Supernode) startWSListener() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		s.handleWSUpgrade(w, r)
+	})
+
+	server := &http.Server{
+		Addr:    s.config.WSListenAddr,
+		Handler: mux,
+	}
+
+	log.Printf("Supernode: Starting WS listener on %s", s.config.WSListenAddr)
+	if err := server.ListenAndServe(); err != nil {
+		log.Printf("Supernode: WS listener error: %v", err)
+	}
+}
+
+// handleWSUpgrade handles WebSocket upgrade requests (plain text)
+func (s *Supernode) handleWSUpgrade(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins
+		},
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Supernode: WS upgrade failed: %v", err)
+		return
+	}
+
+	// Create WSS transport (same as TLS, just different listener)
+	transport := transport.NewWSSTransportFromConn(conn)
+	connID := fmt.Sprintf("ws-%s", conn.RemoteAddr().String())
+
+	// Store connection
+	s.wssConnectionsMu.Lock()
+	s.wssConnections[connID] = transport
+	s.wssConnectionsMu.Unlock()
+
+	log.Printf("Supernode: New WS connection from %s (ID: %s)", conn.RemoteAddr(), connID)
+
+	// Handle the WS connection
+	go s.handleWSSConnection(transport, connID)
+}
+
+// handleWSSUpgrade handles WebSocket upgrade requests
+func (s *Supernode) handleWSSUpgrade(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins
+		},
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Supernode: WSS upgrade failed: %v", err)
+		return
+	}
+
+	// Create WSS transport
+	transport := transport.NewWSSTransportFromConn(conn)
+	connID := fmt.Sprintf("wss-%s", conn.RemoteAddr().String())
+
+	// Store connection
+	s.wssConnectionsMu.Lock()
+	s.wssConnections[connID] = transport
+	s.wssConnectionsMu.Unlock()
+
+	log.Printf("Supernode: New WSS connection from %s (ID: %s)", conn.RemoteAddr(), connID)
+
+	// Handle the WSS connection
+	go s.handleWSSConnection(transport, connID)
+}
+
+// handleWSSConnection handles a single WSS connection
+func (s *Supernode) handleWSSConnection(transport *transport.WSSTransport, connID string) {
+	defer func() {
+		transport.Close()
+		s.wssConnectionsMu.Lock()
+		delete(s.wssConnections, connID)
+		s.wssConnectionsMu.Unlock()
+		log.Printf("Supernode: WSS connection closed: %s", connID)
+	}()
+
+	// Main receive loop for this WSS connection
+	for {
+		buf := s.packetBufPool.Get()
+		n, _, err := transport.Read(buf)
+		if err != nil {
+			log.Printf("Supernode: WSS read error from %s: %v", connID, err)
+			s.packetBufPool.Put(buf)
+			return
+		}
+
+		// Create a WSS address for the connection
+		addr := &wssAddr{connID: connID}
+
+		s.debugLog("WSS received %d bytes from %s", n, connID)
+
+		// Process the packet
+		s.ProcessPacket(buf[:n], addr)
+		s.packetBufPool.Put(buf)
+	}
+}
+
 // Shutdown performs a clean shutdown of the supernode
 func (s *Supernode) Shutdown() {
 	close(s.shutdownCh)
 	s.shutdownWg.Wait()
 	log.Printf("Supernode: Shutdown complete")
+}
+
+// wssAddr is a custom net.Addr implementation for WSS connections
+type wssAddr struct {
+	connID string
+}
+
+func (a *wssAddr) Network() string {
+	return "wss"
+}
+
+func (a *wssAddr) String() string {
+	return a.connID
 }

@@ -7,6 +7,7 @@ import (
 	"n2n-go/pkg/p2p"
 	"n2n-go/pkg/protocol"
 	"n2n-go/pkg/protocol/netstruct"
+	"n2n-go/pkg/transport"
 	"n2n-go/pkg/tuntap"
 	"net"
 	"strconv"
@@ -14,25 +15,148 @@ import (
 	"time"
 )
 
-// setupNetworkComponents initializes the UDP connection and TAP interface
-func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tuntap.Interface, *net.UDPAddr, error) {
-	snAddr, err := net.ResolveUDPAddr("udp4", cfg.SupernodeAddr)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf(" failed to resolve supernode address: %w", err)
+// setupNetworkComponents initializes the network connection and TAP interface
+func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *transport.WSSTransport, *tuntap.Interface, *net.UDPAddr, error) {
+	var snAddr *net.UDPAddr
+	var conn *net.UDPConn
+	var wsTransport *transport.WSSTransport
+	var wssTransport *transport.WSSTransport
+	var tap *tuntap.Interface
+	var err error
+
+	// log.Printf("DEBUG: entering setupNetworkComponents, WSEnabled=%v, WSSEnabled=%v, SupernodeURL=%q, SupernodeAddr=%q", cfg.WSEnabled, cfg.WSSEnabled, cfg.SupernodeURL, cfg.SupernodeAddr)
+
+	// Check if WS is enabled
+	if cfg.WSEnabled && cfg.SupernodeURL != "" {
+		// log.Printf("DEBUG: taking WS branch")
+		
+		wsConfig := &transport.WSSTransportConfig{
+			URL:         cfg.SupernodeURL,
+			SkipVerify:  true, // TODO: Make this configurable
+			ReadTimeout: 30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+		}
+
+		wsTransport, err = transport.NewWSSTransport(wsConfig)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("failed to establish WS connection: %w", err)
+		}
+
+		log.Printf("WS connection established to %s", cfg.SupernodeURL)
+		
+		// For WS, we need a UDP address for the supernode for registration/communication
+		// Use SupernodeAddr if available, otherwise derive from SupernodeURL
+		var host string
+		if cfg.SupernodeAddr != "" {
+			host = cfg.SupernodeAddr
+		} else {
+			host = cfg.SupernodeURL
+			if strings.HasPrefix(host, "ws://") {
+				host = strings.TrimPrefix(host, "ws://")
+			}
+			if idx := strings.Index(host, "/"); idx >= 0 {
+				host = host[:idx]
+			}
+			if !strings.Contains(host, ":") {
+				host = host + ":8080"
+			}
+		}
+		
+		// log.Printf("DEBUG: resolving UDP address for host: %q", host)
+		snAddr, err = net.ResolveUDPAddr("udp4", host)
+		if err != nil {
+			wsTransport.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to resolve supernode address: %w", err)
+		}
+
+		// For WS, we still need TAP interface
+		tap, err = tuntap.NewInterface(tapcfg)
+		if err != nil {
+			wsTransport.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to create TAP interface: %w", err)
+		}
+
+		return nil, wsTransport, tap, snAddr, nil
 	}
 
-	conn, err := setupUDPConnection(cfg.LocalPort, cfg.UDPBufferSize)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf(" %w", err)
+	// Check if WSS is enabled
+	if cfg.WSSEnabled && cfg.SupernodeURL != "" {
+		// log.Printf("DEBUG: taking WSS branch")
+		
+		wssConfig := &transport.WSSTransportConfig{
+			URL:         cfg.SupernodeURL,
+			SkipVerify:  true, // TODO: Make this configurable
+			ReadTimeout: 30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+		}
+
+		if cfg.WSSCert != "" && cfg.WSSKey != "" {
+			wssConfig.CertFile = cfg.WSSCert
+			wssConfig.KeyFile = cfg.WSSKey
+		}
+
+		wssTransport, err = transport.NewWSSTransport(wssConfig)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("failed to establish WSS connection: %w", err)
+		}
+
+		log.Printf("WSS connection established to %s", cfg.SupernodeURL)
+		
+		// For WSS, we need a UDP address for the supernode for registration/communication
+		// Use SupernodeAddr if available, otherwise derive from SupernodeURL
+		var host string
+		if cfg.SupernodeAddr != "" {
+			host = cfg.SupernodeAddr
+		} else {
+			host = cfg.SupernodeURL
+			if strings.HasPrefix(host, "wss://") {
+				host = strings.TrimPrefix(host, "wss://")
+			}
+			if idx := strings.Index(host, "/"); idx >= 0 {
+				host = host[:idx]
+			}
+			if !strings.Contains(host, ":") {
+				host = host + ":443"
+			}
+		}
+		
+		// log.Printf("DEBUG: resolving UDP address for host: %q", host)
+		snAddr, err = net.ResolveUDPAddr("udp4", host)
+		if err != nil {
+			wssTransport.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to resolve supernode address: %w", err)
+		}
+
+		// For WSS, we still need TAP interface
+		tap, err = tuntap.NewInterface(tapcfg)
+		if err != nil {
+			wssTransport.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to create TAP interface: %w", err)
+		}
+
+		return nil, wssTransport, tap, snAddr, nil
 	}
 
-	tap, err := tuntap.NewInterface(tapcfg)
+	// log.Printf("DEBUG: taking UDP branch, SupernodeAddr=%q", cfg.SupernodeAddr)
+
+	// Traditional UDP mode
+	snAddr, err = net.ResolveUDPAddr("udp4", cfg.SupernodeAddr)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf(" failed to resolve supernode address: %w", err)
+	}
+
+	conn, err = setupUDPConnection(cfg.LocalPort, cfg.UDPBufferSize)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf(" %w", err)
+	}
+
+	tap, err = tuntap.NewInterface(tapcfg)
 	if err != nil {
 		conn.Close() // Clean up on error
-		return nil, nil, nil, fmt.Errorf(" failed to create TAP interface: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf(" failed to create TAP interface: %w", err)
 	}
 
-	return conn, tap, snAddr, nil
+	return conn, nil, tap, snAddr, nil
 }
 
 // setupUDPConnection creates and configures a UDP connection with the specified parameters
@@ -87,7 +211,7 @@ func (e *EdgeClient) InitialGetSNPublicKey() error {
 		return err
 	}
 	// Set a timeout for the response
-	if err := e.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := e.setReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf(" failed to set read deadline: %w", err)
 	}
 
@@ -95,13 +219,13 @@ func (e *EdgeClient) InitialGetSNPublicKey() error {
 	respBuf := e.packetBufPool.Get()
 	defer e.packetBufPool.Put(respBuf)
 
-	n, addr, err := e.Conn.ReadFromUDP(respBuf)
+	n, addr, err := e.readPacket(respBuf)
 	if err != nil {
 		return fmt.Errorf(" pubkey ACK timeout: %w", err)
 	}
 
 	// Reset deadline
-	if err := e.Conn.SetReadDeadline(time.Time{}); err != nil {
+	if err := e.setReadDeadline(time.Time{}); err != nil {
 		return fmt.Errorf(" failed to reset read deadline: %w", err)
 	}
 
@@ -132,7 +256,7 @@ func (e *EdgeClient) InitialRegister() error {
 	}
 
 	// Set a timeout for the response
-	if err := e.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := e.setReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf(" failed to set read deadline: %w", err)
 	}
 
@@ -140,13 +264,13 @@ func (e *EdgeClient) InitialRegister() error {
 	respBuf := e.packetBufPool.Get()
 	defer e.packetBufPool.Put(respBuf)
 
-	n, addr, err := e.Conn.ReadFromUDP(respBuf)
+	n, addr, err := e.readPacket(respBuf)
 	if err != nil {
 		return fmt.Errorf(" registration ACK timeout: %w", err)
 	}
 
 	// Reset deadline
-	if err := e.Conn.SetReadDeadline(time.Time{}); err != nil {
+	if err := e.setReadDeadline(time.Time{}); err != nil {
 		return fmt.Errorf(" failed to reset read deadline: %w", err)
 	}
 
@@ -186,7 +310,7 @@ func (e *EdgeClient) sendGratuitousARP() error {
 
 func (e *EdgeClient) TunUp() error {
 	if e.VirtualIP == "" {
-		return fmt.Errorf("cannot configure TAP link before VirtualIP is set")
+		return fmt.Errorf("cannot configure TAP link before VirtualIP is not set")
 	}
 	return e.TAP.IfUp(e.VirtualIP)
 }

@@ -196,6 +196,11 @@ func (e *EdgeClient) handleTAP() {
 
 // handleUDP reads packets from the UDP connection and writes the payload to the TAP interface.
 func (e *EdgeClient) handleUDP() {
+	// If using WSS, handle WSS packets instead
+	if e.WSSTransport != nil {
+		e.handleWSS()
+		return
+	}
 	e.wg.Add(1)
 	defer e.wg.Done()
 
@@ -252,6 +257,71 @@ func (e *EdgeClient) handleUDP() {
 				return
 			}
 			log.Printf("Error from messageHandler: %v", err)
+		}
+	}
+}
+
+func (e *EdgeClient) handleWSS() {
+	e.wg.Add(1)
+	defer e.wg.Done()
+
+	log.Printf("Starting WSS packet handler")
+
+	// Preallocate buffer for receiving packets
+	packetBuf := e.packetBufPool.Get()
+	defer e.packetBufPool.Put(packetBuf)
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		default:
+			// Continue processing
+		}
+		n, addr, err := e.WSSTransport.Read(packetBuf)
+		if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Printf("WSS read error: %v", err)
+			continue
+		}
+
+		e.PacketsRecv.Add(1)
+
+		if packetBuf[0] == protocol.VersionVFuze {
+			udpAddr, _ := addr.(*net.UDPAddr)
+			err = e.handleVFuzePacket(packetBuf, n, udpAddr)
+			if err != nil {
+				if strings.Contains(err.Error(), "file already closed") {
+					return
+				}
+				log.Printf("handleVFuzePacket Error: %v", err)
+			}
+			continue
+		}
+
+		if n < protocol.ProtoVHeaderSize {
+			log.Printf("Received WSS packet too short from %v: %q", addr, string(packetBuf[:n]))
+			continue
+		}
+
+		udpAddr, _ := addr.(*net.UDPAddr)
+		rawMsg, err := protocol.NewRawMessage(packetBuf[:n], udpAddr)
+		if err != nil {
+			log.Printf("error while parsing WSS Packet: %v", err)
+			continue
+		}
+
+		err = e.messageHandlers.Handle(rawMsg)
+		if err != nil {
+			if strings.Contains(err.Error(), "file already closed") {
+				return
+			}
+			log.Printf("Error from WSS messageHandler: %v", err)
 		}
 	}
 }

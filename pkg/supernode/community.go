@@ -15,6 +15,37 @@ import (
 	"github.com/cjbrigato/ippool"
 )
 
+
+
+// Helper functions to extract IP and Port from net.Addr
+func addrToIP(addr net.Addr) (net.IP, bool) {
+    if addr == nil {
+        return nil, false
+    }
+    switch a := addr.(type) {
+    case *net.UDPAddr:
+        return a.IP, true
+    case *net.TCPAddr:
+        return a.IP, true
+    default:
+        return nil, false
+    }
+}
+
+func addrToPort(addr net.Addr) (int, bool) {
+    if addr == nil {
+        return 0, false
+    }
+    switch a := addr.(type) {
+    case *net.UDPAddr:
+        return a.Port, true
+    case *net.TCPAddr:
+        return a.Port, true
+    default:
+        return 0, false
+    }
+}
+
 type EdgeAddressable interface {
 	EdgeMACAddr() string
 	CommunityHash() uint32
@@ -202,12 +233,25 @@ func (c *Community) RefreshEdge(hbMsg *protocol.Message[*netstruct.HeartbeatPuls
 	}
 	oldPort := edge.PublicPort
 	oldPublicIP := edge.PublicIP
-	edge.PublicIP = hbMsg.FromAddr.IP
-	edge.PublicPort = hbMsg.FromAddr.Port
+	if ip, ok := addrToIP(hbMsg.FromAddr); ok {
+		edge.PublicIP = ip
+	} else {
+		edge.PublicIP = net.ParseIP(hbMsg.FromAddr.String())
+	}
+	if port, ok := addrToPort(hbMsg.FromAddr); ok {
+		edge.PublicPort = port
+	} else {
+		edge.PublicPort = 0
+	}
 	edge.LastHeartbeat = time.Now()
 	edge.LastSequence = hbMsg.Header.Sequence
 	c.debugLog("Refreshed edge:%s from HeartBeat", c.name, hbMsg.EdgeMACAddr)
-	return (oldPort != hbMsg.FromAddr.Port) || (!oldPublicIP.Equal(hbMsg.FromAddr.IP)), nil
+	newPort, _ := addrToPort(hbMsg.FromAddr)
+		newIP, _ := addrToIP(hbMsg.FromAddr)
+		if newIP == nil {
+			newIP = net.ParseIP(hbMsg.FromAddr.String())
+		}
+		return (oldPort != newPort) || (!oldPublicIP.Equal(newIP)), nil
 }
 
 // EdgeUpdate registers a new edge or updates an existing one
@@ -235,8 +279,8 @@ func (c *Community) EdgeUpdate(regMsg *protocol.Message[*netstruct.RegisterReque
 		// Create new edge
 		edge = &Edge{
 			Desc:          regMsg.Msg.EdgeDesc,
-			PublicIP:      regMsg.FromAddr.IP,
-			PublicPort:    regMsg.FromAddr.Port,
+			PublicIP:      net.IP{},
+			PublicPort:    0,
 			Community:     c.name,
 			VirtualIP:     vip,
 			VNetMaskLen:   c.maskLen,
@@ -244,6 +288,13 @@ func (c *Community) EdgeUpdate(regMsg *protocol.Message[*netstruct.RegisterReque
 			LastSequence:  regMsg.Header.Sequence,
 			MACAddr:       regMsg.EdgeMACAddr(),
 			MachineID:     regMsg.Msg.ClearMachineID,
+		}
+
+		if ip, ok := addrToIP(regMsg.FromAddr); ok {
+			edge.PublicIP = ip
+		}
+		if port, ok := addrToPort(regMsg.FromAddr); ok {
+			edge.PublicPort = port
 		}
 
 		c.edges[regMsg.Msg.EdgeMACAddr] = edge
@@ -259,8 +310,12 @@ func (c *Community) EdgeUpdate(regMsg *protocol.Message[*netstruct.RegisterReque
 		}
 
 		// Update edge information
-		edge.PublicIP = regMsg.FromAddr.IP
-		edge.PublicPort = regMsg.FromAddr.Port
+		if ip, ok := addrToIP(regMsg.FromAddr); ok {
+		edge.PublicIP = ip
+	}
+		if port, ok := addrToPort(regMsg.FromAddr); ok {
+		edge.PublicPort = port
+	}
 		edge.LastHeartbeat = time.Now()
 		edge.LastSequence = regMsg.Header.Sequence
 

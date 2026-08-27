@@ -30,6 +30,9 @@ type Edge struct {
 	LastSequence  uint16     // Last sequence number received
 	MACAddr       string     // MAC address provided during registration
 	MachineID     []byte
+
+	// WSS support
+	WSSConnID string // WSS connection ID, empty if using UDP
 }
 
 func (e *Edge) UDPAddr() *net.UDPAddr {

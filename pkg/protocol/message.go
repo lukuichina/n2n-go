@@ -13,7 +13,7 @@ import (
 type RawMessage struct {
 	Header    *ProtoVHeader
 	Payload   []byte
-	FromAddr  *net.UDPAddr
+	FromAddr  net.Addr
 	rawPacket []byte
 }
 
@@ -84,7 +84,7 @@ func FlagPacketFromSupernode(packet []byte) ([]byte, error) {
 	return PackProtoVDatagram(header, payload), nil
 }
 
-func NewRawMessage(packet []byte, addr *net.UDPAddr) (*RawMessage, error) {
+func NewRawMessage(packet []byte, addr net.Addr) (*RawMessage, error) {
 
 	header, payload, err := UnpackProtoVDatagram(packet)
 	if err != nil {
@@ -169,7 +169,7 @@ func Encode[T any](s T) ([]byte, error) {
 	return codec.NewCodec[T]().Encode(s)
 }
 
-func MessageFromPacket[T netstruct.PacketTyped](packet []byte, addr *net.UDPAddr) (*Message[T], error) {
+func MessageFromPacket[T netstruct.PacketTyped](packet []byte, addr net.Addr) (*Message[T], error) {
 	rawMsg, err := NewRawMessage(packet, addr)
 	if err != nil {
 		return nil, fmt.Errorf(" error while parsing MessageFromPacket: %w", err)

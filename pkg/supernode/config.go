@@ -1,4 +1,4 @@
-// pkg/supernode/config.go (Modified)
+// pkg/supernode/config.go
 package supernode
 
 import (
@@ -19,12 +19,23 @@ type Config struct {
 	StrictHashChecking  bool          `mapstructure:"strict_hash_checking"`
 	EnableVFuze         bool          `mapstructure:"enable_vfuze"`
 	ListenAddr          string        `mapstructure:"listen_address"` // Listen address
-	ConfigFile          string        `mapstructure:"config_file"`    //Path to config
+
+	// WS configuration
+	WSEnabled      bool   `mapstructure:"ws_enabled" env:"N2N_WS_ENABLED"`
+	WSListenAddr   string `mapstructure:"ws_listen_addr" env:"N2N_WS_LISTEN_ADDR" default:":8080"`
+
+	// WSS configuration
+	WSSEnabled     bool   `mapstructure:"wss_enabled" env:"N2N_WSS_ENABLED"`
+	WSSCert        string `mapstructure:"wss_cert" env:"N2N_WSS_CERT"`
+	WSSKey         string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
+	WSSListenAddr  string `mapstructure:"wss_listen_addr" env:"N2N_WSS_LISTEN_ADDR" default:":443"`
+
+	ConfigFile string `mapstructure:"config_file"` //Path to config
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		Debug:               false,
+		Debug:               true,
 		CommunitySubnet:     "10.128.0.0",
 		CommunitySubnetCIDR: 24,
 		ExpiryDuration:      10 * time.Minute,
@@ -34,6 +45,16 @@ func DefaultConfig() *Config {
 		EnableVFuze:         true,
 		ListenAddr:          ":7777", // Default listen address
 		ConfigFile:          "supernode.yaml",
+
+		// WS defaults
+		WSEnabled:     false,
+		WSListenAddr:  ":8080",
+
+		// WSS defaults
+		WSSEnabled:    false,
+		WSSCert:       "",
+		WSSKey:        "",
+		WSSListenAddr: ":443",
 	}
 }
 
@@ -65,6 +86,16 @@ func LoadConfig() (*Config, error) {
 	flag.BoolVar(&cfg.EnableVFuze, "enableFuze", cfg.EnableVFuze, "enable fuze fastpath")
 	flag.StringVar(&cfg.CommunitySubnet, "subnet", cfg.CommunitySubnet, "Base subnet for communities")
 	flag.IntVar(&cfg.CommunitySubnetCIDR, "subnetcidr", cfg.CommunitySubnetCIDR, "CIDR prefix length for community subnets")
+
+	// WS flags
+	flag.BoolVar(&cfg.WSEnabled, "ws", cfg.WSEnabled, "Enable WS listener")
+	flag.StringVar(&cfg.WSListenAddr, "ws-listen", cfg.WSListenAddr, "WS listen address")
+
+	// WSS flags
+	flag.BoolVar(&cfg.WSSEnabled, "wss", cfg.WSSEnabled, "Enable WSS listener")
+	flag.StringVar(&cfg.WSSCert, "wss-cert", cfg.WSSCert, "WSS certificate file")
+	flag.StringVar(&cfg.WSSKey, "wss-key", cfg.WSSKey, "WSS key file")
+	flag.StringVar(&cfg.WSSListenAddr, "wss-listen", cfg.WSSListenAddr, "WSS listen address")
 
 	flag.Parse() // Parse the flags!
 

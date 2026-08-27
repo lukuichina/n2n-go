@@ -46,7 +46,7 @@ func (s *Supernode) ForwardWithFallBack(r *protocol.RawMessage) error {
 			return nil
 		}
 	}
-	s.debugLog("Unable to selectively forward packet orNo destination MAC provided. Broadcasting to community %s", cm.name)
+	s.debugLog("Unable to selectively forward packet orNo destination MAC provided. Broadcasting to community %s", cm.Name())
 	s.broadcast(r.RawPacket(), cm, r.EdgeMACAddr())
 	return nil
 }
@@ -60,6 +60,21 @@ func (s *Supernode) forwardPacket(packet []byte, target *Edge) error {
 			return err
 		}
 	}
+
+	// Check if target is using WSS
+	if target.WSSConnID != "" {
+		s.wssConnectionsMu.RLock()
+		wssTransport, found := s.wssConnections[target.WSSConnID]
+		s.wssConnectionsMu.RUnlock()
+		if !found {
+			return fmt.Errorf("WSS connection not found: %s", target.WSSConnID)
+		}
+		s.debugLog("Forwarding WSS packet to edge %s (conn: %s)", target.MACAddr, target.WSSConnID)
+		_, err = wssTransport.Write(packet, nil)
+		return err
+	}
+
+	// Use UDP
 	addr := target.UDPAddr()
 	s.debugLog("Forwarding packet to edge %s at %v", target.MACAddr, addr)
 	_, err = s.Conn.WriteToUDP(packet, addr)
@@ -90,13 +105,41 @@ func (s *Supernode) broadcast(packet []byte, cm *Community, senderID string) {
 	}
 }
 
-func (s *Supernode) WritePacket(pt spec.PacketType, community string, dst net.HardwareAddr, payload []byte, addr *net.UDPAddr) error {
+func (s *Supernode) WritePacket(pt spec.PacketType, community string, dst net.HardwareAddr, payload []byte, addr net.Addr) error {
 
 	header := s.SNHeader(pt, community, dst)
 
-	_, err := s.Conn.WriteToUDP(protocol.PackProtoVDatagram(header, payload), addr)
-	if err != nil {
-		return fmt.Errorf(" failed to send packet: %w", err)
+	// Check if this is a WSS connection
+	if addr != nil {
+		// Try to find edge by address
+		s.edgeMu.RLock()
+		var targetEdge *Edge
+		for _, edge := range s.edgesByMAC {
+			if edge.WSSConnID != "" && s.wssConnections[edge.WSSConnID] != nil {
+				// For WSS, we need to match by some identifier
+				// For now, we'll use the address string
+				if edge.WSSConnID == addr.String() {
+					targetEdge = edge
+					break
+				}
+			}
+		}
+		s.edgeMu.RUnlock()
+
+		if targetEdge != nil {
+			packet := protocol.PackProtoVDatagram(header, payload)
+			return s.forwardPacket(packet, targetEdge)
+		}
+	}
+
+	// Only send UDP if we have a UDP address
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		_, err := s.Conn.WriteToUDP(protocol.PackProtoVDatagram(header, payload), udpAddr)
+		if err != nil {
+			return fmt.Errorf(" failed to send packet: %w", err)
+		}
+	} else if addr != nil {
+		return fmt.Errorf("cannot send UDP packet to non-UDP address: %T", addr)
 	}
 	return nil
 }
@@ -122,16 +165,59 @@ func (s *Supernode) SNStructHeader(p netstruct.PacketTyped, community string, ds
 	return s.SNHeader(p.PacketType(), community, dst)
 }
 
-func (s *Supernode) SendStruct(p netstruct.PacketTyped, community string, src, dst net.HardwareAddr, addr *net.UDPAddr) error {
+func (s *Supernode) SendStruct(p netstruct.PacketTyped, community string, src, dst net.HardwareAddr, addr net.Addr) error {
 
 	header := s.SNStructHeader(p, community, dst)
 	payload, err := protocol.Encode(p)
 	if err != nil {
 		return err
 	}
-	_, err = s.Conn.WriteToUDP(protocol.PackProtoVDatagram(header, payload), addr)
-	if err != nil {
-		return fmt.Errorf(" failed to send packet: %w", err)
+
+	// Check if this is a WSS connection
+	if addr != nil {
+		s.edgeMu.RLock()
+		var targetEdge *Edge
+		for _, edge := range s.edgesByMAC {
+			if edge.WSSConnID != "" && s.wssConnections[edge.WSSConnID] != nil {
+				if edge.WSSConnID == addr.String() {
+					targetEdge = edge
+					break
+				}
+			}
+		}
+		s.edgeMu.RUnlock()
+
+		if targetEdge != nil {
+			packet := protocol.PackProtoVDatagram(header, payload)
+			return s.forwardPacket(packet, targetEdge)
+		}
+
+		// Check if this is a wssAddr (for unregistered edges like SNPublicSecret requests)
+		if waddr, ok := addr.(*wssAddr); ok {
+			s.wssConnectionsMu.RLock()
+			wssTransport, found := s.wssConnections[waddr.connID]
+			s.wssConnectionsMu.RUnlock()
+			if found {
+				_, err = wssTransport.Write(protocol.PackProtoVDatagram(header, payload), nil)
+				if err != nil {
+					return fmt.Errorf("failed to send WSS packet: %w", err)
+				}
+				return nil
+			}
+		}
+	}
+
+	// For UDP, we need *net.UDPAddr
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		_, err = s.Conn.WriteToUDP(protocol.PackProtoVDatagram(header, payload), udpAddr)
+		if err != nil {
+			return fmt.Errorf(" failed to send packet: %w", err)
+		}
+	} else if addr != nil {
+		return fmt.Errorf("cannot send UDP packet to non-UDP address: %T", addr)
+	} else {
+		// addr is nil, this might be an error or a broadcast
+		return fmt.Errorf("cannot send UDP packet to nil address")
 	}
 	return nil
 }

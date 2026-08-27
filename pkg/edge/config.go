@@ -3,8 +3,10 @@ package edge
 
 import (
 	"flag"
+	// "n2n-go/pkg/log"
 	"n2n-go/pkg/protocol"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -25,6 +27,15 @@ type Config struct {
 	APIListenAddr        string        `mapstructure:"api_listen_address"`
 	EncryptionPassphrase string        `mapstructure:"encryption_passphrase"`
 	CompressPayload      bool          `mapstructure:"compress_payload"`
+
+	// WS configuration
+	WSEnabled    bool   `mapstructure:"ws_enabled"`
+
+	// WSS configuration
+	SupernodeURL string `mapstructure:"supernode_url" env:"N2N_SUPERNODE_URL"`
+	WSSCert      string `mapstructure:"wss_cert" env:"N2N_WSS_CERT"`
+	WSSKey       string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
+	WSSEnabled   bool   `mapstructure:"wss_enabled"`
 }
 
 func DefaultConfig() *Config {
@@ -38,6 +49,15 @@ func DefaultConfig() *Config {
 		LocalPort:         0,           // 0 means automatically assigned
 		ConfigFile:        "edge.yaml", // Default config file name.
 		APIListenAddr:     ":7778",
+
+		// WS defaults
+		WSEnabled:    false,
+
+		// WSS defaults
+		WSSEnabled:   false,
+		SupernodeURL: "",
+		WSSCert:      "",
+		WSSKey:       "",
 	}
 }
 
@@ -78,14 +98,60 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 		flag.StringVar(&cfg.EncryptionPassphrase, "encryption-passphrase", cfg.EncryptionPassphrase, "Passphrase to encryption key derivation")
 		flag.BoolVar(&cfg.CompressPayload, "compress-payload", cfg.CompressPayload, "Add zstd fast compression/decompression to data packets")
 
+		// WSS flags
+		flag.StringVar(&cfg.SupernodeURL, "supernode-url", cfg.SupernodeURL, "Supernode URL (ws:// or wss://)")
+		flag.StringVar(&cfg.WSSCert, "wss-cert", cfg.WSSCert, "WSS client certificate file")
+		flag.StringVar(&cfg.WSSKey, "wss-key", cfg.WSSKey, "WSS client key file")
+		flag.BoolVar(&cfg.WSEnabled, "ws", cfg.WSEnabled, "Enable WS connection to supernode")
+	flag.BoolVar(&cfg.WSSEnabled, "wss", cfg.WSSEnabled, "Enable WSS connection to supernode")
+
 		flag.Parse() // MUST call this to parse the flags
 	}
+	
+	// log.Printf("DEBUG config: after flag parse, SupernodeURL=%q, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSSEnabled)
+	// Save flag values before unmarshal (CLI flags should override config file)
+	supernodeURL := cfg.SupernodeURL
+	supernodeAddr := cfg.SupernodeAddr
+	wssEnabled := cfg.WSSEnabled
+	wssCert := cfg.WSSCert
+	wssKey := cfg.WSSKey
+
 	// Unmarshal the config into our struct.
 	if err := viper.Unmarshal(cfg); err != nil {
 		return nil, err
 	}
 
+	// log.Printf("DEBUG config: after restore, SupernodeURL=%q, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSSEnabled)
+	// Restore flag values (CLI flags override config file)
+	if supernodeURL != "" {
+		cfg.SupernodeURL = supernodeURL
+	}
+	if supernodeAddr != "" {
+		cfg.SupernodeAddr = supernodeAddr
+	}
+	if wssEnabled {
+		cfg.WSSEnabled = wssEnabled
+	}
+	if wssCert != "" {
+		cfg.WSSCert = wssCert
+	}
+	if wssKey != "" {
+		cfg.WSSKey = wssKey
+	}
+
 	// Handle defaults that Viper can't.
+	
+	// log.Printf("DEBUG config: before auto-enable, SupernodeURL=%q, WSEnabled=%v, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSEnabled, cfg.WSSEnabled)
+	// Auto-enable WS/WSS if SupernodeURL is set
+	if cfg.SupernodeURL != "" {
+		if strings.HasPrefix(cfg.SupernodeURL, "wss://") {
+			cfg.WSSEnabled = true
+		} else if strings.HasPrefix(cfg.SupernodeURL, "ws://") {
+			cfg.WSEnabled = true
+		}
+	// log.Printf("DEBUG config: after auto-enable, SupernodeURL=%q, WSEnabled=%v, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSEnabled, cfg.WSSEnabled)
+	}
+
 	if cfg.EdgeID == "" {
 		h, err := os.Hostname()
 		if err != nil {

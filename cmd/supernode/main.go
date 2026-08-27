@@ -82,6 +82,16 @@ func main() {
 	log.Printf("- Debug mode: %v", cfg.Debug)
 	log.Printf("- VFuze Data FastPath: %v", cfg.EnableVFuze)
 	log.Printf("- Listen Address: %v", cfg.ListenAddr)
+	log.Printf("- WS Enabled: %v", cfg.WSEnabled)
+	if cfg.WSEnabled {
+		log.Printf("- WS Listen Address: %v", cfg.WSListenAddr)
+	}
+	log.Printf("- WSS Enabled: %v", cfg.WSSEnabled)
+	if cfg.WSSEnabled {
+		log.Printf("- WSS Listen Address: %v", cfg.WSSListenAddr)
+		log.Printf("- WSS Cert: %v", cfg.WSSCert)
+		log.Printf("- WSS Key: %v", cfg.WSSKey)
+	}
 	log.Printf("Enforced:")
 	log.Printf("- Strict hash checking: %v", cfg.StrictHashChecking)
 

@@ -37,6 +37,18 @@ func (s *Supernode) handlePeerRequestMessage(r *protocol.RawMessage) error {
 		return err
 	}
 	pil := cm.GetPeerInfoList(peerReqMsg.EdgeMACAddr(), true)
+	
+	// Check if target edge is using WSS
+	s.edgeMu.RLock()
+	targetEdge, exists := cm.edges[peerReqMsg.EdgeMACAddr()]
+	s.edgeMu.RUnlock()
+	
+	if exists && targetEdge.WSSConnID != "" {
+		// Use WSS address
+		waddr := &wssAddr{connID: targetEdge.WSSConnID}
+		return s.SendStruct(pil, peerReqMsg.Msg.CommunityName, s.MacADDR(), nil, waddr)
+	}
+	
 	target, err := cm.GetEdgeUDPAddr(peerReqMsg.EdgeMACAddr())
 	if err != nil {
 		return err
@@ -62,6 +74,18 @@ func (s *Supernode) handleLeasesInfosMessage(r *protocol.RawMessage) error {
 		CommunityName:        cm.Name(),
 		LeasesWithEdgesInfos: leases,
 	}
+	
+	// Check if target edge is using WSS
+	s.edgeMu.RLock()
+	targetEdge, exists := cm.edges[leaseMsg.EdgeMACAddr()]
+	s.edgeMu.RUnlock()
+	
+	if exists && targetEdge.WSSConnID != "" {
+		// Use WSS address
+		waddr := &wssAddr{connID: targetEdge.WSSConnID}
+		return s.SendStruct(infos, cm.Name(), s.MacADDR(), nil, waddr)
+	}
+	
 	target, err := cm.GetEdgeUDPAddr(leaseMsg.EdgeMACAddr())
 	if err != nil {
 		return err
@@ -96,9 +120,19 @@ func (s *Supernode) handleRegisterMessage(r *protocol.RawMessage) error {
 		s.stats.PacketsDropped.Add(1)
 		return err
 	}
+	// Set WSS connection ID if this is a WSS registration
+	if wssAddr, ok := r.FromAddr.(*wssAddr); ok {
+		edge.WSSConnID = wssAddr.connID
+		log.Printf("Supernode: Registered WSS edge %s with connID %s", edge.MACAddr, edge.WSSConnID)
+	}
+
 	s.edgeMu.Lock()
 	s.edgesByMAC[edge.MACAddr] = edge
 	s.edgesBySocket[edge.UDPAddr().String()] = edge
+	// Also index by WSSConnID if set
+	if edge.WSSConnID != "" {
+		s.edgesBySocket[edge.WSSConnID] = edge
+	}
 	s.edgeMu.Unlock()
 
 	rresp.IsRegisterOk = true
@@ -156,6 +190,18 @@ func (s *Supernode) handleP2PFullStateMessage(r *protocol.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	
+	// Check if target edge is using WSS
+	s.edgeMu.RLock()
+	targetEdge, exists := cm.edges[fsMsg.EdgeMACAddr()]
+	s.edgeMu.RUnlock()
+	
+	if exists && targetEdge.WSSConnID != "" {
+		// Use WSS address
+		waddr := &wssAddr{connID: targetEdge.WSSConnID}
+		return s.SendStruct(P2PFullState, cm.Name(), s.MacADDR(), nil, waddr)
+	}
+	
 	target, err := cm.GetEdgeUDPAddr(fsMsg.EdgeMACAddr())
 	if err != nil {
 		return err
@@ -194,7 +240,7 @@ func (s *Supernode) handleDataMessage(r *protocol.RawMessage) error { //packet [
 	return s.ForwardWithFallBack(r)
 }
 
-func (s *Supernode) handleVFuze(packet []byte, addr *net.UDPAddr) {
+func (s *Supernode) handleVFuze(packet []byte, addr net.Addr) {
 	dst, err := protocol.VFuzePacketDestMACAddr(packet)
 	if err != nil {
 		s.debugLog("Supernode: vFuze Packet error: %v", err)
