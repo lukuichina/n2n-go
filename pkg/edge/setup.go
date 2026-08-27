@@ -16,7 +16,7 @@ import (
 )
 
 // setupNetworkComponents initializes the network connection and TAP interface
-func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *transport.WSSTransport, *tuntap.Interface, *net.UDPAddr, error) {
+func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *transport.WSSTransport, *tuntap.Interface, *net.UDPAddr, *transport.WSSTransportConfig, error) {
 	var snAddr *net.UDPAddr
 	var conn *net.UDPConn
 	var wsTransport *transport.WSSTransport
@@ -39,7 +39,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 
 		wsTransport, err = transport.NewWSSTransport(wsConfig)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("failed to establish WS connection: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to establish WS connection: %w", err)
 		}
 
 		log.Printf("WS connection established to %s", cfg.SupernodeURL)
@@ -66,17 +66,17 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 		snAddr, err = net.ResolveUDPAddr("udp4", host)
 		if err != nil {
 			wsTransport.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to resolve supernode address: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to resolve supernode address: %w", err)
 		}
 
 		// For WS, we still need TAP interface
 		tap, err = tuntap.NewInterface(tapcfg)
 		if err != nil {
 			wsTransport.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create TAP interface: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to create TAP interface: %w", err)
 		}
 
-		return nil, wsTransport, tap, snAddr, nil
+		return nil, wsTransport, tap, snAddr, nil, nil
 	}
 
 	// Check if WSS is enabled
@@ -97,7 +97,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 
 		wssTransport, err = transport.NewWSSTransport(wssConfig)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("failed to establish WSS connection: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to establish WSS connection: %w", err)
 		}
 
 		log.Printf("WSS connection established to %s", cfg.SupernodeURL)
@@ -124,17 +124,17 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 		snAddr, err = net.ResolveUDPAddr("udp4", host)
 		if err != nil {
 			wssTransport.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to resolve supernode address: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to resolve supernode address: %w", err)
 		}
 
 		// For WSS, we still need TAP interface
 		tap, err = tuntap.NewInterface(tapcfg)
 		if err != nil {
 			wssTransport.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create TAP interface: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to create TAP interface: %w", err)
 		}
 
-		return nil, wssTransport, tap, snAddr, nil
+		return nil, wssTransport, tap, snAddr, wssConfig, nil
 	}
 
 	// log.Printf("DEBUG: taking UDP branch, SupernodeAddr=%q", cfg.SupernodeAddr)
@@ -142,21 +142,21 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 	// Traditional UDP mode
 	snAddr, err = net.ResolveUDPAddr("udp4", cfg.SupernodeAddr)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf(" failed to resolve supernode address: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf(" failed to resolve supernode address: %w", err)
 	}
 
 	conn, err = setupUDPConnection(cfg.LocalPort, cfg.UDPBufferSize)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf(" %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf(" %w", err)
 	}
 
 	tap, err = tuntap.NewInterface(tapcfg)
 	if err != nil {
 		conn.Close() // Clean up on error
-		return nil, nil, nil, nil, fmt.Errorf(" failed to create TAP interface: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf(" failed to create TAP interface: %w", err)
 	}
 
-	return conn, nil, tap, snAddr, nil
+	return conn, nil, tap, snAddr, nil, nil
 }
 
 // setupUDPConnection creates and configures a UDP connection with the specified parameters

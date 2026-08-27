@@ -35,6 +35,7 @@ type EdgeClient struct {
 	Community     string
 	SupernodeAddr *net.UDPAddr
 	Conn          *net.UDPConn
+	wssConfig *transport.WSSTransportConfig
 	WSSTransport *transport.WSSTransport
 	TAP           *tuntap.Interface
 	seq           uint32
@@ -142,7 +143,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		log.Fatalf("hosts file: access-denied for writing into hostsfile (community entries)")
 	}
 
-	conn, wssTransport, tap, snAddr, err := setupNetworkComponents(cfg, tapcfg)
+	conn, wssTransport, tap, snAddr, wssConfig, err := setupNetworkComponents(cfg, tapcfg)
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +206,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		SupernodeAddr:     snAddr,
 		Conn:              conn,
 		WSSTransport:      wssTransport,
+		wssConfig:         wssConfig,
 		TAP:               tap,
 		Mgmt:              mgmtServer,
 		seq:               0,

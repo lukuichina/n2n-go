@@ -96,7 +96,13 @@ func NewWSSTransportFromConn(conn *websocket.Conn) *WSSTransport {
 }
 
 // Read reads a binary WebSocket message
-func (t *WSSTransport) Read(pkt []byte) (int, net.Addr, error) {
+func (t *WSSTransport) Read(pkt []byte) (n int, addr net.Addr, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("websocket panic: %v", r)
+		}
+	}()
+
 	msgType, data, err := t.conn.ReadMessage()
 	if err != nil {
 		return 0, nil, err
@@ -106,8 +112,9 @@ func (t *WSSTransport) Read(pkt []byte) (int, net.Addr, error) {
 		return 0, nil, fmt.Errorf("unexpected message type: %d (expected binary)", msgType)
 	}
 
-	n := copy(pkt, data)
-	return n, t.addr, nil
+	n = copy(pkt, data)
+	addr = t.addr
+	return n, addr, nil
 }
 
 // Write writes a binary WebSocket message

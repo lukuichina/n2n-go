@@ -3,6 +3,7 @@ package edge
 import (
 	"fmt"
 	"n2n-go/pkg/log"
+	"n2n-go/pkg/transport"
 	"n2n-go/pkg/p2p"
 	"n2n-go/pkg/protocol"
 	"n2n-go/pkg/protocol/netstruct"
@@ -271,6 +272,8 @@ func (e *EdgeClient) handleWSS() {
 	packetBuf := e.packetBufPool.Get()
 	defer e.packetBufPool.Put(packetBuf)
 
+	reconnectDelay := 3 * time.Second
+
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -287,6 +290,29 @@ func (e *EdgeClient) handleWSS() {
 				continue
 			}
 			log.Printf("WSS read error: %v", err)
+			
+			// Try to reconnect
+			if e.wssConfig != nil {
+				log.Printf("Attempting to reconnect WSS in %v...", reconnectDelay)
+				time.Sleep(reconnectDelay)
+				
+				newTransport, err := transport.NewWSSTransport(e.wssConfig)
+				if err != nil {
+					log.Printf("Failed to reconnect WSS: %v", err)
+					continue
+				}
+				
+				e.WSSTransport = newTransport
+				log.Printf("WSS reconnected to %s", e.wssConfig.URL)
+				
+				// Re-register with supernode after reconnection
+				e.registered = false
+				e.isWaitingForSNRetryRegisterResponse = true
+				log.Printf("Fetching supernode public key for re-registration...")
+				if err := e.RequestSNPublicKey(); err != nil {
+					log.Printf("Failed to request supernode public key: %v", err)
+				}
+			}
 			continue
 		}
 

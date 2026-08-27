@@ -48,6 +48,7 @@ func (e *EdgeClient) handleRegisterResponseMessage(r *protocol.RawMessage) error
 	}
 
 	log.Printf("Successfull Supernode Reregister")
+	e.registered = true
 	e.isWaitingForSNRetryRegisterResponse = false
 	e.Peers.IsWaitingCommunityDatas = false
 	log.Printf("sending Recovery Peer List Request")
