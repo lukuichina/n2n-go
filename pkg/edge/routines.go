@@ -281,6 +281,39 @@ func (e *EdgeClient) handleWSS() {
 		default:
 			// Continue processing
 		}
+		
+		// If not connected, try to (re)connect
+		if e.WSSTransport == nil {
+			if e.wssConfig == nil {
+				return
+			}
+			log.Printf("WSS disconnected, attempting to connect in %v...", reconnectDelay)
+			time.Sleep(reconnectDelay)
+			
+			newTransport, err := transport.NewWSSTransport(e.wssConfig)
+			if err != nil {
+				log.Printf("Failed to connect WSS: %v", err)
+				reconnectDelay *= 2
+				if reconnectDelay > 60*time.Second {
+					reconnectDelay = 60 * time.Second
+				}
+				continue
+			}
+			
+			e.WSSTransport = newTransport
+			reconnectDelay = 3 * time.Second // Reset backoff
+			log.Printf("WSS connected to %s", e.wssConfig.URL)
+			
+			// Re-register with supernode after (re)connection
+			e.registered = false
+			e.isWaitingForSNRetryRegisterResponse = true
+			log.Printf("Fetching supernode public key for (re)registration...")
+			if err := e.RequestSNPublicKey(); err != nil {
+				log.Printf("Failed to request supernode public key: %v", err)
+			}
+			continue
+		}
+
 		n, addr, err := e.WSSTransport.Read(packetBuf)
 		if err != nil {
 			if strings.Contains(err.Error(), "use of closed network connection") {
@@ -291,28 +324,14 @@ func (e *EdgeClient) handleWSS() {
 			}
 			log.Printf("WSS read error: %v", err)
 			
-			// Try to reconnect
-			if e.wssConfig != nil {
-				log.Printf("Attempting to reconnect WSS in %v...", reconnectDelay)
-				time.Sleep(reconnectDelay)
-				
-				newTransport, err := transport.NewWSSTransport(e.wssConfig)
-				if err != nil {
-					log.Printf("Failed to reconnect WSS: %v", err)
-					continue
-				}
-				
-				e.WSSTransport = newTransport
-				log.Printf("WSS reconnected to %s", e.wssConfig.URL)
-				
-				// Re-register with supernode after reconnection
-				e.registered = false
-				e.isWaitingForSNRetryRegisterResponse = true
-				log.Printf("Fetching supernode public key for re-registration...")
-				if err := e.RequestSNPublicKey(); err != nil {
-					log.Printf("Failed to request supernode public key: %v", err)
-				}
+			// Close and discard old transport to avoid repeated reads on failed connection
+			oldTransport := e.WSSTransport
+			e.WSSTransport = nil
+			if oldTransport != nil {
+				oldTransport.Close()
 			}
+			
+			// Will reconnect on next iteration
 			continue
 		}
 

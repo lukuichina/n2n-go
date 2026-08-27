@@ -304,6 +304,13 @@ func (s *Supernode) handleWSUpgrade(w http.ResponseWriter, r *http.Request) {
 
 // handleWSSUpgrade handles WebSocket upgrade requests
 func (s *Supernode) handleWSSUpgrade(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Supernode: WSS upgrade request from %s, path: %s", r.RemoteAddr, r.URL.Path)
+	log.Printf("Supernode: WSS headers: Connection=%s, Upgrade=%s, Sec-WebSocket-Version=%s, Sec-WebSocket-Key=%s",
+		r.Header.Get("Connection"),
+		r.Header.Get("Upgrade"),
+		r.Header.Get("Sec-WebSocket-Version"),
+		r.Header.Get("Sec-WebSocket-Key"))
+	
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true // Allow all origins

@@ -31,6 +31,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 		// log.Printf("DEBUG: taking WS branch")
 		
 		wsConfig := &transport.WSSTransportConfig{
+			ProxyURL:     cfg.ProxyURL,
 			URL:         cfg.SupernodeURL,
 			SkipVerify:  true, // TODO: Make this configurable
 			ReadTimeout: 30 * time.Second,
@@ -84,6 +85,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 		// log.Printf("DEBUG: taking WSS branch")
 		
 		wssConfig := &transport.WSSTransportConfig{
+			ProxyURL:     cfg.ProxyURL,
 			URL:         cfg.SupernodeURL,
 			SkipVerify:  true, // TODO: Make this configurable
 			ReadTimeout: 30 * time.Second,

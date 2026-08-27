@@ -2,15 +2,18 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/proxy"
 )
 
 // WSSTransport WebSocket Secure transport implementation
@@ -31,6 +34,7 @@ type WSSTransportConfig struct {
 	SkipVerify  bool
 	ReadTimeout time.Duration
 	WriteTimeout time.Duration
+	ProxyURL    string // http://, https://, or socks5://
 }
 
 // NewWSSTransport creates a WS/WSS client transport (for edge)
@@ -66,9 +70,23 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 		}
 	}
 
+	// Configure proxy if specified
+	if config.ProxyURL != "" {
+		if err := configureProxy(dialer, config.ProxyURL); err != nil {
+			return nil, fmt.Errorf("failed to configure proxy: %w", err)
+		}
+	}
+
 	conn, resp, err := dialer.Dial(config.URL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("WS/WSS dial failed: %w", err)
+		errMsg := fmt.Sprintf("WS/WSS dial failed: %v", err)
+		if resp != nil {
+			errMsg += fmt.Sprintf(" (status: %s)", resp.Status)
+			for k, v := range resp.Header {
+				errMsg += fmt.Sprintf(" [%s: %v]", k, v)
+			}
+		}
+		return nil, fmt.Errorf(errMsg)
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -83,6 +101,34 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 	}
 
 	return transport, nil
+}
+
+// configureProxy configures the websocket dialer to use the specified proxy
+func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
+	if strings.HasPrefix(proxyURL, "socks5://") {
+		// SOCKS5 proxy
+		addr := strings.TrimPrefix(proxyURL, "socks5://")
+		socksDialer, err := proxy.SOCKS5("tcp", addr, nil, &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+		}
+		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return socksDialer.Dial(network, addr)
+		}
+	} else {
+		// HTTP/HTTPS proxy - use environment-based proxy config
+		// If proxyURL is provided, set it as HTTP_PROXY/HTTPS_PROXY for this request
+		if proxyURL != "" {
+			dialer.Proxy = func(req *http.Request) (*url.URL, error) {
+				return url.Parse(proxyURL)
+			}
+		}
+	}
+
+	return nil
 }
 
 // NewWSSTransportFromConn creates a WSS server transport from an existing WebSocket connection

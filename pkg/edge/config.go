@@ -3,7 +3,6 @@ package edge
 
 import (
 	"flag"
-	// "n2n-go/pkg/log"
 	"n2n-go/pkg/protocol"
 	"os"
 	"strings"
@@ -36,6 +35,7 @@ type Config struct {
 	WSSCert      string `mapstructure:"wss_cert" env:"N2N_WSS_CERT"`
 	WSSKey       string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
 	WSSEnabled   bool   `mapstructure:"wss_enabled"`
+	ProxyURL      string `mapstructure:"proxy_url" env:"N2N_PROXY_URL"`
 }
 
 func DefaultConfig() *Config {
@@ -55,6 +55,7 @@ func DefaultConfig() *Config {
 
 		// WSS defaults
 		WSSEnabled:   false,
+		ProxyURL:      "",
 		SupernodeURL: "",
 		WSSCert:      "",
 		WSSKey:       "",
@@ -83,8 +84,16 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 	}
 
 	if parseFlags {
-		// Bind command-line flags to Viper
-		// This is where we connect our flags to our config struct
+		// Save flag values before unmarshal (CLI flags should override config file)
+		supernodeURL := cfg.SupernodeURL
+		supernodeAddr := cfg.SupernodeAddr
+		wssEnabled := cfg.WSSEnabled
+		wssCert := cfg.WSSCert
+		wssKey := cfg.WSSKey
+
+		// Bind command-line flags to config struct.
+		// Because cfg already contains config-file values, command-line flags
+		// take precedence over the config file when provided.
 		flag.StringVar(&cfg.ConfigFile, "config", cfg.ConfigFile, "Path to the configuration file")
 		flag.StringVar(&cfg.EdgeID, "id", cfg.EdgeID, "Unique edge identifier (defaults to hostname if omitted)")
 		flag.StringVar(&cfg.Community, "community", cfg.Community, "Community name")
@@ -92,66 +101,49 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 		flag.IntVar(&cfg.LocalPort, "port", cfg.LocalPort, "Local UDP port (0 for system-assigned)")
 		flag.BoolVar(&cfg.EnableVFuze, "enableFuze", cfg.EnableVFuze, "enable fuze fastpath")
 		flag.StringVar(&cfg.SupernodeAddr, "supernode", cfg.SupernodeAddr, "Supernode address (host:port)")
+		flag.StringVar(&cfg.SupernodeURL, "supernode-url", cfg.SupernodeURL, "Supernode URL for WS/WSS (ws:// or wss://)")
 		flag.DurationVar(&cfg.HeartbeatInterval, "heartbeat", cfg.HeartbeatInterval, "Heartbeat interval")
 		flag.IntVar(&cfg.UDPBufferSize, "udpbuffersize", cfg.UDPBufferSize, "UDP BUffer Sizes")
 		flag.StringVar(&cfg.APIListenAddr, "api-listen", cfg.APIListenAddr, "API listen address")
 		flag.StringVar(&cfg.EncryptionPassphrase, "encryption-passphrase", cfg.EncryptionPassphrase, "Passphrase to encryption key derivation")
 		flag.BoolVar(&cfg.CompressPayload, "compress-payload", cfg.CompressPayload, "Add zstd fast compression/decompression to data packets")
-
-		// WSS flags
-		flag.StringVar(&cfg.SupernodeURL, "supernode-url", cfg.SupernodeURL, "Supernode URL (ws:// or wss://)")
+		flag.StringVar(&cfg.ProxyURL, "proxy-url", cfg.ProxyURL, "Proxy URL (http://, https://, or socks5://)")
 		flag.StringVar(&cfg.WSSCert, "wss-cert", cfg.WSSCert, "WSS client certificate file")
 		flag.StringVar(&cfg.WSSKey, "wss-key", cfg.WSSKey, "WSS client key file")
 		flag.BoolVar(&cfg.WSEnabled, "ws", cfg.WSEnabled, "Enable WS connection to supernode")
-	flag.BoolVar(&cfg.WSSEnabled, "wss", cfg.WSSEnabled, "Enable WSS connection to supernode")
+		flag.BoolVar(&cfg.WSSEnabled, "wss", cfg.WSSEnabled, "Enable WSS connection to supernode")
 
 		flag.Parse() // MUST call this to parse the flags
-	}
-	
-	// log.Printf("DEBUG config: after flag parse, SupernodeURL=%q, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSSEnabled)
-	// Save flag values before unmarshal (CLI flags should override config file)
-	supernodeURL := cfg.SupernodeURL
-	supernodeAddr := cfg.SupernodeAddr
-	wssEnabled := cfg.WSSEnabled
-	wssCert := cfg.WSSCert
-	wssKey := cfg.WSSKey
 
-	// Unmarshal the config into our struct.
-	if err := viper.Unmarshal(cfg); err != nil {
-		return nil, err
-	}
+		// Unmarshal config into struct first so flags can override file values.
+		if err := viper.Unmarshal(cfg); err != nil {
+			return nil, err
+		}
 
-	// log.Printf("DEBUG config: after restore, SupernodeURL=%q, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSSEnabled)
-	// Restore flag values (CLI flags override config file)
-	if supernodeURL != "" {
-		cfg.SupernodeURL = supernodeURL
-	}
-	if supernodeAddr != "" {
-		cfg.SupernodeAddr = supernodeAddr
-	}
-	if wssEnabled {
-		cfg.WSSEnabled = wssEnabled
-	}
-	if wssCert != "" {
-		cfg.WSSCert = wssCert
-	}
-	if wssKey != "" {
-		cfg.WSSKey = wssKey
+		// Restore flag values (CLI flags override config file)
+		if supernodeURL != "" {
+			cfg.SupernodeURL = supernodeURL
+		}
+		if supernodeAddr != "" {
+			cfg.SupernodeAddr = supernodeAddr
+		}
+		if wssEnabled {
+			cfg.WSSEnabled = wssEnabled
+		}
+		if wssCert != "" {
+			cfg.WSSCert = wssCert
+		}
+		if wssKey != "" {
+			cfg.WSSKey = wssKey
+		}
+	} else {
+		// Unmarshal config into struct
+		if err := viper.Unmarshal(cfg); err != nil {
+			return nil, err
+		}
 	}
 
 	// Handle defaults that Viper can't.
-	
-	// log.Printf("DEBUG config: before auto-enable, SupernodeURL=%q, WSEnabled=%v, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSEnabled, cfg.WSSEnabled)
-	// Auto-enable WS/WSS if SupernodeURL is set
-	if cfg.SupernodeURL != "" {
-		if strings.HasPrefix(cfg.SupernodeURL, "wss://") {
-			cfg.WSSEnabled = true
-		} else if strings.HasPrefix(cfg.SupernodeURL, "ws://") {
-			cfg.WSEnabled = true
-		}
-	// log.Printf("DEBUG config: after auto-enable, SupernodeURL=%q, WSEnabled=%v, WSSEnabled=%v", cfg.SupernodeURL, cfg.WSEnabled, cfg.WSSEnabled)
-	}
-
 	if cfg.EdgeID == "" {
 		h, err := os.Hostname()
 		if err != nil {
@@ -163,6 +155,15 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 	if cfg.LocalPort == 0 {
 		if viper.IsSet("local_port") {
 			cfg.LocalPort = viper.GetInt("local_port")
+		}
+	}
+
+	// Auto-enable WS/WSS based on SupernodeURL protocol
+	if cfg.SupernodeURL != "" {
+		if strings.HasPrefix(cfg.SupernodeURL, "ws://") {
+			cfg.WSEnabled = true
+		} else if strings.HasPrefix(cfg.SupernodeURL, "wss://") {
+			cfg.WSSEnabled = true
 		}
 	}
 
