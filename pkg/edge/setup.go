@@ -27,7 +27,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 	// log.Printf("DEBUG: entering setupNetworkComponents, WSEnabled=%v, WSSEnabled=%v, SupernodeURL=%q, SupernodeAddr=%q", cfg.WSEnabled, cfg.WSSEnabled, cfg.SupernodeURL, cfg.SupernodeAddr)
 
 	// Check if WS is enabled
-	if cfg.WSEnabled && cfg.SupernodeURL != "" {
+	if (cfg.WSEnabled || strings.HasPrefix(cfg.SupernodeURL, "ws://")) && cfg.SupernodeURL != "" {
 		// log.Printf("DEBUG: taking WS branch")
 		
 		wsConfig := &transport.WSSTransportConfig{
@@ -81,7 +81,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 	}
 
 	// Check if WSS is enabled
-	if cfg.WSSEnabled && cfg.SupernodeURL != "" {
+	if (cfg.WSSEnabled || strings.HasPrefix(cfg.SupernodeURL, "wss://")) && cfg.SupernodeURL != "" {
 		// log.Printf("DEBUG: taking WSS branch")
 		
 		wssConfig := &transport.WSSTransportConfig{

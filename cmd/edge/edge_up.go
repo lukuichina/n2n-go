@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/urfave/cli/v2"
@@ -25,11 +26,18 @@ var (
 		Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:    "proxy-url",
+			Aliases: []string{"p"},
 			Usage:   "Proxy URL (http://, https://, or socks5://)",
 		},
 		&cli.StringFlag{
 			Name:    "supernode-url",
+			Aliases: []string{"s"},
 			Usage:   "Supernode URL for WS/WSS (ws:// or wss://)",
+		},
+		&cli.StringFlag{
+			Name:    "community",
+			Aliases: []string{"c"},
+			Usage:   "Community name",
 		},
 			&cli.StringFlag{
 				Name:    "edge-id",
@@ -55,6 +63,10 @@ var (
 			&cli.StringFlag{
 				Name:  "wss-key",
 				Usage: "WSS client key file",
+			},
+			&cli.StringFlag{
+				Name:    "api-listen",
+				Usage:   "Management API listen address (default: 127.0.0.1:7778)",
 			},
 			// --- Common Options ---
 
@@ -83,11 +95,18 @@ func up(c *cli.Context) {
 	b, _ := base64.StdEncoding.DecodeString(banner)
 	fmt.Printf(string(b), Version, BuildTime)
 
-	cfg, err := edge.LoadConfig(true) // Load config using Viper
+	cfg, err := edge.LoadConfig(false) // Load config using Viper (skip flag parsing, cli.Context handles flags)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 	log.Printf("using config file %s", cfg.ConfigFile)
+
+	if c.IsSet("community") {
+		comm := c.String("community")
+		if comm != "" {
+			cfg.Community = comm
+		}
+	}
 
 	if c.IsSet("edge-id") {
 		eid := c.String("edge-id")
@@ -104,6 +123,15 @@ func up(c *cli.Context) {
 		cfg.SupernodeURL = c.String("supernode-url")
 	}
 
+	// Auto-enable WS/WSS based on supernode URL scheme
+	if cfg.SupernodeURL != "" {
+		if strings.HasPrefix(cfg.SupernodeURL, "wss://") {
+			cfg.WSSEnabled = true
+		} else if strings.HasPrefix(cfg.SupernodeURL, "ws://") {
+			cfg.WSEnabled = true
+		}
+	}
+
 	if c.IsSet("ws") {
 		cfg.WSEnabled = c.Bool("ws")
 	}
@@ -118,6 +146,10 @@ func up(c *cli.Context) {
 
 	if c.IsSet("wss-key") {
 		cfg.WSSKey = c.String("wss-key")
+	}
+
+	if c.IsSet("api-listen") {
+		cfg.APIListenAddr = c.String("api-listen")
 	}
 
 	client, err := edge.NewEdgeClient(*cfg) // Pass the config struct

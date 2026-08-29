@@ -2,6 +2,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -118,13 +119,66 @@ func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return socksDialer.Dial(network, addr)
 		}
-	} else {
-		// HTTP/HTTPS proxy - use environment-based proxy config
-		// If proxyURL is provided, set it as HTTP_PROXY/HTTPS_PROXY for this request
+	} else if strings.HasPrefix(proxyURL, "http://") {
+		// HTTP proxy - use standard HTTP proxy configuration
 		if proxyURL != "" {
 			dialer.Proxy = func(req *http.Request) (*url.URL, error) {
 				return url.Parse(proxyURL)
 			}
+		}
+	} else if strings.HasPrefix(proxyURL, "https://") {
+		// HTTPS proxy (proxy server uses TLS) - need custom handling
+		// because gorilla/websocket's proxy_FromURL doesn't support https scheme
+		proxyHost := strings.TrimPrefix(proxyURL, "https://")
+		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Connect to proxy via TLS
+			conn, err := tls.Dial("tcp", proxyHost, &tls.Config{
+				InsecureSkipVerify: true,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to HTTPS proxy %s: %w", proxyHost, err)
+			}
+			
+			// Send CONNECT request
+			connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", addr, addr)
+			if _, err := conn.Write([]byte(connectReq)); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to send CONNECT request to proxy: %w", err)
+			}
+			
+			// Read proxy response
+			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+			scanner := bufio.NewScanner(conn)
+			var statusLine string
+			firstLine := true
+			for scanner.Scan() {
+				line := scanner.Text()
+				if line == "" {
+					break
+				}
+				if firstLine {
+					statusLine = line
+					firstLine = false
+				}
+			}
+			
+			if err := scanner.Err(); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to read proxy response: %w", err)
+			}
+			
+			// Check if response is 2xx
+			if !strings.HasPrefix(statusLine, "HTTP/1.1 2") {
+				conn.Close()
+				return nil, fmt.Errorf("proxy returned non-200 status: %s", statusLine)
+			}
+			
+			return conn, nil
+		}
+	} else if proxyURL != "" {
+		// Default to HTTP proxy for unknown schemes
+		dialer.Proxy = func(req *http.Request) (*url.URL, error) {
+			return url.Parse(proxyURL)
 		}
 	}
 

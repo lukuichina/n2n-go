@@ -297,29 +297,32 @@ func findAndConfigureTapDevice(config Config) (devPath, instanceID string, ifIdx
 
 // restart tap to apply config
 func restartTapWindows() error {
+	// Find the TAP adapter ifIndex first
 	cmd := exec.Command("powershell", "-Command",
-		`Get-NetAdapter | Where-Object {$_.InterfaceDescription -like "*TAP-Windows*"} | Select-Object -ExpandProperty Name`)
+		`Get-NetAdapter | Where-Object {$_.InterfaceDescription -like "*TAP-Windows*"} | Select-Object -ExpandProperty ifIndex`)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to list adapters: %v", err)
 	}
 
-	name := strings.TrimSpace(out.String())
-	if name == "" {
+	ifIndexStr := strings.TrimSpace(out.String())
+	if ifIndexStr == "" {
 		return fmt.Errorf("no TAP-Windows adapter found")
 	}
+	log.Printf("Debug: Found TAP adapter ifIndex=%s", ifIndexStr)
 
+	// Use netsh with interface index to disable/enable adapter
 	disableCmd := exec.Command("netsh", "interface", "set", "interface",
-		fmt.Sprintf("name=%s", name), "admin=disabled")
-	if err := disableCmd.Run(); err != nil {
-		return fmt.Errorf("failed to disable adapter: %v", err)
+		fmt.Sprintf("index=%s", ifIndexStr), "admin=disabled")
+	if out, err := disableCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to disable adapter ifIndex=%s: %v, output: %s", ifIndexStr, err, string(out))
 	}
 	time.Sleep(5000)
 	enableCmd := exec.Command("netsh", "interface", "set", "interface",
-		fmt.Sprintf("name=%s", name), "admin=enabled")
-	if err := enableCmd.Run(); err != nil {
-		return fmt.Errorf("failed to enable adapter: %v", err)
+		fmt.Sprintf("index=%s", ifIndexStr), "admin=enabled")
+	if out, err := enableCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to enable adapter ifIndex=%s: %v, output: %s", ifIndexStr, err, string(out))
 	}
 	time.Sleep(10000)
 	return nil

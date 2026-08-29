@@ -123,6 +123,7 @@ func (s *Supernode) ValidateEdgeClaimedMACAddr(claimedMAC string, encryptedID []
 		return nil, err
 	}
 	computedClaimableMAC := computedMAC.String()
+	log.Printf("Supernode: ValidateEdgeClaimedMACAddr claimed=%s computed=%s", claimedMAC, computedClaimableMAC)
 	if computedClaimableMAC != claimedMAC {
 		return nil, fmt.Errorf("computedMac from shared secret (%s) doesn't match claimed mac (%s)", computedClaimableMAC, claimedMAC)
 	}

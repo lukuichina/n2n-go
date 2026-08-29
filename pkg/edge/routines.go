@@ -140,7 +140,7 @@ func (e *EdgeClient) handleTAP() {
 			if strings.Contains(err.Error(), "file already closed") {
 				return
 			}
-			log.Printf("TAP read error: %v", err)
+			log.Printf("TAP read error: %v (handle=%v)", err, e.TAP.Iface.GetHandle())
 			continue
 		}
 

@@ -13,6 +13,8 @@ import (
 	"n2n-go/pkg/log" // Ensure log package is imported
 )
 
+const ethernetHeaderSize = 6 + 6 + 2 // dst MAC(6) + src MAC(6) + ethertype(2)
+
 // Interface is the primary structure for interacting with a TUN/TAP device.
 // It wraps the lower-level, platform-specific Device object.
 type Interface struct {
@@ -20,6 +22,10 @@ type Interface struct {
 	// We make it exported if external packages might need direct access,
 	// otherwise it could be unexported. Let's keep it exported for now.
 	Iface *Device
+
+	// configuredIP stores the last IP CIDR configured on this interface.
+	// Used on Windows to delete the IP when closing or reconfiguring.
+	configuredIP string
 }
 
 // NewInterface creates and initializes a new TUN/TAP interface based on the provided configuration.
@@ -72,6 +78,15 @@ func (i *Interface) Write(b []byte) (int, error) {
 	if i.Iface == nil {
 		return 0, os.ErrInvalid
 	}
+	// On Windows, TAP device may have a different physical MAC than the claimed n2n MAC.
+	// Replace the Ethernet destination MAC with the actual TAP MAC so the Windows
+	// TCP/IP stack accepts the packet. Without this, Windows often drops frames whose
+	// dst MAC does not match the adapter's burned-in address.
+	if runtime.GOOS == "windows" && len(b) >= ethernetHeaderSize {
+		if actualMac := i.Iface.GetMACAddress(); actualMac != nil && len(actualMac) == 6 {
+			copy(b[0:6], actualMac)
+		}
+	}
 	return i.Iface.Write(b)
 }
 
@@ -79,6 +94,9 @@ func (i *Interface) Write(b []byte) (int, error) {
 func (i *Interface) Close() error {
 	if i.Iface == nil {
 		return nil // Already closed
+	}
+	if err := i.closePlatform(); err != nil {
+		return err
 	}
 	err := i.Iface.Close()
 	i.Iface = nil // Prevent further use

@@ -211,7 +211,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		Mgmt:              mgmtServer,
 		seq:               0,
 		NatClient:         natClient,
-		MACAddr:           tap.HardwareAddr(),
+		MACAddr:           predictableMac,
 		predictableMac:    predictableMac,
 		machineId:         machineId,
 		protocolVersion:   cfg.ProtocolVersion,

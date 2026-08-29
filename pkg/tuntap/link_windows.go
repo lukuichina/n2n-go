@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
+	"strings"
 	"unsafe" // Needed for pointer manipulation for IPv4
 
 	"n2n-go/pkg/log"
@@ -121,6 +123,49 @@ func setIPAddress(ifIndex uint32, ipCIDR string) error {
 	return nil
 }
 
+func deleteIPAddress(ifIndex uint32, ipCIDR string) error {
+	ip, _, err := net.ParseCIDR(ipCIDR)
+	if err != nil {
+		return fmt.Errorf("parse CIDR %q: %w", ipCIDR, err)
+	}
+
+	// Build the row for deletion. We only need InterfaceIndex and Address.
+	row := windows.MibUnicastIpAddressRow{
+		InterfaceIndex: ifIndex,
+	}
+
+	if ip4 := ip.To4(); ip4 != nil {
+		addrV4 := windows.RawSockaddrInet4{
+			Family: windows.AF_INET,
+		}
+		copy(addrV4.Addr[:], ip4)
+		sizeV4 := unsafe.Sizeof(addrV4)
+		destPtr := unsafe.Pointer(&row.Address)
+		srcPtr := unsafe.Pointer(&addrV4)
+		if sizeV4 > unsafe.Sizeof(row.Address) {
+			return fmt.Errorf("internal error: sizeof(RawSockaddrInet4) > sizeof(RawSockaddrInet6)")
+		}
+		copy((*(*[1 << 30]byte)(destPtr))[:sizeV4], (*(*[1 << 30]byte)(srcPtr))[:sizeV4])
+	} else if ip6 := ip.To16(); ip6 != nil {
+		row.Address.Family = windows.AF_INET6
+		copy(row.Address.Addr[:], ip6)
+	} else {
+		return fmt.Errorf("invalid IP format: %s", ip.String())
+	}
+
+	log.Printf("Attempting DeleteUnicastIpAddressEntry call for %s on IfIndex %d", ipCIDR, ifIndex)
+	err = callProcErr(procDeleteUnicastIpAddressEntry, uintptr(unsafe.Pointer(&row)))
+	if err != nil {
+		if errors.Is(err, windows.ERROR_NOT_FOUND) {
+			log.Printf("IP address %s not found on IfIndex %d, nothing to delete.", ipCIDR, ifIndex)
+			return nil
+		}
+		return fmt.Errorf("DeleteUnicastIpAddressEntry call failed: %w", err)
+	}
+	log.Printf("Successfully deleted IP address %s from IfIndex %d", ipCIDR, ifIndex)
+	return nil
+}
+
 // setMTUAndEnable uses windows.MibIpInterfaceRow (assuming .Enabled is uint8)
 func setMTUAndEnable(ifIndex uint32, family uint16, mtu int) error {
 	// Use the correct windows struct name
@@ -180,10 +225,21 @@ func (i *Interface) ConfigureInterface(macAddr, ipCIDR string, mtu int) error { 
 		actualMac := i.HardwareAddr()
 		log.Printf("Note: Desired MAC (%s) set via registry; current is %s", macAddr, actualMac.String())
 	}
+
+	// Delete previously configured IP if it exists and is different from the new one.
+	if i.configuredIP != "" && i.configuredIP != ipCIDR {
+		log.Printf("Removing previous IP address %s from IfIndex %d", i.configuredIP, ifIndex)
+		if err := deleteIPAddress(ifIndex, i.configuredIP); err != nil {
+			log.Printf("Warning: failed to delete previous IP %s: %v", i.configuredIP, err)
+		}
+	}
+
 	err := setIPAddress(ifIndex, ipCIDR)
 	if err != nil {
 		return fmt.Errorf("set IP address failed: %w", err)
 	}
+	i.configuredIP = ipCIDR
+
 	ip, _, err := net.ParseCIDR(ipCIDR)
 	if err != nil {
 		return fmt.Errorf("internal re-parse CIDR %s: %w", ipCIDR, err)
@@ -203,13 +259,69 @@ func (i *Interface) ConfigureInterface(macAddr, ipCIDR string, mtu int) error { 
 	return nil
 }
 func (i *Interface) IfUp(ipCIDR string) error { return i.ConfigureInterface("", ipCIDR, DefaultMTU) }
-func (i *Interface) IfMac(macAddr string) error { /* ... as before ... */
+func setMacViaRegistry(ifName, macAddr string) error {
+	// Use PowerShell to find TAP adapter and set MacAddress in registry
+	macNoColons := strings.ReplaceAll(macAddr, ":", "")
+	psCmd := fmt.Sprintf(`Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}" | Get-ItemProperty | Where-Object { $_.DriverDesc -like "*TAP*" } | ForEach-Object { Set-ItemProperty -Path $_.PSPath -Name "MacAddress" -Value "%s" }`, macNoColons)
+	cmd := exec.Command("powershell", "-Command", psCmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("PowerShell failed: %v, output: %s", err, string(out))
+	}
+	log.Printf("Set TAP MAC address to %s via PowerShell/registry for %s", macNoColons, ifName)
+	return nil
+}
+
+func setMacViaRegistryByIndex(ifIndex uint32, macAddr string) error {
+	// Use PowerShell to find TAP adapter by ifIndex and set MacAddress in registry
+	macNoColons := strings.ReplaceAll(macAddr, ":", "")
+	psCmd := fmt.Sprintf(`$ifIndex = %d; Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}" | Get-ItemProperty | Where-Object { $_.DriverDesc -like "*TAP*" } | ForEach-Object { Set-ItemProperty -Path $_.PSPath -Name "MacAddress" -Value "%s" }`, ifIndex, macNoColons)
+	cmd := exec.Command("powershell", "-Command", psCmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("PowerShell failed: %v, output: %s", err, string(out))
+	}
+	log.Printf("Set TAP MAC address to %s via PowerShell/registry for IfIndex %d", macNoColons, ifIndex)
+	return nil
+}
+
+func restartTapInterfaceByIndex(ifIndex uint32) {
+	// Skip restart on Windows to avoid invalidating the open TAP handle.
+	// The MAC is already set in the registry during device creation; a restart
+	// here tends to break subsequent reads from the open handle.
+	log.Printf(" Skipping interface restart for IfIndex %d to keep TAP handle valid", ifIndex)
+}
+
+// Deprecated: Use restartTapInterfaceByIndex instead
+func restartTapInterface(ifName string) {
+	restartTapInterfaceByIndex(0)
+}
+
+func (i *Interface) IfMac(macAddr string) error {
 	if i.Iface == nil {
 		return fmt.Errorf("underlying device is nil")
 	}
-	log.Printf("Note: Setting MAC address (%s) handled via registry.", macAddr)
-	actualMac := i.HardwareAddr()
+
 	ifIndex := i.GetIfIndex()
+	log.Printf("Note: Setting MAC address (%s) for IfIndex %d", macAddr, ifIndex)
+
+	// Try PowerShell Set-NetAdapter first (requires admin)
+	macNoColons := strings.ReplaceAll(macAddr, ":", "")
+	psCmd := fmt.Sprintf("Set-NetAdapter -InterfaceIndex %d -MacAddress '%s' -Confirm:$false", ifIndex, macNoColons)
+	cmd := exec.Command("powershell", "-Command", psCmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: PowerShell Set-NetAdapter failed for IfIndex %d: %v, output: %s", ifIndex, err, string(out))
+
+		// Fallback to registry method
+		if err2 := setMacViaRegistryByIndex(ifIndex, macAddr); err2 != nil {
+			log.Printf("Warning: registry MAC set also failed for IfIndex %d: %v", ifIndex, err2)
+		}
+	} else {
+		log.Printf("Successfully set MAC to %s via PowerShell for IfIndex %d", macNoColons, ifIndex)
+	}
+
+	// Restart interface to apply changes
+	restartTapInterfaceByIndex(ifIndex)
+
+	actualMac := i.HardwareAddr()
 	if actualMac != nil {
 		log.Printf("Current MAC for IfIndex %d is %s", ifIndex, actualMac.String())
 	} else {

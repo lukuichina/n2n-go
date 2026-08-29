@@ -28,10 +28,14 @@ func (m *NetworkAllocator) ProposeVirtualNetwork(community string) (netip.Prefix
 	// Use the lower 24 bits of the hash as an offset.
 	offset := binary.BigEndian.Uint32(h[:4]) & 0x00FFFFFF
 
-	// Get the base network as a uint32.
+	// Get the base network and mask as uint32s.
 	base := binary.BigEndian.Uint32(m.baseNetwork)
-	// Combine the base network with the offset.
-	vipUint := base | offset
+	maskUint := binary.BigEndian.Uint32(m.mask)
+
+	// Combine the base network with the offset, keeping the network part intact.
+	// hostPart extracts only the host bits from the offset (clears network bits).
+	hostPart := offset &^ maskUint
+	vipUint := (base & maskUint) | hostPart
 
 	// Convert the uint32 back to an IP.
 	vip := make(net.IP, 4)

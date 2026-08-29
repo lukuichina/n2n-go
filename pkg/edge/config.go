@@ -48,7 +48,7 @@ func DefaultConfig() *Config {
 		TapName:           "n2n_tap0",
 		LocalPort:         0,           // 0 means automatically assigned
 		ConfigFile:        "edge.yaml", // Default config file name.
-		APIListenAddr:     ":7778",
+		APIListenAddr:     "127.0.0.1:7778",
 
 		// WS defaults
 		WSEnabled:    false,
