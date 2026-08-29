@@ -24,11 +24,11 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 	var tap *tuntap.Interface
 	var err error
 
-	// log.Printf("DEBUG: entering setupNetworkComponents, WSEnabled=%v, WSSEnabled=%v, SupernodeURL=%q, SupernodeAddr=%q", cfg.WSEnabled, cfg.WSSEnabled, cfg.SupernodeURL, cfg.SupernodeAddr)
+	log.Printf("DEBUG: entering setupNetworkComponents, WSEnabled=%v, WSSEnabled=%v, SupernodeURL=%q, SupernodeAddr=%q", cfg.WSEnabled, cfg.WSSEnabled, cfg.SupernodeURL, cfg.SupernodeAddr)
 
 	// Check if WS is enabled
 	if (cfg.WSEnabled || strings.HasPrefix(cfg.SupernodeURL, "ws://")) && cfg.SupernodeURL != "" {
-		// log.Printf("DEBUG: taking WS branch")
+		log.Printf("DEBUG: taking WS branch")
 		
 		wsConfig := &transport.WSSTransportConfig{
 			ProxyURL:     cfg.ProxyURL,
@@ -63,7 +63,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			}
 		}
 		
-		// log.Printf("DEBUG: resolving UDP address for host: %q", host)
+		log.Printf("DEBUG: resolving UDP address for host: %q", host)
 		snAddr, err = net.ResolveUDPAddr("udp4", host)
 		if err != nil {
 			wsTransport.Close()
@@ -122,7 +122,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			}
 		}
 		
-		// log.Printf("DEBUG: resolving UDP address for host: %q", host)
+		log.Printf("DEBUG: resolving UDP address for host: %q", host)
 		snAddr, err = net.ResolveUDPAddr("udp4", host)
 		if err != nil {
 			wssTransport.Close()

@@ -64,7 +64,14 @@ func (e *EdgeClient) handleP2PUpdates() {
 	for {
 		select {
 		case <-ticker.C:
-			e.UpdatePeersP2PStates()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("handleP2PUpdates: recovered from panic: %v", r)
+					}
+				}()
+				e.UpdatePeersP2PStates()
+			}()
 		case <-e.ctx.Done():
 			return
 		}

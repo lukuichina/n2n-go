@@ -158,6 +158,11 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 	if err != nil {
 		if runtime.GOOS == "windows" {
 			log.Printf("warn: %v", err)
+			// If MAC modification failed, use the actual TAP MAC to avoid mismatch
+			if actualMac := tap.HardwareAddr(); actualMac != nil {
+				log.Printf("Using actual TAP MAC %s instead of predictable MAC %s", actualMac.String(), predictableMac.String())
+				predictableMac = actualMac
+			}
 		} else {
 			log.Fatalf("err: %v", err)
 		}

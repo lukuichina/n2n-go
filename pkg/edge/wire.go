@@ -85,6 +85,9 @@ func (e *EdgeClient) WritePacket(pt spec.PacketType, dst net.HardwareAddr, paylo
 	}
 
 	// Use UDP
+	if e.Conn == nil {
+		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+	}
 	_, err = e.Conn.WriteToUDP(packet, udpSocket)
 	if err != nil {
 		return fmt.Errorf("failed to send UDP packet: %w", err)
@@ -117,6 +120,9 @@ func (e *EdgeClient) SendStruct(s netstruct.PacketTyped, dst net.HardwareAddr, s
 	}
 
 	// Use UDP
+	if e.Conn == nil {
+		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+	}
 	_, err = e.Conn.WriteToUDP(packet, udpSocket)
 	if err != nil {
 		return fmt.Errorf("failed to send UDP packet: %w", err)
@@ -147,6 +153,9 @@ func (e *EdgeClient) SendVFuze(dst net.HardwareAddr, n int, payload []byte, stra
 	}
 
 	// Use UDP
+	if e.Conn == nil {
+		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+	}
 	_, err = e.Conn.WriteToUDP(packet[:totalLen], udpSocket)
 	if err != nil {
 		return err
