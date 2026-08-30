@@ -3,6 +3,7 @@ package edge
 
 import (
 	"flag"
+	"fmt"
 	"n2n-go/pkg/protocol"
 	"os"
 	"time"
@@ -81,6 +82,16 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 			return nil, err
 		}
 		// Config file not found; ignore error if desired
+	}
+
+	// Print config file path and content for debugging
+	if cfgPath := viper.ConfigFileUsed(); cfgPath != "" {
+		fmt.Printf("Using config file: %s\n", cfgPath)
+		if data, err := os.ReadFile(cfgPath); err == nil {
+			fmt.Printf("Config content:\n%s\n", string(data))
+		} else {
+			fmt.Printf("Failed to read config file: %v\n", err)
+		}
 	}
 
 	if parseFlags {
