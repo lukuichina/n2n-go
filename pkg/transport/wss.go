@@ -35,7 +35,7 @@ type WSSTransportConfig struct {
 	SkipVerify  bool
 	ReadTimeout time.Duration
 	WriteTimeout time.Duration
-	ProxyURL    string // http://, https://, or socks5://
+	ProxyURL    string // http://, https://, socks5://, or socks5s://
 }
 
 // NewWSSTransport creates a WS/WSS client transport (for edge)
@@ -107,7 +107,7 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 // configureProxy configures the websocket dialer to use the specified proxy
 func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
 	if strings.HasPrefix(proxyURL, "socks5://") {
-		// SOCKS5 proxy
+		// SOCKS5 proxy (plain text)
 		addr := strings.TrimPrefix(proxyURL, "socks5://")
 		socksDialer, err := proxy.SOCKS5("tcp", addr, nil, &net.Dialer{
 			Timeout:   10 * time.Second,
@@ -118,6 +118,26 @@ func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
 		}
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return socksDialer.Dial(network, addr)
+		}
+	} else if strings.HasPrefix(proxyURL, "socks5s://") {
+		// SOCKS5 proxy over TLS
+		proxyHost := strings.TrimPrefix(proxyURL, "socks5s://")
+		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Connect to proxy via TLS
+			tlsConn, err := tls.Dial("tcp", proxyHost, &tls.Config{
+				InsecureSkipVerify: true,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to SOCKS5 TLS proxy %s: %w", proxyHost, err)
+			}
+
+			// Perform SOCKS5 handshake over TLS
+			if err := socks5Handshake(tlsConn, addr); err != nil {
+				tlsConn.Close()
+				return nil, fmt.Errorf("SOCKS5 TLS handshake failed: %w", err)
+			}
+
+			return tlsConn, nil
 		}
 	} else if strings.HasPrefix(proxyURL, "http://") {
 		// HTTP proxy - use standard HTTP proxy configuration
@@ -249,4 +269,73 @@ func (t *WSSTransport) SetReadDeadline(deadline time.Time) error {
 // SetWriteDeadline sets the write deadline
 func (t *WSSTransport) SetWriteDeadline(deadline time.Time) error {
 	return t.conn.SetWriteDeadline(deadline)
+}
+
+// socks5Handshake performs a SOCKS5 handshake over an existing connection
+func socks5Handshake(conn net.Conn, targetAddr string) error {
+	// SOCKS5 version and authentication methods
+	// Version 5, 1 authentication method (No authentication: 0x00)
+	_, err := conn.Write([]byte{0x05, 0x01, 0x00})
+	if err != nil {
+		return fmt.Errorf("failed to send SOCKS5 version/methods: %w", err)
+	}
+
+	// Read server's choice of authentication method
+	response := make([]byte, 2)
+	if _, err := conn.Read(response); err != nil {
+		return fmt.Errorf("failed to read SOCKS5 method selection: %w", err)
+	}
+
+	if response[0] != 0x05 {
+		return fmt.Errorf("invalid SOCKS5 version: %d", response[0])
+	}
+	if response[1] == 0xFF {
+		return fmt.Errorf("no acceptable authentication methods")
+	}
+
+	// Send connection request (CONNECT command)
+	// Parse target address
+	addr, err := net.ResolveTCPAddr("tcp", targetAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve target address %s: %w", targetAddr, err)
+	}
+
+	var req []byte
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		// IPv4
+		req = []byte{0x05, 0x01, 0x00, 0x01}
+		req = append(req, ip4...)
+	} else if ip6 := addr.IP.To16(); ip6 != nil {
+		// IPv6
+		req = []byte{0x05, 0x01, 0x00, 0x04}
+		req = append(req, ip6...)
+	} else {
+		// Domain name
+		hostBytes := []byte(addr.IP.String())
+		req = []byte{0x05, 0x01, 0x00, 0x03, byte(len(hostBytes))}
+		req = append(req, hostBytes...)
+	}
+
+	// Port
+	req = append(req, byte(addr.Port>>8), byte(addr.Port&0xFF))
+
+	if _, err := conn.Write(req); err != nil {
+		return fmt.Errorf("failed to send SOCKS5 connect request: %w", err)
+	}
+
+	// Read connection response
+	resp := make([]byte, 10)
+	if _, err := conn.Read(resp); err != nil {
+		return fmt.Errorf("failed to read SOCKS5 connect response: %w", err)
+	}
+
+	if resp[0] != 0x05 {
+		return fmt.Errorf("invalid SOCKS5 version in response: %d", resp[0])
+	}
+
+	if resp[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 connection failed with code: %d", resp[1])
+	}
+
+	return nil
 }

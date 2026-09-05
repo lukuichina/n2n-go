@@ -27,7 +27,7 @@ var (
 		&cli.StringFlag{
 			Name:    "proxy-url",
 			Aliases: []string{"p"},
-			Usage:   "Proxy URL (http://, https://, or socks5://)",
+			Usage:   "Proxy URL (http://, https://, socks5://, or socks5s://)",
 		},
 		&cli.StringFlag{
 			Name:    "supernode-url",

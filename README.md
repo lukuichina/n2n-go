@@ -93,6 +93,7 @@ udp_buffer_size: 8388608
 api_listen_address: ":7778"  # Optional API address
 encryption_passphrase: "YourSecretPassphrase"  # Optional encryption
 compress_payload: false # Optional zstd compression
+proxy_url: "" # Optional proxy URL (http://, https://, socks5://, or socks5s://)
 ```
 
 #### Edge Command-line Options
@@ -111,6 +112,41 @@ compress_payload: false # Optional zstd compression
 | `-api-listen` | API listen address | `:7778` |
 | `-encryption-passphrase` | Passphrase for encryption | - |
 | `-compress-payload` | Enable Zstd compression for data payloads | `false` |
+| `-p` / `--proxy-url` | Proxy URL for WSS transport: `http://`, `https://`, `socks5://`, or `socks5s://` | - |
+
+#### Proxy Configuration
+
+The edge supports connecting to the supernode through a proxy when using WSS transport. This is useful when direct connectivity is restricted.
+
+**Supported proxy schemes:**
+- `http://` - HTTP proxy (plain text)
+- `https://` - HTTPS proxy with TLS
+- `socks5://` - SOCKS5 proxy (plain text)
+- `socks5s://` - SOCKS5 proxy over TLS
+
+**Example usage:**
+
+```bash
+# Using HTTP proxy
+./edge up -s wss://supernode.example.com:443 -p http://proxy.example.com:8080
+
+# Using HTTPS proxy
+./edge up -s wss://supernode.example.com:443 -p https://proxy.example.com:8443
+
+# Using SOCKS5 proxy
+./edge up -s wss://supernode.example.com:443 -p socks5://proxy.example.com:1080
+
+# Using SOCKS5 proxy over TLS
+./edge up -s wss://supernode.example.com:443 -p socks5s://proxy.example.com:1080
+```
+
+**Configuration file example (edge.yaml):**
+
+```yaml
+proxy_url: "socks5s://proxy.example.com:1080"
+```
+
+**Note:** Proxy support is only applicable for WSS (WebSocket Secure) connections. When using `-s` with `ws://` (non-TLS), the proxy will still be used but without the TLS layer.
 
 ### Supernode Configuration (supernode.yaml)
 
