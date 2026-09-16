@@ -19,9 +19,9 @@ func (e *EdgeClient) Unregister() error {
 	var unregErr error
 	e.unregisterOnce.Do(func() {
 		unreg := &netstruct.UnregisterRequest{
-			EdgeMACAddr:        e.MACAddr.String(),
+			EdgeMacAddr:        e.MACAddr.String(),
 			CommunityName:      e.Community,
-			EncryptedMachineID: encMacid,
+			EncryptedMachineId: encMacid,
 		}
 		err := e.SendStruct(unreg, nil, p2p.UDPEnforceSupernode)
 		if err != nil {
@@ -58,7 +58,7 @@ func (e *EdgeClient) sendHeartbeat() error {
 	if err != nil {
 		return fmt.Errorf(" failed to send heartbeat: %w", err)
 	}
-	pulse := &netstruct.HeartbeatPulse{EdgeMACAddr: e.MACAddr.String(), CommunityName: e.Community, EncryptedMachineID: encmacid}
+	pulse := &netstruct.HeartbeatPulse{EdgeMacAddr: e.MACAddr.String(), CommunityName: e.Community, EncryptedMachineId: encmacid}
 	err = e.SendStruct(pulse, nil, p2p.UDPEnforceSupernode)
 	if err != nil {
 		return fmt.Errorf(" failed to send heartbeat: %w", err)
@@ -95,10 +95,8 @@ func (e *EdgeClient) sendP2PFullStateRequest() error {
 	req := &p2p.P2PFullState{
 		CommunityName: e.Community,
 		IsRequest:     true,
-		P2PCommunityDatas: p2p.P2PCommunityDatas{
-			Reachables:   make(map[string]p2p.PeerP2PInfos),
-			UnReachables: make(map[string]p2p.PeerCachedInfo),
-		},
+		Reachables:    make(map[string]*p2p.PeerP2PInfos),
+		Unreachables:  make(map[string]*p2p.PeerCachedInfo),
 	}
 	err := e.SendStruct(req, nil, p2p.UDPEnforceSupernode)
 	if err != nil {

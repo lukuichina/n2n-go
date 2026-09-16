@@ -235,7 +235,7 @@ func (e *EdgeClient) InitialGetSNPublicKey() error {
 		return fmt.Errorf(" short packet while waiting for initial SnSecretsPub")
 	}
 
-	rresp, err := protocol.MessageFromPacket[*netstruct.SNPublicSecret](respBuf, addr)
+	rresp, err := protocol.MessageFromPacket[*netstruct.SnPublicSecret](respBuf[:n], addr)
 	if err != nil {
 		return err
 	}
@@ -280,7 +280,7 @@ func (e *EdgeClient) InitialRegister() error {
 		return fmt.Errorf(" short packet while waiting for initial RegisterResponse")
 	}
 
-	rresp, err := protocol.MessageFromPacket[*netstruct.RegisterResponse](respBuf, addr)
+	rresp, err := protocol.MessageFromPacket[*netstruct.RegisterResponse](respBuf[:n], addr)
 
 	if err != nil {
 		return err
@@ -289,7 +289,7 @@ func (e *EdgeClient) InitialRegister() error {
 	if !rresp.Msg.IsRegisterOk {
 		return ErrNACKRegister
 	}
-	e.VirtualIP = fmt.Sprintf("%s/%d", rresp.Msg.VirtualIP, rresp.Msg.Masklen)
+	e.VirtualIP = fmt.Sprintf("%s/%d", rresp.Msg.VirtualIp, rresp.Msg.Masklen)
 	e.ParsedVirtualIP = net.ParseIP(strings.Split(e.VirtualIP, "/")[0])
 	if e.ParsedVirtualIP == nil {
 		return fmt.Errorf("invalid virtual IP in configuration: %s", e.VirtualIP)
@@ -320,7 +320,7 @@ func (e *EdgeClient) TunUp() error {
 func (e *EdgeClient) RequestSNPublicKey() error {
 	log.Printf("Trying to get Supernode publickey with supernode at %s...", e.SupernodeAddr)
 
-	reqPub := &netstruct.SNPublicSecret{
+	reqPub := &netstruct.SnPublicSecret{
 		IsRequest: true,
 	}
 
@@ -336,10 +336,10 @@ func (e *EdgeClient) RequestRegister() error {
 	}
 
 	regReq := &netstruct.RegisterRequest{
-		EdgeMACAddr:        e.MACAddr.String(),
+		EdgeMacAddr:        e.MACAddr.String(),
 		EdgeDesc:           e.ID,
 		CommunityName:      e.Community,
-		EncryptedMachineID: encMachineID,
+		EncryptedMachineId: encMachineID,
 	}
 
 	return e.SendStruct(regReq, nil, p2p.UDPEnforceSupernode)

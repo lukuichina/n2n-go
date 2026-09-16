@@ -1,11 +1,15 @@
 package codec
 
 import (
-	"bytes"
-	"encoding/gob"
 	"fmt"
+	"reflect"
+
+	"google.golang.org/protobuf/proto"
 )
 
+// Codec provides protobuf-based serialization for protocol messages.
+// T must be a pointer to a type implementing proto.Message
+// (e.g., *netstruct.RegisterRequest, *p2p.pb.PeerInfo).
 type Codec[T any] struct {
 	encodable *T
 }
@@ -25,71 +29,37 @@ func (c *Codec[T]) Decode(data []byte) (*T, error) {
 	return Decode[T](data)
 }
 
-type Encoder[T any] struct {
-	buffer    bytes.Buffer
-	encodable T
-}
-
-// data, err := codec.NewEncoder(t).Encode()
-func NewEncoder[T any](x T) *Encoder[T] {
-	return &Encoder[T]{
-		encodable: x,
+// Encode serializes a protobuf message using proto.Marshal.
+// T must be a pointer to a type implementing proto.Message.
+func Encode[T any](x T) ([]byte, error) {
+	msg, ok := any(x).(proto.Message)
+	if !ok {
+		return nil, fmt.Errorf("type %T does not implement proto.Message", x)
 	}
+	return proto.Marshal(msg)
 }
 
-func (e *Encoder[T]) Encode() ([]byte, error) {
-	enc := gob.NewEncoder(&e.buffer)
-	err := enc.Encode(e.encodable)
-	if err != nil {
-		return nil, fmt.Errorf("error while encoding: %w", err)
-	}
-	return e.buffer.Bytes(), nil
-}
-
-type Decoder[T any] struct {
-	data      []byte
-	decodable *T
-}
-
-// err := codec.NewDecoder(data, &t).Decode()
-func NewDecoder[T any](data []byte, x *T) *Decoder[T] {
-	return &Decoder[T]{
-		data:      data,
-		decodable: x,
-	}
-}
-
-func (d *Decoder[T]) Decode() error {
-	r := bytes.NewReader(d.data)
-	enc := gob.NewDecoder(r) // Will write to network.
-	pil := d.decodable
-	err := enc.Decode(pil)
-	if err != nil {
-		return fmt.Errorf("error while decoding : %w", err)
-	}
-	return nil
-}
-
-// data, err := codec.NewEncoder(t).Encode()
-
-func Encode[T any](pil T) ([]byte, error) {
-	var buffer bytes.Buffer
-	enc := gob.NewEncoder(&buffer)
-	err := enc.Encode(pil)
-	if err != nil {
-		return nil, fmt.Errorf("error while encoding: %w", err)
-	}
-	return buffer.Bytes(), nil
-}
-
+// Decode deserializes a protobuf message using proto.Unmarshal.
+// T must be a pointer to a type implementing proto.Message.
+// If T is a nil pointer, the underlying struct is allocated automatically.
+// Returns a pointer to T (which may be **T if T is already a pointer).
 func Decode[T any](data []byte) (*T, error) {
 	var x T
-	r := bytes.NewReader(data)
-	enc := gob.NewDecoder(r) // Will write to network.
-	pil := &x
-	err := enc.Decode(pil)
-	if err != nil {
-		return nil, fmt.Errorf("error while decoding : %w", err)
+
+	// If x is a nil pointer, allocate the underlying struct
+	rv := reflect.ValueOf(&x).Elem()
+	if rv.Kind() == reflect.Ptr && rv.IsNil() {
+		rv.Set(reflect.New(rv.Type().Elem()))
 	}
-	return pil, nil
+
+	msg, ok := any(x).(proto.Message)
+	if !ok {
+		return nil, fmt.Errorf("type %T does not implement proto.Message", x)
+	}
+
+	err := proto.Unmarshal(data, msg)
+	if err != nil {
+		return nil, fmt.Errorf("error while decoding: %w", err)
+	}
+	return &x, nil
 }

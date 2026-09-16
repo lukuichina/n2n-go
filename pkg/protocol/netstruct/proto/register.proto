@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package netstruct;
+
+option go_package = "n2n-go/pkg/protocol/netstruct/pb";
+
+// 对应 Go 中的 SNPublicSecret
+message SnPublicSecret {
+  bool is_request = 1;
+  bytes pem_data = 2;
+}
+
+// 对应 Go 中的 RegisterRequest
+message RegisterRequest {
+  string edge_mac_addr = 1;
+  string edge_desc = 2;
+  string community_name = 3;
+  bytes encrypted_machine_id = 4;
+  bytes clear_machine_id = 5;
+}
+
+// 对应 Go 中的 RetryRegisterRequest
+message RetryRegisterRequest {}
+
+// 对应 Go 中的 RegisterResponse
+message RegisterResponse {
+  bool is_register_ok = 1;
+  string virtual_ip = 2;
+  int32 masklen = 3;
+}
+
+// 对应 Go 中的 HeartbeatPulse
+message HeartbeatPulse {
+  string edge_mac_addr = 1;
+  string community_name = 2;
+  bytes encrypted_machine_id = 3;
+  bytes clear_machine_id = 4;
+}
+
+// 对应 Go 中的 UnregisterRequest
+message UnregisterRequest {
+  string edge_mac_addr = 1;
+  string community_name = 2;
+  bytes encrypted_machine_id = 3;
+}

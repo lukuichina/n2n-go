@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package netstruct;
+
+option go_package = "n2n-go/pkg/protocol/netstruct/pb";
+
+// 对应 Go 中的 LeaseEdgeInfos
+message IppoolLease {
+  bytes ip = 1;
+  string mac = 2;
+  int64 expiry_ns = 3;
+  bool sticky = 4;
+  int64 last_renew_ns = 5;
+}
+
+message LeaseEdgeInfos {
+  string edge_id = 1;
+  bool is_registered = 2;
+  int64 time_since_last_update_ns = 3;
+  bytes virtual_ip = 4;
+}
+
+message LeaseWithEdgeInfos {
+  IppoolLease lease = 1;
+  LeaseEdgeInfos lease_edge_infos = 2;
+}
+
+message LeasesInfos {
+  bool is_request = 1;
+  string community_name = 2;
+  map<string, LeaseWithEdgeInfos> leases_with_edges_infos = 3;
+}
+
+message OnlineCheck {
+  bool is_reply = 1;
+  string cookie = 2;
+}

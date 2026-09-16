@@ -43,7 +43,7 @@ func snPeerEdges(peersNodeIDs map[string]string) string {
 	return result
 }
 
-func P2VizGenOfflinesDot(offlines map[string]PeerCachedInfo) string {
+func P2VizGenOfflinesDot(offlines map[string]*PeerCachedInfo) string {
 	var offnodes string
 	keys := make([]string, 0, len(offlines))
 	for k := range offlines {
@@ -51,7 +51,7 @@ func P2VizGenOfflinesDot(offlines map[string]PeerCachedInfo) string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		offnodes = add_offline(offnodes, offlines[k].Desc, offlines[k].VirtualIP.String())
+		offnodes = add_offline(offnodes, offlines[k].GetDesc(), offlines[k].GetVirtualIp())
 	}
 	return fmt.Sprintf(offlinegraph, offnodes)
 }
@@ -163,13 +163,13 @@ func (ppk PeerPairKey) getPeers() (peerA, peerB string, err error) {
 type CommunityP2PVizDatas struct {
 	CommunityName        string
 	PeersDescToVIP       map[string]string
-	P2PAvailabilityInfos map[string]PeerP2PInfos
+	P2PAvailabilityInfos map[string]*PeerP2PInfos
 	ConnectionData       map[PeerDirectedPairKey]ConnectionInfo
 	PeerPairs            map[PeerPairKey]bool
 	P2PStates            map[PeerPairKey]ConnectionType
 }
 
-func NewCommunityP2PVizDatas(community string, peerInfos map[string]PeerP2PInfos) (*CommunityP2PVizDatas, error) {
+func NewCommunityP2PVizDatas(community string, peerInfos map[string]*PeerP2PInfos) (*CommunityP2PVizDatas, error) {
 	peersDescToVIP := make(map[string]string)
 	connectionData := make(map[PeerDirectedPairKey]ConnectionInfo)
 	peerPairs := make(map[PeerPairKey]bool)
@@ -177,15 +177,15 @@ func NewCommunityP2PVizDatas(community string, peerInfos map[string]PeerP2PInfos
 
 	// connectionData
 	for _, peerInfo := range peerInfos {
-		fromID := peerInfo.From.Infos.Desc
-		fromVIP := peerInfo.From.Infos.VirtualIP.String()
+		fromID := peerInfo.GetFrom().GetDesc()
+		fromVIP := peerInfo.GetFrom().GetVirtualIp()
 		peersDescToVIP[fromID] = fromVIP
 
-		for _, toPeer := range peerInfo.To {
-			toID := toPeer.Infos.Desc
+		for _, toPeer := range peerInfo.GetTo() {
+			toID := toPeer.GetDesc()
 			connKey := newPeerDirectedPairKey(fromID, toID)
 			connectionData[connKey] = ConnectionInfo{
-				Status:   toPeer.P2PStatus,
+				Status:   P2PUnknown,
 				FromPeer: fromID,
 				ToPeer:   toID,
 			}

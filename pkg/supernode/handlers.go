@@ -98,7 +98,7 @@ func (s *Supernode) handleUnregisterMessage(r *protocol.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.ValidateEdgeClaimedMACAddr(unReg.EdgeMACAddr(), unReg.Msg.EncryptedMachineID, unReg.Msg.CommunityName)
+	_, err = s.ValidateEdgeClaimedMACAddr(unReg.EdgeMACAddr(), unReg.Msg.EncryptedMachineId, unReg.Msg.CommunityName)
 	if err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func (s *Supernode) handleRegisterMessage(r *protocol.RawMessage) error {
 	rresp := &netstruct.RegisterResponse{}
 	edge, cm, err := s.RegisterEdge(reg)
 	if edge == nil || err != nil {
-		log.Printf("Supernode: Registration failed for %s: %v", reg.Msg.EdgeMACAddr, err)
+		log.Printf("Supernode: Registration failed for %s: %v", reg.Msg.EdgeMacAddr, err)
 		rresp.IsRegisterOk = false
 		s.SendStruct(rresp, reg.Msg.CommunityName, s.MacADDR(), nil, r.FromAddr)
 		s.stats.PacketsDropped.Add(1)
@@ -136,8 +136,8 @@ func (s *Supernode) handleRegisterMessage(r *protocol.RawMessage) error {
 	s.edgeMu.Unlock()
 
 	rresp.IsRegisterOk = true
-	rresp.VirtualIP = edge.VirtualIP.String()
-	rresp.Masklen = edge.VNetMaskLen
+	rresp.VirtualIp = edge.VirtualIP.String()
+	rresp.Masklen = int32(edge.VNetMaskLen)
 	s.SendStruct(rresp, reg.Msg.CommunityName, s.MacADDR(), nil, r.FromAddr)
 
 	pil := newPeerInfoEvent(p2p.TypeRegister, edge)
@@ -154,11 +154,11 @@ func (s *Supernode) handleHeartbeatMessage(r *protocol.RawMessage) error {
 		return err
 	}
 	s.stats.HeartbeatsReceived.Add(1)
-	decmacid, err := s.DecryptMachineID(pulse.Msg.EncryptedMachineID)
+	decmacid, err := s.DecryptMachineID(pulse.Msg.EncryptedMachineId)
 	if err != nil {
 		return err
 	}
-	pulse.Msg.ClearMachineID = decmacid
+	pulse.Msg.ClearMachineId = decmacid
 	changed, err := cm.RefreshEdge(pulse)
 	if err != nil {
 		return err
@@ -218,14 +218,14 @@ func (s *Supernode) handlePingMessage(r *protocol.RawMessage) error { //packet [
 }
 
 func (s *Supernode) handleSNPublicSecretMessage(r *protocol.RawMessage) error {
-	secretMsg, err := protocol.ToMessage[*netstruct.SNPublicSecret](r)
+	secretMsg, err := protocol.ToMessage[*netstruct.SnPublicSecret](r)
 	if err != nil {
 		return err
 	}
 	if !secretMsg.Msg.IsRequest {
 		return fmt.Errorf("supernode handle only snpublicsecret requests")
 	}
-	resp := &netstruct.SNPublicSecret{
+	resp := &netstruct.SnPublicSecret{
 		IsRequest: false,
 		PemData:   s.SNSecrets.Pem,
 	}

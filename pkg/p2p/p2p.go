@@ -3,7 +3,6 @@ package p2p
 import (
 	"fmt"
 	"n2n-go/pkg/log"
-	"n2n-go/pkg/protocol/spec"
 	"net"
 	"sync"
 	"time"
@@ -44,28 +43,9 @@ func (pt P2PCapacity) String() string {
 	}
 }
 
-type PeerP2PInfos struct {
-	From *Peer
-	To   []*Peer
-}
-
-func (psi *PeerP2PInfos) PacketType() spec.PacketType {
-	return spec.TypeP2PStateInfo
-}
-
-type P2PFullState struct {
-	CommunityName string
-	IsRequest     bool
-	P2PCommunityDatas
-}
-
 type P2PCommunityDatas struct {
-	Reachables   map[string]PeerP2PInfos
-	UnReachables map[string]PeerCachedInfo
-}
-
-func (pfs *P2PFullState) PacketType() spec.PacketType {
-	return spec.TypeP2PFullState
+	Reachables   map[string]*PeerP2PInfos
+	UnReachables map[string]*PeerCachedInfo
 }
 
 type Peer struct {
@@ -93,7 +73,7 @@ type PeerRegistry struct {
 	hasPendingChanges       bool
 }
 
-func (reg *PeerRegistry) UpdateP2PCommunityDatas(reachables map[string]PeerP2PInfos, unreachables map[string]PeerCachedInfo) error {
+func (reg *PeerRegistry) UpdateP2PCommunityDatas(reachables map[string]*PeerP2PInfos, unreachables map[string]*PeerCachedInfo) error {
 	if reachables == nil {
 		return fmt.Errorf("received nil reachables in P2PFullStateMessage")
 	}
@@ -104,7 +84,7 @@ func (reg *PeerRegistry) UpdateP2PCommunityDatas(reachables map[string]PeerP2PIn
 	if unreachables != nil {
 		reg.UnReachables = unreachables
 	} else {
-		reg.UnReachables = make(map[string]PeerCachedInfo)
+		reg.UnReachables = make(map[string]*PeerCachedInfo)
 	}
 	reg.IsWaitingCommunityDatas = false
 
@@ -152,12 +132,12 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 }
 
 func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
-	var to []*Peer
+	var to []*PeerInfo
 	for _, v := range reg.Peers {
-		to = append(to, v)
+		to = append(to, &v.Infos)
 	}
 	return &PeerP2PInfos{
-		From: reg.Me,
+		From: &reg.Me.Infos,
 		To:   to,
 	}
 }
@@ -207,7 +187,7 @@ func (p *Peer) SetFullDuplex(value bool) (bool, error) {
 		}
 	}
 	if value != p.IsFullDuplex {
-		log.Printf("updated peer %s/%s/%s with FullDuplex=%v", p.Infos.Desc, p.Infos.VirtualIP.String(), p.Infos.MACAddr.String(), value)
+		log.Printf("updated peer %s/%s/%s with FullDuplex=%v", p.Infos.Desc, p.Infos.VirtualIp, net.HardwareAddr(p.Infos.MacAddr).String(), value)
 		changed = true
 	}
 	p.IsFullDuplex = value
@@ -239,7 +219,7 @@ func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
 	}
 	p.UpdatedAt = time.Now()
 	if !skipLog {
-		log.Printf("updated peer %s/%s/%s with P2PStatus=%s %s", p.Infos.Desc, p.Infos.VirtualIP.String(), p.Infos.MACAddr.String(), p.P2PStatus.String(), forcedStatement)
+		log.Printf("updated peer %s/%s/%s with P2PStatus=%s %s", p.Infos.Desc, p.Infos.VirtualIp, net.HardwareAddr(p.Infos.MacAddr).String(), p.P2PStatus.String(), forcedStatement)
 	}
 	return previousStatus != status
 }
@@ -248,14 +228,14 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 	reg.peerMu.Lock()
 	defer reg.peerMu.Unlock()
 
-	macAddr := infos.MACAddr.String()
+	macAddr := net.HardwareAddr(infos.MacAddr).String()
 	if existingPeer, exists := reg.Peers[macAddr]; exists {
 		origPeer := *existingPeer
 		if !overwrite {
 			return nil, fmt.Errorf("peer with MAC address %s already exists", macAddr)
 		}
-		if existingPeer.Infos.VirtualIP != infos.VirtualIP ||
-			existingPeer.Infos.PubSocket.String() != infos.PubSocket.String() {
+		if existingPeer.Infos.VirtualIp != infos.VirtualIp ||
+			existingPeer.Infos.PubSocket != infos.PubSocket {
 			log.Printf("peer with MAC %s updated with network difference: resetting P2PStatus", macAddr)
 			existingPeer.P2PStatus = P2PUnknown
 			existingPeer.P2PCheckID = ""
@@ -263,9 +243,9 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 
 		existingPeer.Infos = infos
 		existingPeer.UpdatedAt = time.Now()
-		log.Printf("updated peer nown hold of %s MACAddr:", macAddr)
-		log.Printf(" was: vip=%s PubSocket=%s desc=%s", origPeer.Infos.VirtualIP, origPeer.Infos.PubSocket, origPeer.Infos.Desc)
-		log.Printf(" now: vip=%s PubSocket=%s desc=%s", existingPeer.Infos.VirtualIP, existingPeer.Infos.PubSocket, existingPeer.Infos.Desc)
+		log.Printf("updated peer now hold of %s MACAddr:", macAddr)
+		log.Printf(" was: vip=%s PubSocket=%s desc=%s", origPeer.Infos.VirtualIp, origPeer.Infos.PubSocket, origPeer.Infos.Desc)
+		log.Printf(" now: vip=%s PubSocket=%s desc=%s", existingPeer.Infos.VirtualIp, existingPeer.Infos.PubSocket, existingPeer.Infos.Desc)
 		delete(reg.peerBySocket, origPeer.UDPAddr().String())
 		reg.peerBySocket[existingPeer.UDPAddr().String()] = existingPeer
 		reg.SetPendingChanges()
@@ -279,7 +259,7 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 	}
 	reg.Peers[macAddr] = peer
 	reg.peerBySocket[peer.UDPAddr().String()] = peer
-	log.Printf("added peer %s/%s/%s with PubSocket=%s", peer.Infos.Desc, peer.Infos.VirtualIP.String(), peer.Infos.MACAddr.String(), peer.Infos.PubSocket)
+	log.Printf("added peer %s/%s/%s with PubSocket=%s", peer.Infos.Desc, peer.Infos.VirtualIp, net.HardwareAddr(peer.Infos.MacAddr).String(), peer.Infos.PubSocket)
 	reg.SetPendingChanges()
 	return peer, nil
 }
@@ -294,7 +274,7 @@ func (reg *PeerRegistry) RemovePeer(MACAddr string) error {
 	}
 
 	dDesc := p.Infos.Desc
-	dVip := p.Infos.VirtualIP.String()
+	dVip := p.Infos.VirtualIp
 	dUDPAddrString := p.UDPAddr().String()
 	delete(reg.Peers, MACAddr)
 	delete(reg.peerBySocket, dUDPAddrString)
@@ -304,10 +284,20 @@ func (reg *PeerRegistry) RemovePeer(MACAddr string) error {
 }
 
 func (p *Peer) UDPAddr() *net.UDPAddr {
-	return &net.UDPAddr{
-		IP:   p.Infos.PubSocket.IP,
-		Port: p.Infos.PubSocket.Port,
+	return parseUDPAddr(p.Infos.PubSocket)
+}
+
+func parseUDPAddr(socket string) *net.UDPAddr {
+	host, portStr, err := net.SplitHostPort(socket)
+	if err != nil {
+		return nil
 	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil
+	}
+	port, _ := net.LookupPort("udp", portStr)
+	return &net.UDPAddr{IP: ip, Port: port}
 }
 
 func (reg *PeerRegistry) GetP2PUnknownPeers() []*Peer {
@@ -349,7 +339,7 @@ func (reg *PeerRegistry) GetP2PAvailablePeers() []*Peer {
 // with an option to overwrite existing P2PStatuses, or it may add or delete peers.
 func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bool, overwrite bool) error {
 
-	switch peerInfoList.EventType {
+	switch PeerInfoEventType(peerInfoList.GetEventType()) {
 	case TypeList:
 		if reset {
 			reg.peerMu.Lock()
@@ -358,16 +348,16 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 			reg.peerMu.Unlock()
 			log.Printf("resetting peer registry")
 		}
-		if peerInfoList.HasOrigin {
+		if peerInfoList.GetHasOrigin() {
 			me := &Peer{
-				Infos:     peerInfoList.Origin,
+				Infos:     *peerInfoList.GetOrigin(),
 				UpdatedAt: time.Now(),
 			}
 			reg.Me = me
 			log.Printf("setting self PeerInfo from Origin Peerlist in supernode")
 		}
-		for _, info := range peerInfoList.PeerInfos {
-			_, err := reg.AddPeer(info, overwrite)
+		for _, info := range peerInfoList.GetPeerInfos() {
+			_, err := reg.AddPeer(*info, overwrite)
 			if err != nil {
 				return fmt.Errorf("failed to add peer: %v", err)
 			}
@@ -375,8 +365,8 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 		if !reset {
 			// Remove peers that are not in the new list
 			newPeers := make(map[string]struct{})
-			for _, info := range peerInfoList.PeerInfos {
-				macAddr := info.MACAddr.String()
+			for _, info := range peerInfoList.GetPeerInfos() {
+				macAddr := net.HardwareAddr(info.MacAddr).String()
 				newPeers[macAddr] = struct{}{}
 			}
 
@@ -388,22 +378,22 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 			}
 		}
 	case TypeRegister:
-		for _, info := range peerInfoList.PeerInfos {
-			_, err := reg.AddPeer(info, overwrite)
+		for _, info := range peerInfoList.GetPeerInfos() {
+			_, err := reg.AddPeer(*info, overwrite)
 			if err != nil {
 				return fmt.Errorf("failed to add peer: %v", err)
 			}
 		}
 	case TypeUnregister:
-		for _, info := range peerInfoList.PeerInfos {
-			macAddr := info.MACAddr.String()
+		for _, info := range peerInfoList.GetPeerInfos() {
+			macAddr := net.HardwareAddr(info.MacAddr).String()
 			err := reg.RemovePeer(macAddr)
 			if err != nil {
 				return fmt.Errorf("failed to remove peer: %v", err)
 			}
 		}
 	default:
-		return fmt.Errorf("unknown event type: %v", peerInfoList.EventType)
+		return fmt.Errorf("unknown event type: %v", peerInfoList.GetEventType())
 	}
 	return nil
 }

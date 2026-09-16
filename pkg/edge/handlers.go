@@ -15,7 +15,7 @@ import (
 var ErrNACKRegister = errors.New("Edge: supernode refused register request. Aborting")
 
 func (e *EdgeClient) handleSNPublicSecretMessage(r *protocol.RawMessage) error {
-	rresp, err := protocol.ToMessage[*netstruct.SNPublicSecret](r)
+	rresp, err := protocol.ToMessage[*netstruct.SnPublicSecret](r)
 	if err != nil {
 		return err
 	}
@@ -162,7 +162,7 @@ func (e *EdgeClient) handleP2PFullStateMessage(r *protocol.RawMessage) error {
 	if fstateMsg.Msg.IsRequest {
 		return fmt.Errorf("edge shall not received Request type P2PFullStateMessage")
 	}
-	return e.Peers.UpdateP2PCommunityDatas(fstateMsg.Msg.Reachables, fstateMsg.Msg.UnReachables)
+	return e.Peers.UpdateP2PCommunityDatas(fstateMsg.Msg.Reachables, fstateMsg.Msg.Unreachables)
 }
 
 func (e *EdgeClient) handlePingMessage(r *protocol.RawMessage) error {
@@ -170,7 +170,7 @@ func (e *EdgeClient) handlePingMessage(r *protocol.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	// If it is PING message, answer with pong and CheckID payload
+	// If it is PING message, answer with pong and CheckId payload
 	if !pingMsg.Msg.IsPong {
 		// swap dst/src
 		dst, err := net.ParseMAC(pingMsg.EdgeMACAddr())
@@ -182,7 +182,7 @@ func (e *EdgeClient) handlePingMessage(r *protocol.RawMessage) error {
 		}
 		pongMsg := &netstruct.PeerToPing{
 			IsPong:  true,
-			CheckID: pingMsg.Msg.CheckID,
+			CheckId: pingMsg.Msg.CheckId,
 		}
 		e.SendStruct(pongMsg, dst, p2p.UDPBestEffort)
 	} else {
@@ -191,12 +191,12 @@ func (e *EdgeClient) handlePingMessage(r *protocol.RawMessage) error {
 		if err != nil {
 			return fmt.Errorf("received a pong for a MACAddress %s not in our peers list", pingMsg.EdgeMACAddr())
 		}
-		if p.P2PCheckID == pingMsg.Msg.CheckID {
-			if p.UpdateP2PStatus(p2p.P2PAvailable, pingMsg.Msg.CheckID) {
+		if p.P2PCheckID == pingMsg.Msg.CheckId {
+			if p.UpdateP2PStatus(p2p.P2PAvailable, pingMsg.Msg.CheckId) {
 				e.Peers.SetPendingChanges()
 			}
 		} else {
-			err = fmt.Errorf("received a pong for MACAddress %s but checkID differs (want %s, received %s)", pingMsg.EdgeMACAddr(), p.P2PCheckID, pingMsg.Msg.CheckID)
+			err = fmt.Errorf("received a pong for MACAddress %s but checkID differs (want %s, received %s)", pingMsg.EdgeMACAddr(), p.P2PCheckID, pingMsg.Msg.CheckId)
 			if p.UpdateP2PStatus(p2p.P2PUnknown, "") {
 				e.Peers.SetPendingChanges()
 			}

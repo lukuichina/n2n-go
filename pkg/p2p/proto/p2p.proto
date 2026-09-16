@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package p2p;
+
+option go_package = "n2n-go/pkg/p2p/pb";
+
+// 对应 Go 中的 PeerInfo
+message PeerInfo {
+  string virtual_ip = 1;
+  bytes mac_addr = 2;
+  string pub_socket = 3;
+  string community = 4;
+  string desc = 5;
+}
+
+// 对应 Go 中的 PeerInfoList
+message PeerInfoList {
+  bool has_origin = 1;
+  PeerInfo origin = 2;
+  repeated PeerInfo peer_infos = 3;
+  uint32 event_type = 4;
+}
+
+// 对应 Go 中的 PeerP2PInfos
+message PeerP2PInfos {
+  PeerInfo from = 1;
+  repeated PeerInfo to = 2;
+}
+
+// 对应 Go 中的 P2PFullState
+message P2PFullState {
+  string community_name = 1;
+  bool is_request = 2;
+  // Reachables: map[string]PeerP2PInfos
+  map<string, PeerP2PInfos> reachables = 3;
+  // UnReachables: map[string]PeerCachedInfo
+  map<string, PeerCachedInfo> unreachables = 4;
+}
+
+// 对应 Go 中的 PeerCachedInfo
+message PeerCachedInfo {
+  string desc = 1;
+  string mac_addr = 2;
+  string virtual_ip = 3;
+  string community = 4;
+  // time.Duration serialized as int64 nanoseconds
+  int64 last_update_ns = 5;
+}

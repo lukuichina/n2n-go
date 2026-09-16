@@ -19,38 +19,38 @@ func (e *EdgeClient) UpdatePeersP2PStates() {
 	for _, p := range peers {
 		err := e.PingPeer(p, 3, 300*time.Second, p2p.P2PPending)
 		if err != nil {
-			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", p.Infos.MACAddr.String(), err)
+			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
 		}
 	}
 	peers = e.Peers.GetP2PendingPeers()
 	for _, p := range peers {
 		err := e.PingPeer(p, 3, 300*time.Second, p2p.P2PPending)
 		if err != nil {
-			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", p.Infos.MACAddr.String(), err)
+			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
 		}
 	}
 	peers = e.Peers.GetP2PAvailablePeers()
 	for _, p := range peers {
 		err := e.PingPeer(p, 3, 300*time.Millisecond, p2p.P2PAvailable)
 		if err != nil {
-			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", p.Infos.MACAddr.String(), err)
+			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
 		}
 	}
 }
 
 func (e *EdgeClient) PingPeer(p *p2p.Peer, n int, interval time.Duration, status p2p.P2PCapacity) error {
-	checkid := fmt.Sprintf("%s.%s.%s.%s.%d", e.ID, e.MACAddr.String(), p.Infos.MACAddr.String(), p.Infos.PubSocket.IP.String(), p.Infos.PubSocket.Port)
+	checkid := fmt.Sprintf("%s.%s.%s.%s.%d", e.ID, e.MACAddr.String(), net.HardwareAddr(p.Infos.MacAddr).String(), p.Infos.PubSocket, 0)
 	pingMsg := &netstruct.PeerToPing{
 		IsPong:  false,
-		CheckID: checkid,
+		CheckId: checkid,
 	}
 	if p.UpdateP2PStatus(status, checkid) {
 		e.Peers.SetPendingChanges()
 	}
 	for range n {
-		e.SendStruct(pingMsg, p.Infos.MACAddr, p2p.UDPEnforceP2P)
+		e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPEnforceP2P)
 	}
-	return e.SendStruct(pingMsg, p.Infos.MACAddr, p2p.UDPEnforceP2P)
+	return e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPEnforceP2P)
 }
 
 // handleHeartbeat sends heartbeat messages periodically

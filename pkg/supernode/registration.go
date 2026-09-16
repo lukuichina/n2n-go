@@ -75,11 +75,11 @@ func (s *Supernode) GetCommunity(i EdgeAddressable) (*Community, error) {
 // RegisterEdge registers or updates an edge in the supernode
 func (s *Supernode) RegisterEdge(regMsg *protocol.Message[*netstruct.RegisterRequest]) (*Edge, *Community, error) {
 
-	machineID, err := s.ValidateEdgeClaimedMACAddr(regMsg.EdgeMACAddr(), regMsg.Msg.EncryptedMachineID, regMsg.Msg.CommunityName)
+	machineID, err := s.ValidateEdgeClaimedMACAddr(regMsg.EdgeMACAddr(), regMsg.Msg.EncryptedMachineId, regMsg.Msg.CommunityName)
 	if err != nil {
 		return nil, nil, err
 	}
-	regMsg.Msg.ClearMachineID = machineID
+	regMsg.Msg.ClearMachineId = machineID
 
 	cm, err := s.RegisterCommunity(regMsg.Msg.CommunityName, regMsg.CommunityHash())
 	if err != nil {
@@ -162,33 +162,34 @@ func (s *Supernode) GetEdgeCachedInfo(macAddr string) (*EdgeCachedInfos, bool) {
 	return infos, ok
 }
 
-func (s *Supernode) GetOfflineCachedEdges(cm *Community) (map[string]p2p.PeerCachedInfo, error) {
+func (s *Supernode) GetOfflineCachedEdges(cm *Community) (map[string]*p2p.PeerCachedInfo, error) {
 	if cm == nil {
 		return nil, fmt.Errorf("nil community error")
 	}
 	communityName := cm.Name()
-	offlineEdges := make(map[string]p2p.PeerCachedInfo)
+	offlineEdges := make(map[string]*p2p.PeerCachedInfo)
 	s.edgeCacheMu.RLock()
 	defer s.edgeCacheMu.RUnlock()
 	for _, v := range s.edgeCachedInfos {
 		if v.Community != communityName || v.IsRegistered {
 			continue
 		}
-		offlineEdges[v.MACAddr] = p2p.PeerCachedInfo{
-			Desc:       v.Desc,
-			MACAddr:    v.MACAddr,
-			Community:  communityName,
-			LastUpdate: v.UpdatedAt,
-			VirtualIP:  v.VirtualIP,
+		offlineEdges[v.MACAddr] = &p2p.PeerCachedInfo{
+			Desc:         v.Desc,
+			MacAddr:      v.MACAddr,
+			Community:    communityName,
+			LastUpdateNs: int64(time.Since(v.UpdatedAt)),
+			VirtualIp:    v.VirtualIP.String(),
 		}
 	}
 	return offlineEdges, nil
 }
 func newPeerInfoEvent(eventType p2p.PeerInfoEventType, edge *Edge) *p2p.PeerInfoList {
+	pi := edge.PeerInfo()
 	return &p2p.PeerInfoList{
-		PeerInfos: []p2p.PeerInfo{
-			edge.PeerInfo(),
+		PeerInfos: []*p2p.PeerInfo{
+			&pi,
 		},
-		EventType: eventType,
+		EventType: uint32(eventType),
 	}
 }

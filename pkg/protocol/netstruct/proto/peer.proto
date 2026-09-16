@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package netstruct;
+
+option go_package = "n2n-go/pkg/protocol/netstruct/pb";
+
+// 对应 Go 中的 PeerListRequest
+message PeerListRequest {
+  string community_name = 1;
+}
+
+// 对应 Go 中的 PeerToPing
+message PeerToPing {
+  string check_id = 1;
+  bool is_pong = 2;
+}
