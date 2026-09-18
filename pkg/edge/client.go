@@ -241,6 +241,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 	edge.messageHandlers[spec.TypeRetryRegisterRequest] = edge.handleRetryRegisterRequest
 	edge.messageHandlers[spec.TypeRegisterResponse] = edge.handleRegisterResponseMessage
 	edge.messageHandlers[spec.TypeSNPublicSecret] = edge.handleSNPublicSecretMessage
+	edge.messageHandlers[spec.TypeHeartbeat] = edge.handleHeartbeatMessage
 	return edge, nil
 }
 

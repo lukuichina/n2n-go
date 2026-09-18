@@ -166,6 +166,17 @@ func (e *EdgeClient) handleTAP() {
 			continue
 		}
 
+		// Log ARP frames (both request/broadcast and reply/unicast)
+		if ethertype == tuntap.EthertypeARP {
+			dstMAC := tuntap.FastDestination(frameBuf)
+			srcMAC := tuntap.FastSource(frameBuf)
+			if tuntap.IsBroadcast(dstMAC) {
+				log.Printf("TAP read ARP request (broadcast) from %s, frame len=%d", srcMAC, n)
+			} else {
+				log.Printf("TAP read ARP reply (unicast) from %s to %s, frame len=%d", srcMAC, dstMAC, n)
+			}
+		}
+
 		payload, err := e.ProcessOutgoingPayload(frameBuf[:n])
 		if err != nil {
 			log.Printf("Failed to process Outgoing payload %v", err)

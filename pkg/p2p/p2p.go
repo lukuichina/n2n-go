@@ -132,6 +132,9 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 }
 
 func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
+	if reg.Me == nil {
+		return &PeerP2PInfos{}
+	}
 	var to []*PeerInfo
 	for _, v := range reg.Peers {
 		to = append(to, &v.Infos)

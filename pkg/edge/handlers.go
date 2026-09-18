@@ -14,6 +14,11 @@ import (
 
 var ErrNACKRegister = errors.New("Edge: supernode refused register request. Aborting")
 
+func (e *EdgeClient) handleHeartbeatMessage(r *protocol.RawMessage) error {
+	// Heartbeat from relay (WS mode) - no response needed, just acknowledge
+	return nil
+}
+
 func (e *EdgeClient) handleSNPublicSecretMessage(r *protocol.RawMessage) error {
 	rresp, err := protocol.ToMessage[*netstruct.SnPublicSecret](r)
 	if err != nil {
@@ -94,6 +99,13 @@ func (e *EdgeClient) handleDataPayload(payload []byte) error {
 	payload, err := e.ProcessIncomingPayload(payload)
 	if err != nil {
 		return fmt.Errorf("error while processing Incoming data packets, droping (err: %w)", err)
+	}
+	// Pad to minimum Ethernet frame size (60 bytes) for IFF_NO_PI TAP devices.
+	// Linux kernel rejects frames < ETH_Z when IFF_NO_PI is set.
+	if len(payload) < 60 {
+		padded := make([]byte, 60)
+		copy(padded, payload)
+		payload = padded
 	}
 	_, err = e.TAP.Write(payload)
 	if err != nil {
