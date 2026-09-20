@@ -96,9 +96,19 @@ func (e *EdgeClient) handleVFuzePacket(packetBuf []byte, n int, addr *net.UDPAdd
 }
 
 func (e *EdgeClient) handleDataPayload(payload []byte) error {
-	payload, err := e.ProcessIncomingPayload(payload)
-	if err != nil {
-		return fmt.Errorf("error while processing Incoming data packets, droping (err: %w)", err)
+	// AES-GCM 最小有效密文长度 = nonceSize(12) + authTag(16) = 28 字节。
+	// 短于此长度的包不可能是 AES-GCM 加密过的，跳过 transform pipeline 直接透传。
+	// 这处理了同一社区内加密设置不一致（部分 Edge 用 -k、部分不用）或
+	// 上游（Worker/Supernode）转发的非加密短包场景。
+	const minGCMSize = 28 // nonce(12) + tag(16)
+	var err error
+	if len(payload) < minGCMSize {
+		log.Printf("handleDataPayload: payload len=%d < %d (AES-GCM minimum), skipping decryption, passing through", len(payload), minGCMSize)
+	} else {
+		payload, err = e.ProcessIncomingPayload(payload)
+		if err != nil {
+			return fmt.Errorf("error while processing Incoming data packets, droping (err: %w)", err)
+		}
 	}
 	// Pad to minimum Ethernet frame size (60 bytes) for IFF_NO_PI TAP devices.
 	// Linux kernel rejects frames < ETH_Z when IFF_NO_PI is set.

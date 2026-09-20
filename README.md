@@ -78,16 +78,16 @@ This connects to a supernode via WSS and joins the "acme" community.
 
 ```bash
 # Basic usage with WSS
-sudo ./edge up -c myc -s wss://n2ngo-ws.swings.one/n2n?community=myc -l
+sudo ./edge up -c acme -s wss://n2ngo-ws.swings.one/n2n?community=acme -l
 
 # With custom TAP interface and UDP port
-sudo ./edge up -c myc -s wss://host/n2n -t n2n1 -p 1194 -l
+sudo ./edge up -c acme -s wss://host/n2n -t n2n1 -P 1194 -l
 
 # With encryption and compression
-sudo ./edge up -c myc -s wss://host/n2n -k mysecret -C -l
+sudo ./edge up -c acme -s wss://host/n2n -k mysecret -C -l
 
 # Disable VFuze fastpath
-sudo ./edge up -c myc -s wss://host/n2n -F=false -l
+sudo ./edge up -c acme -s wss://host/n2n -F=false -l
 ```
 
 ## Configuration
