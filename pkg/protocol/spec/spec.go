@@ -19,6 +19,10 @@ const (
 	TypeSNPublicSecret       PacketType = 251
 	TypeRegisterResponse     PacketType = 252
 	TypeRetryRegisterRequest PacketType = 253
+
+	// Custom P2P / ICE / TURN types (matching JS constants)
+	TypeICECandidate  PacketType = 14
+	TypeTURNCredentials PacketType = 15
 )
 
 // String returns a human-readable name for the packet type
@@ -50,6 +54,10 @@ func (pt PacketType) String() string {
 		return "RetryRegisterRequest"
 	case TypeSNPublicSecret:
 		return "SNPublicSecret"
+	case TypeICECandidate:
+		return "ICECandidate"
+	case TypeTURNCredentials:
+		return "TURNCredentials"
 	default:
 		return "Unknown"
 	}

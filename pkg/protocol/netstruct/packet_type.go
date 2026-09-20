@@ -24,3 +24,7 @@ func (*UnregisterRequest) PacketType() spec.PacketType    { return spec.TypeUnre
 // Peer messages
 func (*PeerListRequest) PacketType() spec.PacketType { return spec.TypePeerListRequest }
 func (*PeerToPing) PacketType() spec.PacketType      { return spec.TypePing }
+
+// ice_turn messages
+func (*ICECandidate) PacketType() spec.PacketType   { return spec.TypeICECandidate }
+func (*TURNCredentials) PacketType() spec.PacketType { return spec.TypeTURNCredentials }
