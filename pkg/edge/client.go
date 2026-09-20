@@ -242,6 +242,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 	edge.messageHandlers[spec.TypeRegisterResponse] = edge.handleRegisterResponseMessage
 	edge.messageHandlers[spec.TypeSNPublicSecret] = edge.handleSNPublicSecretMessage
 	edge.messageHandlers[spec.TypeHeartbeat] = edge.handleHeartbeatMessage
+	log.Printf("edge %s: enableVFuze = %v", edge.ID, edge.enableVFuze)
 	return edge, nil
 }
 

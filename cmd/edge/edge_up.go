@@ -39,38 +39,40 @@ var (
 			Aliases: []string{"c"},
 			Usage:   "Community name",
 		},
-			&cli.StringFlag{
-				Name:    "edge-id",
-				Aliases: []string{"i"},
-				Usage:   "edge-id EdgeName",
-			}, &cli.BoolFlag{
-				Name:    "stdout-log",
-				Aliases: []string{"l"},
-				Usage:   "stdout-log",
-			},
-			&cli.BoolFlag{
-				Name:  "ws",
-				Usage: "Enable WS connection to supernode",
-			},
-			&cli.BoolFlag{
-				Name:  "wss",
-				Usage: "Enable WSS connection to supernode",
-			},
-			&cli.StringFlag{
-				Name:  "wss-cert",
-				Usage: "WSS client certificate file",
-			},
-			&cli.StringFlag{
-				Name:  "wss-key",
-				Usage: "WSS client key file",
-			},
-			&cli.StringFlag{
-				Name:    "api-listen",
-				Usage:   "Management API listen address (default: 127.0.0.1:7778)",
-			},
-			// --- Common Options ---
-
+		&cli.StringFlag{
+			Name:    "edge-id",
+			Aliases: []string{"i"},
+			Usage:   "edge-id EdgeName",
 		},
+		&cli.BoolFlag{
+			Name:    "stdout-log",
+			Aliases: []string{"l"},
+			Usage:   "stdout-log",
+		},
+		&cli.BoolFlag{
+			Name:  "ws",
+			Usage: "Enable WS connection to supernode",
+		},
+		&cli.BoolFlag{
+			Name:  "wss",
+			Usage: "Enable WSS connection to supernode",
+		},
+		&cli.StringFlag{
+			Name:  "wss-cert",
+			Usage: "WSS client certificate file",
+		},
+		&cli.StringFlag{
+			Name:  "wss-key",
+			Usage: "WSS client key file",
+		},
+		&cli.StringFlag{
+			Name:    "api-listen",
+			Usage:   "Management API listen address (default: 127.0.0.1:7778)",
+		},
+	},
+		// Positional arg: supernode URL shortcut
+		// Usage: ./edge up wss://host/n2n -l
+		// Equivalent to: ./edge up -c default -s wss://host/n2n?community=default -l
 		Action: upCmd,
 	}
 )
@@ -101,6 +103,19 @@ func up(c *cli.Context) {
 	}
 	log.Printf("using config file %s", cfg.ConfigFile)
 
+	// Positional arg shortcut: ./edge up wss://host/n2n -l
+	// Equivalent to: ./edge up -c default -s wss://host/n2n?community=default -l
+	if c.NArg() >= 1 {
+		posURL := c.Args().Get(0)
+		if posURL != "" {
+			cfg.SupernodeURL = posURL
+			if cfg.Community == "" {
+				cfg.Community = "default"
+			}
+			log.Printf("positional supernode-url: %s (community=%s)", posURL, cfg.Community)
+		}
+	}
+
 	if c.IsSet("community") {
 		comm := c.String("community")
 		if comm != "" {
@@ -121,6 +136,26 @@ func up(c *cli.Context) {
 
 	if c.IsSet("supernode-url") {
 		cfg.SupernodeURL = c.String("supernode-url")
+	}
+
+	// 自动构建 community 到 supernode-url
+	// 支持用法：./edge up -c default -s wss://host/n2n -l
+	// 自动构建为：wss://host/n2n?community=default
+	// 如果 -c 未设置但 URL 中没有 ?community=，默认使用 default
+	if cfg.SupernodeURL != "" && !strings.Contains(cfg.SupernodeURL, "?community=") {
+		community := cfg.Community
+		if community == "" {
+			community = "default"
+		}
+		separator := "?"
+		if strings.Contains(cfg.SupernodeURL, "?") {
+			separator = "&"
+		}
+		cfg.SupernodeURL = cfg.SupernodeURL + separator + "community=" + community
+		if cfg.Community == "" {
+			cfg.Community = community
+		}
+		log.Printf("auto-appended community to supernode-url: %s", cfg.SupernodeURL)
 	}
 
 	// Auto-enable WS/WSS based on supernode URL scheme
