@@ -44,7 +44,7 @@ func DefaultConfig() *Config {
 		ProtocolVersion:   protocol.VersionV,
 		VerifyHash:        true,
 		EnableVFuze:       true,
-		UDPBufferSize:     8192 * 8192,
+		UDPBufferSize:     8388608,
 		TapName:           "n2n_tap0",
 		LocalPort:         0,           // 0 means automatically assigned
 		ConfigFile:        "edge.yaml", // Default config file name.

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/urfave/cli/v2"
 )
@@ -30,7 +31,7 @@ var (
 			Usage:   "Proxy URL (http://, https://, socks5://, or socks5s://)",
 		},
 		&cli.StringFlag{
-			Name:    "supernode-url",
+			Name:    "supernode",
 			Aliases: []string{"s"},
 			Usage:   "Supernode URL for WS/WSS (ws:// or wss://)",
 		},
@@ -40,9 +41,9 @@ var (
 			Usage:   "Community name",
 		},
 		&cli.StringFlag{
-			Name:    "edge-id",
+			Name:    "id",
 			Aliases: []string{"i"},
-			Usage:   "edge-id EdgeName",
+			Usage:   "Edge identifier",
 		},
 		&cli.BoolFlag{
 			Name:    "stdout-log",
@@ -67,7 +68,50 @@ var (
 		},
 		&cli.StringFlag{
 			Name:    "api-listen",
+			Aliases: []string{"A"},
 			Usage:   "Management API listen address (default: 127.0.0.1:7778)",
+		},
+		&cli.StringFlag{
+			Name:    "config",
+			Usage:   "Path to configuration file (default: edge.yaml)",
+		},
+		&cli.StringFlag{
+			Name:    "tap",
+			Aliases: []string{"t"},
+			Usage:   "TAP interface name (default: n2n_tap0)",
+		},
+		&cli.IntFlag{
+			Name:    "port",
+			Aliases: []string{"P"},
+			Usage:   "Local UDP port (default: 0, system-assigned)",
+		},
+		&cli.BoolFlag{
+			Name:    "enableFuze",
+			Aliases: []string{"F"},
+			Usage:   "Enable VFuze fastpath (default: true)",
+			Value:   true,
+		},
+		&cli.DurationFlag{
+			Name:    "heartbeat",
+			Aliases: []string{"H"},
+			Usage:   "Heartbeat interval (default: 30s)",
+			Value:   30 * time.Second,
+		},
+		&cli.IntFlag{
+			Name:    "udpbuffersize",
+			Aliases: []string{"b"},
+			Usage:   "UDP buffer size (default: 8388608)",
+			Value:   8388608,
+		},
+		&cli.StringFlag{
+			Name:    "encryption-passphrase",
+			Aliases: []string{"k"},
+			Usage:   "Passphrase for encryption key derivation",
+		},
+		&cli.BoolFlag{
+			Name:    "compress-payload",
+			Aliases: []string{"C"},
+			Usage:   "Enable Zstd compression for data payloads (default: false)",
 		},
 	},
 		// Positional arg: supernode URL shortcut
@@ -123,8 +167,8 @@ func up(c *cli.Context) {
 		}
 	}
 
-	if c.IsSet("edge-id") {
-		eid := c.String("edge-id")
+	if c.IsSet("id") {
+		eid := c.String("id")
 		if eid != "" {
 			cfg.EdgeID = eid
 		}
@@ -134,8 +178,8 @@ func up(c *cli.Context) {
 		cfg.ProxyURL = c.String("proxy-url")
 	}
 
-	if c.IsSet("supernode-url") {
-		cfg.SupernodeURL = c.String("supernode-url")
+	if c.IsSet("supernode") {
+		cfg.SupernodeURL = c.String("supernode")
 	}
 
 	// 自动构建 community 到 supernode-url
@@ -185,6 +229,32 @@ func up(c *cli.Context) {
 
 	if c.IsSet("api-listen") {
 		cfg.APIListenAddr = c.String("api-listen")
+	}
+
+	// --- Additional flags ---
+	if c.IsSet("config") {
+		cfg.ConfigFile = c.String("config")
+	}
+	if c.IsSet("tap") {
+		cfg.TapName = c.String("tap")
+	}
+	if c.IsSet("port") {
+		cfg.LocalPort = c.Int("port")
+	}
+	if c.IsSet("enableFuze") {
+		cfg.EnableVFuze = c.Bool("enableFuze")
+	}
+	if c.IsSet("heartbeat") {
+		cfg.HeartbeatInterval = c.Duration("heartbeat")
+	}
+	if c.IsSet("udpbuffersize") {
+		cfg.UDPBufferSize = c.Int("udpbuffersize")
+	}
+	if c.IsSet("encryption-passphrase") {
+		cfg.EncryptionPassphrase = c.String("encryption-passphrase")
+	}
+	if c.IsSet("compress-payload") {
+		cfg.CompressPayload = c.Bool("compress-payload")
 	}
 
 	client, err := edge.NewEdgeClient(*cfg) // Pass the config struct

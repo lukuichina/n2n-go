@@ -69,10 +69,26 @@ By default, the supernode listens on UDP port 7777. Configuration is read from `
 ### Running an Edge
 
 ```bash
-sudo ./edge -community acme -supernode 192.168.1.253:7777
+sudo ./edge up -c acme -s wss://supernode.example.com/n2n?community=acme -l
 ```
 
-This connects to a supernode at 192.168.1.253:7777 and joins the "acme" community.
+This connects to a supernode via WSS and joins the "acme" community.
+
+**Common flags:**
+
+```bash
+# Basic usage with WSS
+sudo ./edge up -c myc -s wss://n2ngo-ws.swings.one/n2n?community=myc -l
+
+# With custom TAP interface and UDP port
+sudo ./edge up -c myc -s wss://host/n2n -t n2n1 -p 1194 -l
+
+# With encryption and compression
+sudo ./edge up -c myc -s wss://host/n2n -k mysecret -C -l
+
+# Disable VFuze fastpath
+sudo ./edge up -c myc -s wss://host/n2n -F=false -l
+```
 
 ## Configuration
 
@@ -98,21 +114,22 @@ proxy_url: "" # Optional proxy URL (http://, https://, socks5://, or socks5s://)
 
 #### Edge Command-line Options
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-config` | Path to configuration file | `edge.yaml` |
-| `-id` | Edge identifier | hostname |
-| `-community` | Community name | - |
-| `-tap` | TAP interface name | `n2n_tap0` |
-| `-port` | Local UDP port | `0` (system-assigned) |
-| `-enableFuze` | Enable VFuze fastpath | `true` |
-| `-supernode` | Supernode address | - |
-| `-heartbeat` | Heartbeat interval | `30s` |
-| `-udpbuffersize` | UDP buffer size | `8388608` |
-| `-api-listen` | API listen address | `:7778` |
-| `-encryption-passphrase` | Passphrase for encryption | - |
-| `-compress-payload` | Enable Zstd compression for data payloads | `false` |
-| `-p` / `--proxy-url` | Proxy URL for WSS transport: `http://`, `https://`, `socks5://`, or `socks5s://` | - |
+| Flag | Alias | Description | Default |
+|------|-------|-------------|---------|
+| `--config` | — | Path to configuration file | `edge.yaml` |
+| `--id` | `-i` | Edge identifier | hostname |
+| `--community` | `-c` | Community name | - |
+| `--tap` | `-t` | TAP interface name | `n2n_tap0` |
+| `--port` | `-P` | Local UDP port | `0` (system-assigned) |
+| `--enableFuze` | `-F` | Enable VFuze fastpath | `true` |
+| `--heartbeat` | `-H` | Heartbeat interval | `30s` |
+| `--udpbuffersize` | `-b` | UDP buffer size | `8388608` |
+| `--encryption-passphrase` | `-k` | Passphrase for encryption | - |
+| `--compress-payload` | `-C` | Enable Zstd compression for data payloads | `false` |
+| `--proxy-url` | `-p` | Proxy URL for WSS transport: `http://`, `https://`, `socks5://`, or `socks5s://` | - |
+| `--supernode` | `-s` | Supernode URL for WS/WSS (`ws://` or `wss://`) | - |
+| `--api-listen` | `-A` | Management API listen address | `127.0.0.1:7778` |
+| `--stdout-log` | `-l` | Log to stdout instead of SQLite | `false` |
 
 #### Proxy Configuration
 
