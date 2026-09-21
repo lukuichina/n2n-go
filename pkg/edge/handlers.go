@@ -211,7 +211,10 @@ func (e *EdgeClient) handlePingMessage(r *protocol.RawMessage) error {
 		// if it is a PONG message, check OUR last pings and update P2PStates accordingly
 		p, err := e.Peers.GetPeer(pingMsg.EdgeMACAddr())
 		if err != nil {
-			return fmt.Errorf("received a pong for a MACAddress %s not in our peers list", pingMsg.EdgeMACAddr())
+			// Peer may have been removed (e.g. via TypeUnregister) after
+			// the ping was sent; silently ignore stale pongs.
+			log.Printf("(warn) received pong for MACAddress %s not in our peers list (stale)", pingMsg.EdgeMACAddr())
+			return nil
 		}
 		if p.P2PCheckID == pingMsg.Msg.CheckId {
 			if p.UpdateP2PStatus(p2p.P2PAvailable, pingMsg.Msg.CheckId) {

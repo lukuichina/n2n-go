@@ -273,7 +273,11 @@ func (reg *PeerRegistry) RemovePeer(MACAddr string) error {
 
 	p, exists := reg.Peers[MACAddr]
 	if !exists {
-		return fmt.Errorf("peer with MAC address %s not found", MACAddr)
+		// Idempotent: silently ignore removal of non-existent peers.
+		// The relay may send TypeUnregister for MACs that were never
+		// registered locally (e.g. relay-side MAC confusion), or a pong
+		// may arrive after the peer has already been removed.
+		return nil
 	}
 
 	dDesc := p.Infos.Desc
