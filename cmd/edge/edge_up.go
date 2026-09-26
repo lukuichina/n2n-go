@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,95 +26,100 @@ var (
 		UsageText:   "up [args...]",
 		Description: `starts edge instance`,
 		Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:    "proxy-url",
-			Aliases: []string{"p"},
-			Usage:   "Proxy URL (http://, https://, socks5://, or socks5s://)",
+			&cli.StringFlag{
+				Name:    "proxy-url",
+				Aliases: []string{"x"},
+				Usage:   "Proxy URL (http://, https://, socks5://, or socks5s://)",
+			},
+			&cli.StringFlag{
+				Name:    "supernode",
+				Aliases: []string{"s"},
+				Usage:   "Supernode URL for WS/WSS (ws:// or wss://)",
+			},
+			&cli.StringFlag{
+				Name:    "community",
+				Aliases: []string{"c"},
+				Usage:   "Community name",
+			},
+			&cli.StringFlag{
+				Name:    "id",
+				Aliases: []string{"i"},
+				Usage:   "Edge identifier",
+			},
+			&cli.BoolFlag{
+				Name:    "stdout-log",
+				Aliases: []string{"l"},
+				Usage:   "stdout-log",
+			},
+			&cli.BoolFlag{
+				Name:  "ws",
+				Usage: "Enable WS connection to supernode",
+			},
+			&cli.BoolFlag{
+				Name:  "wss",
+				Usage: "Enable WSS connection to supernode",
+			},
+			&cli.StringFlag{
+				Name:  "wss-cert",
+				Usage: "WSS client certificate file",
+			},
+			&cli.StringFlag{
+				Name:  "wss-key",
+				Usage: "WSS client key file",
+			},
+			&cli.StringFlag{
+				Name:    "api-listen",
+				Aliases: []string{"A"},
+				Usage:   "Management API listen endpoint, as `addr:port`. The addr may be omitted (defaults to 127.0.0.1) and the port may be omitted (defaults to 7778), so a bare `-A` yields 127.0.0.1:7778. Examples: `-A :9000`, `-A 9000`, `-A 0.0.0.0:9000`",
+			},
+			&cli.StringFlag{
+				Name:  "config",
+				Usage: "Path to configuration file (default: edge.yaml)",
+			},
+			&cli.StringFlag{
+				Name:    "tap",
+				Aliases: []string{"t"},
+				Usage:   "TAP interface name (default: n2n_tap0)",
+			},
+			&cli.IntFlag{
+				Name:    "port",
+				Aliases: []string{"p"},
+				Usage:   "Local UDP port (default: 0, system-assigned)",
+			},
+			&cli.StringFlag{
+				Name:    "p2p-listen",
+				Aliases: []string{"P"},
+				Usage:   "P2P UDP listen endpoint for hole punching, as `addr:port`. The addr may be omitted (defaults to 0.0.0.0) and the port may be omitted (defaults to 0, system-assigned). Examples: `-P :7777`, `-P 7777`, `-P 10.0.0.5:7777`",
+			},
+			&cli.BoolFlag{
+				Name:    "enableFuze",
+				Aliases: []string{"F"},
+				Usage:   "Enable VFuze fastpath (default: true)",
+				Value:   true,
+			},
+			&cli.DurationFlag{
+				Name:    "heartbeat",
+				Aliases: []string{"H"},
+				Usage:   "Heartbeat interval (default: 30s)",
+				Value:   30 * time.Second,
+			},
+			&cli.IntFlag{
+				Name:    "udpbuffersize",
+				Aliases: []string{"b"},
+				Usage:   "UDP buffer size (default: 8388608)",
+				Value:   8388608,
+			},
+			&cli.StringFlag{
+				Name:    "encryption-passphrase",
+				Aliases: []string{"k"},
+				Usage:   "Passphrase for encryption key derivation",
+			},
+			&cli.BoolFlag{
+				Name:    "compress-payload",
+				Aliases: []string{"C"},
+				Usage:   "Enable Zstd compression for data payloads (default: false)",
+			},
 		},
-		&cli.StringFlag{
-			Name:    "supernode",
-			Aliases: []string{"s"},
-			Usage:   "Supernode URL for WS/WSS (ws:// or wss://)",
-		},
-		&cli.StringFlag{
-			Name:    "community",
-			Aliases: []string{"c"},
-			Usage:   "Community name",
-		},
-		&cli.StringFlag{
-			Name:    "id",
-			Aliases: []string{"i"},
-			Usage:   "Edge identifier",
-		},
-		&cli.BoolFlag{
-			Name:    "stdout-log",
-			Aliases: []string{"l"},
-			Usage:   "stdout-log",
-		},
-		&cli.BoolFlag{
-			Name:  "ws",
-			Usage: "Enable WS connection to supernode",
-		},
-		&cli.BoolFlag{
-			Name:  "wss",
-			Usage: "Enable WSS connection to supernode",
-		},
-		&cli.StringFlag{
-			Name:  "wss-cert",
-			Usage: "WSS client certificate file",
-		},
-		&cli.StringFlag{
-			Name:  "wss-key",
-			Usage: "WSS client key file",
-		},
-		&cli.StringFlag{
-			Name:    "api-listen",
-			Aliases: []string{"A"},
-			Usage:   "Management API listen address (default: 127.0.0.1:7778)",
-		},
-		&cli.StringFlag{
-			Name:    "config",
-			Usage:   "Path to configuration file (default: edge.yaml)",
-		},
-		&cli.StringFlag{
-			Name:    "tap",
-			Aliases: []string{"t"},
-			Usage:   "TAP interface name (default: n2n_tap0)",
-		},
-		&cli.IntFlag{
-			Name:    "port",
-			Aliases: []string{"P"},
-			Usage:   "Local UDP port (default: 0, system-assigned)",
-		},
-		&cli.BoolFlag{
-			Name:    "enableFuze",
-			Aliases: []string{"F"},
-			Usage:   "Enable VFuze fastpath (default: true)",
-			Value:   true,
-		},
-		&cli.DurationFlag{
-			Name:    "heartbeat",
-			Aliases: []string{"H"},
-			Usage:   "Heartbeat interval (default: 30s)",
-			Value:   30 * time.Second,
-		},
-		&cli.IntFlag{
-			Name:    "udpbuffersize",
-			Aliases: []string{"b"},
-			Usage:   "UDP buffer size (default: 8388608)",
-			Value:   8388608,
-		},
-		&cli.StringFlag{
-			Name:    "encryption-passphrase",
-			Aliases: []string{"k"},
-			Usage:   "Passphrase for encryption key derivation",
-		},
-		&cli.BoolFlag{
-			Name:    "compress-payload",
-			Aliases: []string{"C"},
-			Usage:   "Enable Zstd compression for data payloads (default: false)",
-		},
-	},
 		// Positional arg: supernode URL shortcut
 		// Usage: ./edge up wss://host/n2n -l
 		// Equivalent to: ./edge up -c default -s wss://host/n2n?community=default -l
@@ -240,6 +246,25 @@ func up(c *cli.Context) {
 	}
 	if c.IsSet("port") {
 		cfg.LocalPort = c.Int("port")
+	}
+	if c.IsSet("p2p-listen") {
+		// One "addr:port" spec, both parts optional. Split it back into the
+		// two config fields the P2P socket setup expects.
+		normalized, err := edge.ParseListenAddr(c.String("p2p-listen"), "0.0.0.0", "0")
+		if err != nil {
+			log.Fatalf("invalid --p2p-listen value: %v", err)
+		}
+		host, portStr, _ := strings.Cut(normalized, ":")
+		port, _ := strconv.Atoi(portStr)
+		cfg.P2PListenAddr = host
+		cfg.P2PListenPort = port
+	}
+	if c.IsSet("api-listen") {
+		normalized, err := edge.ParseListenAddr(c.String("api-listen"), "127.0.0.1", "7778")
+		if err != nil {
+			log.Fatalf("invalid --api-listen value: %v", err)
+		}
+		cfg.APIListenAddr = normalized
 	}
 	if c.IsSet("enableFuze") {
 		cfg.EnableVFuze = c.Bool("enableFuze")

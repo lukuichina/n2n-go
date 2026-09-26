@@ -3,11 +3,11 @@ package edge
 import (
 	"fmt"
 	"n2n-go/pkg/log"
-	"n2n-go/pkg/transport"
 	"n2n-go/pkg/p2p"
 	"n2n-go/pkg/protocol"
 	"n2n-go/pkg/protocol/netstruct"
 	"n2n-go/pkg/protocol/spec"
+	"n2n-go/pkg/transport"
 	"n2n-go/pkg/tuntap"
 	"net"
 	"strings"
@@ -17,6 +17,10 @@ import (
 func (e *EdgeClient) UpdatePeersP2PStates() {
 	peers := e.Peers.GetP2PUnknownPeers()
 	for _, p := range peers {
+		// Skip self — prevents self-ping PONG from setting FullDuplex=true on own peer
+		if net.HardwareAddr(p.Infos.MacAddr).String() == e.MACAddr.String() {
+			continue
+		}
 		err := e.PingPeer(p, 3, 300*time.Second, p2p.P2PPending)
 		if err != nil {
 			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
@@ -24,6 +28,9 @@ func (e *EdgeClient) UpdatePeersP2PStates() {
 	}
 	peers = e.Peers.GetP2PendingPeers()
 	for _, p := range peers {
+		if net.HardwareAddr(p.Infos.MacAddr).String() == e.MACAddr.String() {
+			continue
+		}
 		err := e.PingPeer(p, 3, 300*time.Second, p2p.P2PPending)
 		if err != nil {
 			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
@@ -31,6 +38,9 @@ func (e *EdgeClient) UpdatePeersP2PStates() {
 	}
 	peers = e.Peers.GetP2PAvailablePeers()
 	for _, p := range peers {
+		if net.HardwareAddr(p.Infos.MacAddr).String() == e.MACAddr.String() {
+			continue
+		}
 		err := e.PingPeer(p, 3, 300*time.Millisecond, p2p.P2PAvailable)
 		if err != nil {
 			log.Printf("handleP2PUpdates: error in UpdatePeersP2PStates for peer with MACAddress %s: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
@@ -48,10 +58,28 @@ func (e *EdgeClient) PingPeer(p *p2p.Peer, n int, interval time.Duration, status
 		e.Peers.SetPendingChanges()
 	}
 	for range n {
-		e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPEnforceP2P)
+		e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPBestEffort)
 	}
-	return e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPEnforceP2P)
+	return e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPBestEffort)
 }
+
+// peerListResyncInterval is how often a community with no known peers asks
+// the supernode for the peer list again.
+//
+// Without this the edge only ever asks twice: once at startup ("preliminary"
+// in client.go) and once after a successful re-register (handlers.go). If
+// either of those snapshots is truncated — e.g. it was taken before the other
+// edge finished registering, or the supernode skipped the notification
+// because the other WebSocket had not come up yet — the peer is simply
+// never learned about, and every packet to it fails forever with
+// "peer lookup failed for <mac>". The supernode side treats a peer list as a
+// full snapshot and drops every peer missing from it, so a single missed
+// notification is enough to leave one side permanently isolated.
+//
+// Asking on a timer is cheap (one small message per interval) and makes the
+// peer table self-healing instead of depending on the supernode to announce
+// everyone to everyone exactly once, at exactly the right moment.
+const peerListResyncInterval = 30 * time.Second
 
 // handleHeartbeat sends heartbeat messages periodically
 func (e *EdgeClient) handleP2PUpdates() {
@@ -60,6 +88,11 @@ func (e *EdgeClient) handleP2PUpdates() {
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+
+	// Separate, slower ticker for the peer-list resync so it survives across
+	// the 3s loop without being reset by it.
+	resyncTicker := time.NewTicker(peerListResyncInterval)
+	defer resyncTicker.Stop()
 
 	for {
 		select {
@@ -71,10 +104,93 @@ func (e *EdgeClient) handleP2PUpdates() {
 					}
 				}()
 				e.UpdatePeersP2PStates()
+				// Execute relay-coordinated NAT hole punching if an instruction is pending.
+				e.executeNatHolePunchLoop()
+			}()
+		case <-resyncTicker.C:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("handleP2PUpdates: peer list resync recovered from panic: %v", r)
+					}
+				}()
+				// Only reach out while we know of nobody else. A populated
+				// table means the supernode told us about the community, and
+				// spamming requests would be pure overhead.
+				if e.Peers.NumPeers() == 0 {
+					if err := e.sendPeerListRequest(); err != nil {
+						log.Printf("handleP2PUpdates: periodic peer list request failed: %v", err)
+					}
+				}
 			}()
 		case <-e.ctx.Done():
 			return
 		}
+	}
+}
+
+// executeNatHolePunchLoop checks for pending NAT hole instructions
+// and executes them against the P2P UDP connection.
+func (e *EdgeClient) executeNatHolePunchLoop() {
+	if e.P2PConn == nil {
+		return
+	}
+	if !e.Peers.HasNatHoleInstruction() {
+		return
+	}
+	// STUN is deliberately NOT refreshed here.
+	//
+	// The STUN client reads from e.P2PConn, the very socket handleP2P is
+	// blocked on, and its read loop discards anything that does not decode
+	// as a STUN message:
+	//
+	//     n, _, err := s.conn.ReadFromUDP(buf)   // steals the punch packet
+	//     if err := stun.Decode(buf[:n], &respMsg); err != nil {
+	//         continue                            // dropped, never re-injected
+	//     }
+	//
+	// So a refresh here swallows the peer's incoming hole-punch packets for
+	// the whole discovery window (3 servers x 5s timeout ~= 15s), while we
+	// punch every ~3s. The punch could essentially never be observed.
+	//
+	// FRP avoids this by design: nathole.Prepare() does its single STUN
+	// transaction before the punch loop starts, leaving the punch loop as
+	// the socket's only reader. We mirror that: STUN runs at registration
+	// time (InitialSetup -> pubSocketString) and is then left alone, so
+	// handleP2P owns the socket.
+	//
+	// The NAT mapping stays valid because the punch packets themselves are
+	// sent from this same socket, keeping its outbound binding alive.
+	//
+	// Send NAT hole punch packets via direct UDP.
+	// In environments where inter-VM UDP is not routable (e.g., behind
+	// Cloudflare Tunnel), the Worker's handlePing forwarding (fixed
+	// separately) handles P2P discovery via WebSocket instead.
+	//
+	// Run it off the caller's goroutine. The punch now ends with a long wait
+	// (FRP's ReadTimeoutMs), and this function is invoked from the 3s
+	// state-update ticker; blocking here would stall UpdatePeersP2PStates
+	// for the whole wait. The in-flight guard keeps a slow round from
+	// stacking up a second and third concurrent punch against the same
+	// instruction.
+	if e.natHolePunching.CompareAndSwap(false, true) {
+		go func() {
+			defer e.natHolePunching.Store(false)
+			e.Peers.ExecuteNatHolePunch(e.P2PConn)
+			// FRP writes real data immediately after the punch rather than
+			// waiting for the next user packet. With no user data queued
+			// here, the verification probe plays that role.
+			//
+			// Deliberately NOT gated on the punch's return value: that value
+			// is true only when the peer is already FullDuplex, and promotion
+			// is itself gated on receiving a data frame that only this probe
+			// sends. Gating the probe on it left the two conditions
+			// permanently unsatisfiable — punch traffic flowed fine (hundreds
+			// of packets exchanged) while FullDuplex was never reached.
+			for _, p := range e.Peers.GetPunchedNotFullDuplexPeers() {
+				e.sendPathVerificationProbe(p)
+			}
+		}()
 	}
 }
 
@@ -117,6 +233,189 @@ func (e *EdgeClient) handleHeartbeat() {
 	}
 }
 
+// handleP2PKeepAlive keeps the NAT mapping for every FullDuplex peer open,
+// and demotes peers that stop answering so the failure actually propagates.
+//
+// Why this is needed: a UDP NAT mapping dies when nothing is sent through it.
+// Once ours expired, the peer could no longer reach us — its ARP replies went
+// out over P2P and were dropped by the gateway, our ARP entry went INCOMPLETE,
+// and the tunnel was unusable while still reporting FullDuplex.
+//
+// FRP's equivalent has two halves, and both are mirrored here:
+//
+//  1. yamux keepalive, 10s (client/visitor/xtcp.go:351). A ping is sent and
+//     the pong is awaited; a missing pong calls exitErr(ErrKeepAliveTimeout)
+//     and tears the session down (yamux session.go keepalive()/Ping()).
+//     Here the ping is a real PeerToPing, and the "pong" is any inbound frame
+//     from that peer, recorded by NoteDataPacket in handleP2P.
+//
+//  2. keepTunnelOpenWorker, every MinRetryInterval=90s
+//     (client/visitor/xtcp.go:114). A failed probe re-runs makeNatHole().
+//     Here a timed-out peer is demoted off FullDuplex and its NAT hole
+//     instruction is re-armed, so executeNatHolePunchLoop retries it.
+//
+// The two differ from FRP in one way worth noting: FRP can afford a 90s
+// health interval because KCP retransmits underneath and holds the mapping
+// open (pkg/util/net/kcp.go:96, NewConn3(1, udpAddr, nil, 10, 3, pConn)).
+// We have no lower layer, so the probe interval is the only thing keeping the
+// mapping alive and must stay well under the gateway's idle timeout.
+func (e *EdgeClient) handleP2PKeepAlive() {
+	e.wg.Add(1)
+	defer e.wg.Done()
+
+	interval := e.keepAliveInterval
+	if interval <= 0 {
+		return
+	}
+	timeout := e.keepAliveTimeout
+	if timeout <= interval {
+		// A timeout at or below the interval would tear the tunnel down on
+		// the first lost probe, which is far too twitchy for a path that
+		// still has a working NAT mapping.
+		timeout = 3 * interval
+		log.Printf("[P2P] keepalive timeout %v <= interval %v, raising to %v", e.keepAliveTimeout, interval, timeout)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[P2P] keepalive recovered from panic: %v", r)
+					}
+				}()
+				e.p2pKeepAliveTick(timeout)
+			}()
+		case <-e.ctx.Done():
+			return
+		}
+	}
+}
+
+// p2pKeepAliveTick sends one probe to each FullDuplex peer and demotes the
+// ones that have been silent for longer than timeout.
+func (e *EdgeClient) p2pKeepAliveTick(timeout time.Duration) {
+	self := e.MACAddr.String()
+	now := time.Now()
+
+	// Send first, then judge: a peer that just came up would otherwise be
+	// demoted by a stale LastDataSeenAt before its first reply landed.
+	for _, p := range e.Peers.GetFullDuplexPeers() {
+		macStr := net.HardwareAddr(p.Infos.MacAddr).String()
+		if macStr == self {
+			continue
+		}
+		// UDPBestEffort routes over P2P while the peer is FullDuplex, so
+		// this both keeps our mapping open and gives the peer a reason to
+		// answer, which keeps theirs open.
+		//
+		// Deliberately NOT PingPeer(): that also calls UpdateP2PStatus, and
+		// UpdateP2PStatus's "pendingTTL < 1" branch force-sets
+		// P2PUnavailable, which would knock a perfectly healthy peer off
+		// FullDuplex on the first tick whose pendingTTL had drained. The
+		// keepalive must not mutate the state it is measuring.
+		e.sendKeepAlivePing(p)
+		e.sendPathVerificationProbe(p)
+	}
+
+	// Peers that were punched but never promoted need the same probe on a
+	// timer. The post-punch probe fires once, immediately after
+	// ExecuteNatHolePunch returns — but at that moment the peer's socket
+	// has only just been opened by the punch, so the probe is routinely
+	// dropped and nothing retries it. Without this loop those peers sit
+	// un-promoted forever even though punches are flowing (observed: 522
+	// punch packets received, zero data frames). Retrying every keepalive
+	// interval converges as soon as the path is genuinely open.
+	for _, p := range e.Peers.GetPunchedNotFullDuplexPeers() {
+		macStr := net.HardwareAddr(p.Infos.MacAddr).String()
+		if macStr == self {
+			continue
+		}
+		e.sendPathVerificationProbe(p)
+	}
+
+	for _, p := range e.Peers.GetFullDuplexPeers() {
+		macStr := net.HardwareAddr(p.Infos.MacAddr).String()
+		if macStr == self {
+			continue
+		}
+		last := p.LastDataSeenAt()
+		if last.IsZero() || now.Sub(last) < timeout {
+			continue
+		}
+		log.Printf("[P2P] keepalive timeout: no frame from %s for %v, demoting FullDuplex -> relay",
+			macStr, now.Sub(last).Truncate(time.Second))
+		if changed, _ := p.SetFullDuplex(false); changed {
+			// Re-arm the punch so the next tick retries instead of leaving
+			// the peer stuck on the relay forever.
+			e.Peers.ReArmNatHoleInstruction(p.Infos.MacAddr)
+			e.Peers.SetPendingChanges()
+		}
+	}
+}
+
+// sendKeepAlivePing sends one liveness ping to a peer without touching its
+// P2P state.
+//
+// It is the data-path analogue of yamux's keepalive ping (FRP
+// client/visitor/xtcp.go:351 -> yamux session.go:363). The pong is not
+// matched by checkID here: any inbound frame from the peer is accepted as
+// proof of life, which handleP2P records via NoteDataPacket. That is looser
+// than yamux, which awaits a specific pong, but it matches what we can
+// observe without tracking every outstanding checkID, and it is still
+// strictly stronger than a punch — a punch is generated by our own outbound
+// traffic and proves nothing about the inbound path.
+func (e *EdgeClient) sendKeepAlivePing(p *p2p.Peer) {
+	checkid := fmt.Sprintf("ka.%s.%s.%d", e.ID, net.HardwareAddr(p.Infos.MacAddr).String(), time.Now().UnixNano())
+	pingMsg := &netstruct.PeerToPing{
+		IsPong:  false,
+		CheckId: checkid,
+	}
+	if err := e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPBestEffort); err != nil {
+		log.Printf("[P2P] keepalive ping to %s failed: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
+	}
+}
+
+// sendPathVerificationProbe actively proves the direct data path works, for
+// peers that have been punched but not yet promoted to FullDuplex.
+//
+// Why this is necessary: promotion to FullDuplex is gated on having seen a
+// real data frame, but data is only ever routed over P2P when the peer is
+// ALREADY FullDuplex (wire.go UDPAddrWithStrategy: UDPBestEffort takes the
+// direct path only on P2PFullDuplex). Gating promotion on data therefore
+// deadlocks — nothing sends P2P data until promotion, and nothing is promoted
+// until P2P data arrives. Punches kept "succeeding" while no promotion ever
+// happened.
+//
+// FRP does not have this problem because after punching it immediately writes
+// real user data through the tunnel, which both proves the path and promotes
+// the session. There is no user data to write at punch time here (the TAP has
+// nothing queued), so this sends the smallest real ProtoV frame that will do:
+// a ping, forced over P2P with UDPEnforceP2P, which bypasses the
+// status check. The peer's pong comes back over P2P, is recorded by
+// handleP2P via NoteDataPacket, and promotes both sides — on each side
+// independently, since each only promotes on frames it actually received.
+func (e *EdgeClient) sendPathVerificationProbe(p *p2p.Peer) {
+	if p.P2PStatus == p2p.P2PFullDuplex && p.IsFullDuplex {
+		return // already promoted; the keepalive ping is enough
+	}
+	if p.P2PRaddr == "" && p.UDPAddr() == nil {
+		return // no known address to probe
+	}
+	checkid := fmt.Sprintf("vp.%s.%s.%d", e.ID, net.HardwareAddr(p.Infos.MacAddr).String(), time.Now().UnixNano())
+	pingMsg := &netstruct.PeerToPing{
+		IsPong:  false,
+		CheckId: checkid,
+	}
+	if err := e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPEnforceP2P); err != nil {
+		log.Printf("[P2P] path verification probe to %s failed: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
+	}
+}
+
 // handleTAP reads packets from the TAP interface and (potentially) sends them to the supernode.
 // What's read from TAP right now are EthernetFrames and thus transformed into DATA packets
 // Then sent through UDP, to either Supernode or P2PDirect connection if available and relevant.
@@ -147,7 +446,16 @@ func (e *EdgeClient) handleTAP() {
 			if strings.Contains(err.Error(), "file already closed") {
 				return
 			}
-			log.Printf("TAP read error: %v (handle=%v)", err, e.TAP.Iface.GetHandle())
+			// Avoid tight busy-loop on persistent read errors (e.g.
+			// "not pollable" when the TAP device is in a bad state).
+			// Back off before retrying so the process does not peg CPU at 100%.
+			log.Printf("TAP read error: %v (handle=%v) — backing off", err, e.TAP.Iface.GetHandle())
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		if n == 0 {
+			// Poll timeout with no data — loop around to check ctx.Done()
 			continue
 		}
 
@@ -213,6 +521,250 @@ func (e *EdgeClient) handleTAP() {
 	}
 }
 
+// handlePunchDatagram processes an inbound hole-punch datagram — a punch or an
+// ACK — that arrived on one of this edge's UDP sockets.
+//
+// It is the single implementation behind both handleP2P (WSS mode, dedicated
+// P2P socket) and handleUDP (plain UDP mode). Those two paths used to carry
+// near-duplicate copies of this logic, which is how the ACK echo loop below went
+// unnoticed: the classification was "first four bytes are the punch magic", so
+// an ACK was indistinguishable from a punch and BOTH edges answered every ACK
+// with another ACK. Each datagram produced exactly one reply, making a
+// self-sustaining loop at 1/RTT (~90 pkt/s at the measured 23.7ms E1<->E2 RTT)
+// that only died when UDP happened to drop a datagram — the loop has no
+// independent driver. E2 logged 7 four-byte punches against 558 eight-byte ACKs.
+//
+// Two rules keep it one-directional:
+//
+//  1. Answer a punch, never an ACK. The ACK already carries the confirmation
+//     its sender is waiting for, so re-answering it is pure amplification.
+//  2. Rate-limit both the reply and the state we publish about the peer, so a
+//     misbehaving or older peer cannot turn punch traffic into a packet storm
+//     or into a stream of PeerP2PInfos updates to the supernode.
+func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
+	now := time.Now()
+	isAck := p2p.IsPunchAck(buf, n)
+
+	// The peer is looked up before answering, because the per-peer rate limit
+	// lives on the peer. Under a NAT the observed source port is the only
+	// address the peer can actually be reached at, so it is also the only
+	// useful fallback when the published pubSocket has gone stale.
+	p, err := e.Peers.GetPeerBySocket(addr)
+	if err != nil {
+		// Fallback: match by IP only (Symmetric NAT may hand the peer a
+		// different port per destination, so the socket match can miss).
+		p, err = e.Peers.GetPeerBySocketIP(addr.IP)
+	}
+	if err != nil {
+		// Unknown peer: still answer a genuine punch — it is how a peer that
+		// just came back with a new NAT port proves it is reachable — but
+		// never answer an ACK, do not fabricate state for an unknown peer, and
+		// rate-limit the reply so the four public magic bytes cannot be used
+		// to drive a reflection amplifier.
+		if !p2p.ShouldAnswerPunch(buf, n) {
+			log.Printf("[P2P] Ignoring punch ACK from unknown peer at %v", addr)
+			return
+		}
+		if e.allowUnknownPunchAck(addr.String(), now) {
+			log.Printf("[P2P] Punch packet from unknown peer at %v — answering once", addr)
+			e.sendPunchAck(addr)
+		}
+		return
+	}
+
+	mac := net.HardwareAddr(p.Infos.MacAddr).String()
+
+	if isAck {
+		// An ACK is evidence that the peer's socket is reachable, and that is
+		// worth recording — it is what unblocks waitForPunchSuccess. It is
+		// never worth answering.
+		p.NotePunchPacket()
+	} else {
+		if p.AllowPunchAck(now) {
+			log.Printf("[P2P] Punch packet received from %v (peer %s)", addr, mac)
+			e.sendPunchAck(addr)
+		}
+		p.NotePunchPacket()
+	}
+
+	// The observed source address is the peer's real raddr, exactly like FRP's
+	// raddr. Under Symmetric NAT it differs from the STUN-derived pubSocket
+	// (the NAT assigns a different port per destination), and UDPAddrWithStrategy
+	// must target it. This is also what lets a restarted peer — whose NAT port
+	// has changed — be re-learned without a supernode round trip.
+	p.SetP2PRaddr(addr.String())
+
+	if !p.AllowPunchPublish(now) {
+		// State is already current for this peer; skip the supernode-facing
+		// work. NotePunchPacket/SetP2PRaddr above are cheap and idempotent,
+		// so liveness tracking stays accurate at full packet rate.
+		return
+	}
+
+	if changed, ferr := p.SetFullDuplex(true); changed {
+		log.Printf("[P2P] FullDuplex established with %s (punch evidence from %v)", mac, addr)
+		e.Peers.SetPendingChanges()
+	} else if ferr != nil {
+		log.Printf("[P2P] punch from %s could not set FullDuplex: %v", mac, ferr)
+	}
+
+	// Tell the relay the round succeeded, otherwise it keeps pushing fresh
+	// instructions at an already-established tunnel.
+	e.Peers.SetPendingChanges()
+	e.Peers.RecordNatHolePunchResult(
+		mac,
+		p2p.NatHolePunchState_PunchStateSucceeded, 1,
+		fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr))
+}
+
+// allowUnknownPunchAck rate-limits ACK replies to sources that match no known
+// peer, keyed by source address. The map is pruned whenever it grows past a
+// small bound, so a spoofed flood cannot make it grow without limit.
+func (e *EdgeClient) allowUnknownPunchAck(addr string, now time.Time) bool {
+	const maxTracked = 64
+	e.unknownPunchAckMu.Lock()
+	defer e.unknownPunchAckMu.Unlock()
+	if e.unknownPunchAck == nil {
+		e.unknownPunchAck = make(map[string]time.Time)
+	}
+	if last, ok := e.unknownPunchAck[addr]; ok && now.Sub(last) < time.Second {
+		return false
+	}
+	e.unknownPunchAck[addr] = now
+	if len(e.unknownPunchAck) > maxTracked {
+		for k, t := range e.unknownPunchAck {
+			if now.Sub(t) > 10*time.Second {
+				delete(e.unknownPunchAck, k)
+			}
+		}
+	}
+	return true
+}
+
+// sendPunchAck answers a punch on the socket the punch arrived on, replying to
+// the observed source address rather than the STUN-discovered pubSocket — the
+// FRP waitDetectMessage behaviour. Replying to the source address is what
+// works when the cloud NAT has no UDP port forwarding: the NAT's conntrack
+// already permits return traffic for the peer's outbound flow.
+func (e *EdgeClient) sendPunchAck(addr *net.UDPAddr) {
+	punchAck := p2p.PunchAckBytes()
+	if e.P2PConn != nil && e.P2PConn != e.Conn {
+		if _, err := e.P2PConn.WriteToUDP(punchAck, addr); err != nil {
+			log.Printf("[P2P] Failed to send punch ACK to %v: %v", addr, err)
+		} else {
+			log.Printf("[P2P] Sent punch ACK to source %v", addr)
+		}
+		return
+	}
+	if e.Conn != nil {
+		if _, err := e.Conn.WriteToUDP(punchAck, addr); err != nil {
+			log.Printf("[P2P] Failed to send punch ACK to %v: %v", addr, err)
+		} else {
+			log.Printf("[P2P] Sent punch ACK to source %v", addr)
+		}
+		return
+	}
+	if e.WSSTransport != nil {
+		if _, err := e.WSSTransport.Write(punchAck, addr); err != nil {
+			log.Printf("[P2P] Failed to send punch ACK via WSS to %v: %v", addr, err)
+		} else {
+			log.Printf("[P2P] Sent punch ACK via WSS to %v", addr)
+		}
+	}
+}
+
+// handleP2P reads packets from the dedicated P2P UDP socket (used in WSS mode where
+// the supernode connection is over WebSocket and a separate UDP socket is needed for
+// peer-to-peer hole-punching). In UDP mode, handleUDP already reads from the shared socket.
+func (e *EdgeClient) handleP2P() {
+	if e.P2PConn == nil || e.P2PConn == e.Conn {
+		return
+	}
+	e.wg.Add(1)
+	defer e.wg.Done()
+
+	log.Printf("Starting P2P UDP packet handler on %s", e.P2PAddr)
+
+	packetBuf := e.packetBufPool.Get()
+	defer e.packetBufPool.Put(packetBuf)
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		default:
+		}
+		n, addr, err := e.P2PConn.ReadFromUDP(packetBuf)
+		if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Printf("P2P UDP read error: %v", err)
+			continue
+		}
+
+		e.PacketsRecv.Add(1)
+		// Punch traffic is logged (throttled) inside handlePunchDatagram; logging
+		// every datagram here is what buried the real events during the ACK echo loop.
+		if !p2p.IsPunch(packetBuf, n) {
+			log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, packetBuf[0])
+		}
+		if p2p.IsPunch(packetBuf, n) {
+			// Punch/ACK traffic is handled in one shared place so handleP2P and
+			// handleUDP cannot drift apart again.
+			e.handlePunchDatagram(n, addr, packetBuf)
+			continue
+		}
+		if packetBuf[0] == protocol.VersionVFuze {
+			udpAddr := addr
+			err = e.handleVFuzePacket(packetBuf, n, udpAddr)
+			if err != nil {
+				if strings.Contains(err.Error(), "file already closed") {
+					return
+				}
+				log.Printf("P2P handleVFuzePacket Error: %v", err)
+			}
+			continue
+		}
+
+		if n < protocol.ProtoVHeaderSize {
+			log.Printf("P2P: received packet too short from %v: %q", addr, string(packetBuf[:n]))
+			continue
+		}
+
+		rawMsg, err := protocol.NewRawMessage(packetBuf[:n], addr)
+		if err != nil {
+			log.Printf("P2P: error while parsing UDP Packet: %v", err)
+			continue
+		}
+
+		// A well-formed ProtoV frame arriving on the P2P socket is the only
+		// proof we accept that the direct data path actually carries traffic.
+		// Record it and let it (not a punch) promote the peer to FullDuplex.
+		if rawMsg.Header != nil {
+			if p, perr := e.Peers.GetPeerBySocket(addr); perr == nil {
+				p.NoteDataPacket()
+				if changed, _ := p.SetFullDuplex(true); changed {
+					log.Printf("[P2P] FullDuplex established with %s (verified by real data frame from %v)",
+						net.HardwareAddr(p.Infos.MacAddr).String(), addr)
+					e.Peers.SetPendingChanges()
+				}
+			}
+		}
+
+		err = e.messageHandlers.Handle(rawMsg)
+		if err != nil {
+			if strings.Contains(err.Error(), "file already closed") {
+				return
+			}
+			log.Printf("P2P: Error from messageHandler: %v", err)
+		}
+	}
+}
+
 // handleUDP reads packets from the UDP connection and writes the payload to the TAP interface.
 func (e *EdgeClient) handleUDP() {
 	// If using WSS, handle WSS packets instead
@@ -247,7 +799,17 @@ func (e *EdgeClient) handleUDP() {
 		}
 
 		e.PacketsRecv.Add(1)
-
+		// Punch traffic is logged (throttled) inside handlePunchDatagram; logging
+		// every datagram here is what buried the real events during the ACK echo loop.
+		if !p2p.IsPunch(packetBuf, n) {
+			log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, packetBuf[0])
+		}
+		if p2p.IsPunch(packetBuf, n) {
+			// Punch/ACK traffic is handled in one shared place so handleP2P and
+			// handleUDP cannot drift apart again.
+			e.handlePunchDatagram(n, addr, packetBuf)
+			continue
+		}
 		if packetBuf[0] == protocol.VersionVFuze {
 			err = e.handleVFuzePacket(packetBuf, n, addr)
 			if err != nil {
@@ -299,7 +861,7 @@ func (e *EdgeClient) handleWSS() {
 		default:
 			// Continue processing
 		}
-		
+
 		// If not connected, try to (re)connect
 		if e.WSSTransport == nil {
 			if e.wssConfig == nil {
@@ -307,7 +869,7 @@ func (e *EdgeClient) handleWSS() {
 			}
 			log.Printf("WSS disconnected, attempting to connect in %v...", reconnectDelay)
 			time.Sleep(reconnectDelay)
-			
+
 			newTransport, err := transport.NewWSSTransport(e.wssConfig)
 			if err != nil {
 				log.Printf("Failed to connect WSS: %v", err)
@@ -317,11 +879,11 @@ func (e *EdgeClient) handleWSS() {
 				}
 				continue
 			}
-			
+
 			e.WSSTransport = newTransport
 			reconnectDelay = 3 * time.Second // Reset backoff
 			log.Printf("WSS connected to %s", e.wssConfig.URL)
-			
+
 			// Re-register with supernode after (re)connection
 			e.registered = false
 			e.isWaitingForSNRetryRegisterResponse = true
@@ -332,28 +894,42 @@ func (e *EdgeClient) handleWSS() {
 			continue
 		}
 
+		// Set a read deadline to detect half-open/disconnected WebSocket
+		// connections (e.g. when the supernode/Worker hot-reloads and
+		// drops the connection without sending a close frame).
+		e.WSSTransport.SetReadDeadline(time.Now().Add(120 * time.Second))
+
 		n, addr, err := e.WSSTransport.Read(packetBuf)
 		if err != nil {
 			if strings.Contains(err.Error(), "use of closed network connection") {
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
+				log.Printf("WSS read deadline exceeded (20s) — connection likely dead, reconnecting...")
+			} else {
+				log.Printf("WSS read error: %v", err)
 			}
-			log.Printf("WSS read error: %v", err)
-			
 			// Close and discard old transport to avoid repeated reads on failed connection
 			oldTransport := e.WSSTransport
 			e.WSSTransport = nil
 			if oldTransport != nil {
 				oldTransport.Close()
 			}
-			
 			// Will reconnect on next iteration
 			continue
 		}
 
 		e.PacketsRecv.Add(1)
+		log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, packetBuf[0])
+
+		// FRP-style fix: ONLY process punch packets that arrive via direct P2P UDP
+		// (handleP2P), because WSSTransport.Read returns the Worker's address
+		// (conn.RemoteAddr()), NOT the sender's NAT-mapped raddr. The Worker
+		// (Cloudflare Worker) does NOT forward raw punch packets (0xFF...) —
+		// it only forwards ProtoV (0x05) and VFuze (0x51) messages, so punch
+		// packets arriving here would have the wrong addr anyway.
+		// The handleP2P loop (which uses P2PConn.ReadFromUDP) correctly
+		// receives punch packets with the true raddr and handles them.
 
 		if packetBuf[0] == protocol.VersionVFuze {
 			udpAddr, _ := addr.(*net.UDPAddr)
@@ -378,6 +954,11 @@ func (e *EdgeClient) handleWSS() {
 			log.Printf("error while parsing WSS Packet: %v", err)
 			continue
 		}
+		log.Printf("WSS: parsed protoV msg type=%d srcMAC=%s dstMAC=%s payloadLen=%d",
+			rawMsg.Header.PacketType,
+			rawMsg.Header.GetSrcMACAddr(),
+			rawMsg.Header.GetDstMACAddr(),
+			len(rawMsg.Payload))
 
 		err = e.messageHandlers.Handle(rawMsg)
 		if err != nil {

@@ -80,8 +80,12 @@ This connects to a supernode via WSS and joins the "acme" community.
 # Basic usage with WSS
 sudo ./edge up -c acme -s wss://n2ngo-ws.swings.one/n2n?community=acme -l
 
-# With custom TAP interface and UDP port
+# With custom TAP interface and P2P hole-punch port
 sudo ./edge up -c acme -s wss://host/n2n -t n2n1 -P 1194 -l
+
+# Pin the P2P listen endpoint explicitly
+# (recommended: makes the sender/receiver roles deterministic)
+sudo ./edge up -c acme -s wss://host/n2n -P 10.0.0.5:1194 -l
 
 # With encryption and compression
 sudo ./edge up -c acme -s wss://host/n2n -k mysecret -C -l
@@ -102,11 +106,14 @@ edge_id: ""  # auto generate from hostname
 community: "acme"
 supernode_addr: "157.180.44.113:7777"
 local_port: 0  # Use 0 for automatic port assignment
+p2p_listen_addr: ""  # P2P UDP listen address (empty = all interfaces)
+p2p_listen_port: 0  # P2P UDP hole-punch port; 0 = automatic assignment
+                    # (the CLI merges both into a single --p2p-listen addr:port)
 enable_vfuze: true
 tap_name: "n2n_tap0"
 heartbeat_interval: "10s"
 udp_buffer_size: 8388608
-api_listen_address: ":7778"  # Optional API address
+api_listen_address: "127.0.0.1:7778"  # Optional API endpoint
 encryption_passphrase: "YourSecretPassphrase"  # Optional encryption
 compress_payload: false # Optional zstd compression
 proxy_url: "" # Optional proxy URL (http://, https://, socks5://, or socks5s://)
@@ -120,16 +127,52 @@ proxy_url: "" # Optional proxy URL (http://, https://, socks5://, or socks5s://)
 | `--id` | `-i` | Edge identifier | hostname |
 | `--community` | `-c` | Community name | - |
 | `--tap` | `-t` | TAP interface name | `n2n_tap0` |
-| `--port` | `-P` | Local UDP port | `0` (system-assigned) |
+| `--port` | `-p` | Local UDP port for the plain-UDP supernode socket | `0` (system-assigned) |
+| `--p2p-listen` | `-P` | P2P UDP listen endpoint for hole punching, `addr:port` (both parts optional) | `0.0.0.0:0` |
 | `--enableFuze` | `-F` | Enable VFuze fastpath | `true` |
 | `--heartbeat` | `-H` | Heartbeat interval | `30s` |
 | `--udpbuffersize` | `-b` | UDP buffer size | `8388608` |
 | `--encryption-passphrase` | `-k` | Passphrase for encryption | - |
 | `--compress-payload` | `-C` | Enable Zstd compression for data payloads | `false` |
-| `--proxy-url` | `-p` | Proxy URL for WSS transport: `http://`, `https://`, `socks5://`, or `socks5s://` | - |
+| `--proxy-url` | `-x` | Proxy URL for WSS transport: `http://`, `https://`, `socks5://`, or `socks5s://` | - |
 | `--supernode` | `-s` | Supernode URL for WS/WSS (`ws://` or `wss://`) | - |
-| `--api-listen` | `-A` | Management API listen address | `127.0.0.1:7778` |
+| `--api-listen` | `-A` | Management API listen endpoint, `addr:port` (both parts optional) | `127.0.0.1:7778` |
 | `--stdout-log` | `-l` | Log to stdout instead of SQLite | `false` |
+
+##### Listen endpoints: `--p2p-listen` and `--api-listen`
+
+Both listen flags take a single `addr:port` value where **either part may be
+omitted**. A bare number is read as a port, which is what you almost always
+mean:
+
+| Value | `--p2p-listen` resolves to | `--api-listen` resolves to |
+|-------|------------------------------|-----------------------------|
+| *(omitted)* | `0.0.0.0:0` | `127.0.0.1:7778` |
+| `-P 7777` | `0.0.0.0:7777` | `127.0.0.1:7777` |
+| `-P :7777` | `0.0.0.0:7777` | `127.0.0.1:7777` |
+| `-P 10.0.0.5:7777` | `10.0.0.5:7777` | `10.0.0.5:7777` |
+| `-P [::1]:7777` | `[::1]:7777` | `[::1]:7777` |
+
+IPv6 literals must use the bracket form when a port follows (`[::1]:7777`); a
+bare `::1` is read as an address with the default port. A non-numeric port or an
+out-of-range value is rejected at startup rather than silently ignored.
+
+> **Note on `--port` vs `--p2p-listen`:** they control different sockets.
+> `--port` applies only to the plain-UDP supernode socket and is ignored in WSS
+> mode, where the supernode connection rides on WebSocket. `--p2p-listen` sets
+> the dedicated UDP socket used for peer-to-peer hole punching; its port is what
+> peers learn as each other's `pubSocket` and punch at. Note that port `0` means
+> "let the kernel assign an ephemeral port", so it is preserved rather than
+> treated as unset.
+>
+> Pinning it makes role assignment deterministic: the relay elects the peer with
+> the **lower** public port as the punch sender, so fixing both ends' ports fixes
+> the sender/receiver roles without having to race for an ephemeral port. This is
+> also what makes the role-swap behaviour testable on demand.
+
+> **Note on `--api-listen`:** it binds `127.0.0.1` when the address is omitted.
+> Bind `0.0.0.0` explicitly to expose the management API to the network — the API
+> password is the community name, so exposing it is a real risk.
 
 #### Proxy Configuration
 
@@ -145,16 +188,16 @@ The edge supports connecting to the supernode through a proxy when using WSS tra
 
 ```bash
 # Using HTTP proxy
-./edge up -s wss://supernode.example.com:443 -p http://proxy.example.com:8080
+./edge up -s wss://supernode.example.com:443 -x http://proxy.example.com:8080
 
 # Using HTTPS proxy
-./edge up -s wss://supernode.example.com:443 -p https://proxy.example.com:8443
+./edge up -s wss://supernode.example.com:443 -x https://proxy.example.com:8443
 
 # Using SOCKS5 proxy
-./edge up -s wss://supernode.example.com:443 -p socks5://proxy.example.com:1080
+./edge up -s wss://supernode.example.com:443 -x socks5://proxy.example.com:1080
 
 # Using SOCKS5 proxy over TLS
-./edge up -s wss://supernode.example.com:443 -p socks5s://proxy.example.com:1080
+./edge up -s wss://supernode.example.com:443 -x socks5s://proxy.example.com:1080
 ```
 
 **Configuration file example (edge.yaml):**

@@ -82,6 +82,13 @@ func marshalPublicKey(publicKey *rsa.PublicKey) []byte {
 
 // Helper function to parse public key from PEM format
 func parsePublicKey(pemData []byte) (*rsa.PublicKey, error) {
+	log.Printf("DEBUG parsePublicKey: input pemData length=%d", len(pemData))
+	if len(pemData) > 0 {
+		log.Printf("DEBUG parsePublicKey: pemData first 200 bytes=%q", string(pemData[:min(200, len(pemData))]))
+		log.Printf("DEBUG parsePublicKey: pemData last 50 bytes=%q", string(pemData[max(0, len(pemData)-50):]))
+	} else {
+		log.Printf("DEBUG parsePublicKey: pemData is EMPTY!")
+	}
 	block, _ := pem.Decode(pemData)
 	if block == nil {
 		return nil, fmt.Errorf("failed to parse PEM block containing the public key")

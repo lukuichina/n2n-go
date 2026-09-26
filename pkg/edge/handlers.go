@@ -82,13 +82,35 @@ func (e *EdgeClient) handleVFuzePacket(packetBuf []byte, n int, addr *net.UDPAdd
 		return nil
 	}
 
-	if !disablePeerSocketCheckingInVFuze {
+	// A relayed packet has no UDP source, so the socket checks below cannot
+	// run. Skip them rather than dereferencing nil; the destMAC check above
+	// still applies, and this matches the ProtoV path, which also delivers
+	// relayed packets with a nil source address.
+	if !disablePeerSocketCheckingInVFuze && addr != nil {
 		// if not from supernode, we check that we now this peer
 		if !e.IsSupernodeUDPAddr(addr) {
 			if !e.IsKnownPeerSocket(addr) {
 				log.Printf("ignoring VFuze packet from not in known peers: %s", addr.String())
 				return nil
 			}
+		}
+	}
+
+	// Store raddr (NAT-mapped source address) when we receive VFuze data.
+	// Under Symmetric NAT, the source port changes with each destination,
+	// so we continuously update the best-known reachable address.
+	//
+	// addr is nil for packets relayed by the Worker: handleWSS does
+	// addr.(*net.UDPAddr) on conn.RemoteAddr(), which is not a *net.UDPAddr,
+	// so the assertion yields a nil *net.UDPAddr that was passed straight
+	// through. Dereferencing it crashed the whole edge process. The payload
+	// is still valid and must be delivered — only the raddr bookkeeping needs
+	// a real source, and a relayed packet simply has none to learn.
+	if addr != nil {
+		if peer, err := e.Peers.GetPeerBySocket(addr); err == nil {
+			peer.SetP2PRaddr(addr.String())
+		} else if peer, err := e.Peers.GetPeerBySocketIP(addr.IP); err == nil {
+			peer.SetP2PRaddr(addr.String())
 		}
 	}
 
@@ -117,6 +139,13 @@ func (e *EdgeClient) handleDataPayload(payload []byte) error {
 		copy(padded, payload)
 		payload = padded
 	}
+	if e.TAP == nil {
+		// The TAP device can disappear underneath a running edge (it was
+		// deleted, or never came up). Writing through a nil device panics
+		// and takes the whole edge process down, turning a recoverable
+		// data-path problem into a hard outage. Report it instead.
+		return fmt.Errorf("TAP device is nil, dropping %d-byte payload", len(payload))
+	}
 	_, err = e.TAP.Write(payload)
 	if err != nil {
 		return fmt.Errorf("TAP write error: %w", err)
@@ -125,6 +154,22 @@ func (e *EdgeClient) handleDataPayload(payload []byte) error {
 }
 
 func (e *EdgeClient) handleDataMessage(r *protocol.RawMessage) error {
+	log.Printf("handleDataMessage: type=%d srcMAC=%s dstMAC=%s payloadLen=%d",
+		r.Header.PacketType,
+		r.Header.GetSrcMACAddr(),
+		r.Header.GetDstMACAddr(),
+		len(r.Payload))
+
+	// Store raddr when receiving data messages — the source address is
+	// the NAT-mapped address through which the peer can be reached.
+	// This continuously updates the best-known reachable address under
+	// Symmetric NAT where the port changes per destination.
+	if udpAddr, ok := r.FromAddr.(*net.UDPAddr); ok && udpAddr != nil {
+		if peer, err := e.Peers.GetPeerBySocket(udpAddr); err == nil {
+			peer.SetP2PRaddr(udpAddr.String())
+		}
+	}
+
 	return e.handleDataPayload(r.Payload)
 }
 
@@ -138,6 +183,30 @@ func (e *EdgeClient) handlePeerInfoMessage(r *protocol.RawMessage) error {
 	if err != nil {
 		log.Printf("error in HandlePeerInfoList: %v", err)
 		return err
+	}
+	// Mark pending changes so sendP2PInfos will broadcast our own P2P
+	// state (pubSocket from STUN, NAT type) to the Worker. Without this,
+	// the Worker never learns our NAT info and cannot coordinate hole
+	// punching — only the peer that received P2PStateInfo gets eligible.
+	e.Peers.SetPendingChanges()
+	// Extract and dispatch relay-coordinated NAT hole instructions.
+	// The Worker embeds an instruction in each peer's PeerInfo entry, but
+	// only the entry matching our own MAC is addressed to us. Processing
+	// other peers' instructions would cause the role-detection logic to
+	// assign us the wrong role (self-punching).
+	ourMAC := e.MACAddr.String()
+	for _, pi := range peerInfos.GetPeerInfos() {
+		instr := pi.GetNatHoleInstruction()
+		if instr == nil {
+			continue
+		}
+		peerMAC := net.HardwareAddr(pi.GetMacAddr()).String()
+		if peerMAC != ourMAC {
+			continue
+		}
+		if err := e.handleNatHoleInstruction(peerMAC, instr); err != nil {
+			log.Printf("[Edge] handleNatHoleInstruction error: %v", err)
+		}
 	}
 	return nil
 }

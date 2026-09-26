@@ -2,6 +2,7 @@ package edge
 
 import (
 	"fmt"
+	"net"
 	"n2n-go/pkg/log"
 	"n2n-go/pkg/p2p"
 	"n2n-go/pkg/protocol/netstruct"
@@ -76,12 +77,18 @@ func (e *EdgeClient) sendP2PInfos() error {
 		return nil
 	}
 
-	log.Printf("sending pending PeerP2PInfos changes to supernode...")
-
 	infos := e.Peers.GetPeerP2PInfos()
+	if infos == nil || (infos.From == nil && len(infos.To) == 0) {
+		log.Printf("sendP2PInfos: GetPeerP2PInfos returned nil/empty (reg.Me=%v, hasPending=%v)", infos == nil, e.Peers.HasPendingChanges())
+		// Still clear pending changes to avoid infinite loop of empty sends
+		e.Peers.ClearPendingChanges()
+		return nil
+	}
+	log.Printf("sending pending PeerP2PInfos changes to supernode... (from MAC=%s, to=%d peers)", net.HardwareAddr(infos.From.MacAddr).String(), len(infos.To))
 	e.Peers.ClearPendingChanges()
 	err := e.SendStruct(infos, nil, p2p.UDPEnforceSupernode)
 	if err != nil {
+		log.Printf("sendP2PInfos: FAILED to send: %v", err)
 		return fmt.Errorf(" failed to send updated P2PInfos: %w", err)
 	}
 	return nil

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package p2p;
 
-option go_package = "n2n-go/pkg/p2p/pb";
+option go_package = "n2n-go/pkg/p2p";
 
 // 对应 Go 中的 PeerInfo
 message PeerInfo {
@@ -11,6 +11,56 @@ message PeerInfo {
   string pub_socket = 3;
   string community = 4;
   string desc = 5;
+  string p2p_endpoint = 6;
+  repeated string p2p_capabilities = 7;
+  string nat_type = 8;
+  uint64 last_seen = 9;
+  // NatHole instruction for relay-coordinated NAT hole-punching.
+  // When set, the receiving edge should act on the instruction to punch
+  // through the NAT together with the peer identified by target_mac.
+  NatHoleInstruction nat_hole_instruction = 10;
+  // Observed source address (host:port) that this edge's P2P socket actually
+  // receives packets from. Under a NAT that assigns a different port per
+  // destination, this differs from the STUN-discovered pub_socket, which is
+  // only a point-in-time snapshot and often stale by the time punching runs.
+  // The peer that observes us sends this back so we can punch to the
+  // verified-reachable address instead of the predicted one.
+  string observed_raddr = 11;
+
+  // NatHolePunchResult reports the outcome of this edge's most recent
+  // hole-punch attempt, so the relay can stop re-broadcasting instructions
+  // for pairs that already established P2P and immediately re-arm the ones
+  // that just failed.
+  NatHolePunchResult punch_result = 12;
+  // MAC of the peer this punch_result refers to. Empty means "no attempt
+  // in flight", which lets the relay distinguish a fresh report from a
+  // stale one.
+  string punch_result_peer_mac = 13;
+}
+
+// NatHolePunchState: outcome of a hole-punch attempt, as reported by an edge
+// to the relay. This closes the feedback loop that previously did not exist:
+// without it the relay can only guess, and either broadcasts forever or
+// gives up too early.
+enum NatHolePunchState {
+  // No attempt reported (default / zero value).
+  PunchStateNone = 0;
+  // An attempt is in flight; the relay should wait rather than re-broadcast.
+  PunchStateInProgress = 1;
+  // The attempt failed after exhausting its retries. The relay should
+  // re-broadcast a fresh instruction, applying its own backoff.
+  PunchStateFailed = 2;
+  // The punch succeeded and the tunnel is up. The relay must stop
+  // broadcasting for this pair until the tunnel drops.
+  PunchStateSucceeded = 3;
+}
+
+message NatHolePunchResult {
+  NatHolePunchState state = 1;
+  // Number of attempts the edge burned on the current round.
+  uint32 attempts = 2;
+  // Human-readable reason, for relay-side logging only.
+  string detail = 3;
 }
 
 // 对应 Go 中的 PeerInfoList
@@ -45,4 +95,52 @@ message PeerCachedInfo {
   string community = 4;
   // time.Duration serialized as int64 nanoseconds
   int64 last_update_ns = 5;
+}
+// NatHoleRole: which side initiates the punch
+enum NatHoleRole {
+  DetectRoleSender = 0;
+  DetectRoleReceiver = 1;
+}
+
+// NatHole message: relay server coordinates NAT hole-punching between
+// two HardNAT peers. Sent via PeerInfoList to both edges.
+message NatHole {
+  NatHoleRole role = 1;
+  // port range to try (inclusive)
+  uint32 ports_range_from = 2;
+  uint32 ports_range_to = 3;
+  // TTL in seconds for the punch packet
+  uint32 ttl = 4;
+  // MAC address of the edge that should send the punch packets
+  bytes target_mac = 5;
+  // MAC address of the edge that should receive the punch packets
+  bytes sender_mac = 6;
+  // P2P endpoint (ip:port) of the sender
+  string sender_p2p_endpoint = 7;
+  // pub_socket (ip:port) of the sender
+  string sender_pub_socket = 8;
+  // NAT type of the sender
+  string sender_nat_type = 9;
+  // NAT behavior of the sender
+  string sender_behavior = 10;
+  // Port difference observed by the sender
+  int32 ports_difference = 11;
+  // Whether the sender has regular port changes
+  bool regular_ports_change = 12;
+}
+
+// NatHole instruction embedded in PeerInfoList for relay-coordinated punching
+message NatHoleInstruction {
+  NatHoleRole role = 1;
+  uint32 ports_range_from = 2;
+  uint32 ports_range_to = 3;
+  uint32 ttl = 4;
+  bytes target_mac = 5;
+  bytes sender_mac = 6;
+  string sender_p2p_endpoint = 7;
+  string sender_pub_socket = 8;
+  string sender_nat_type = 9;
+  string sender_behavior = 10;
+  int32 ports_difference = 11;
+  bool regular_ports_change = 12;
 }

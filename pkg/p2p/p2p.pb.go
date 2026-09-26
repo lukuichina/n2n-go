@@ -21,16 +21,149 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// NatHolePunchState: outcome of a hole-punch attempt, as reported by an edge
+// to the relay. This closes the feedback loop that previously did not exist:
+// without it the relay can only guess, and either broadcasts forever or
+// gives up too early.
+type NatHolePunchState int32
+
+const (
+	// No attempt reported (default / zero value).
+	NatHolePunchState_PunchStateNone NatHolePunchState = 0
+	// An attempt is in flight; the relay should wait rather than re-broadcast.
+	NatHolePunchState_PunchStateInProgress NatHolePunchState = 1
+	// The attempt failed after exhausting its retries. The relay should
+	// re-broadcast a fresh instruction, applying its own backoff.
+	NatHolePunchState_PunchStateFailed NatHolePunchState = 2
+	// The punch succeeded and the tunnel is up. The relay must stop
+	// broadcasting for this pair until the tunnel drops.
+	NatHolePunchState_PunchStateSucceeded NatHolePunchState = 3
+)
+
+// Enum value maps for NatHolePunchState.
+var (
+	NatHolePunchState_name = map[int32]string{
+		0: "PunchStateNone",
+		1: "PunchStateInProgress",
+		2: "PunchStateFailed",
+		3: "PunchStateSucceeded",
+	}
+	NatHolePunchState_value = map[string]int32{
+		"PunchStateNone":       0,
+		"PunchStateInProgress": 1,
+		"PunchStateFailed":     2,
+		"PunchStateSucceeded":  3,
+	}
+)
+
+func (x NatHolePunchState) Enum() *NatHolePunchState {
+	p := new(NatHolePunchState)
+	*p = x
+	return p
+}
+
+func (x NatHolePunchState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (NatHolePunchState) Descriptor() protoreflect.EnumDescriptor {
+	return file_pkg_p2p_proto_p2p_proto_enumTypes[0].Descriptor()
+}
+
+func (NatHolePunchState) Type() protoreflect.EnumType {
+	return &file_pkg_p2p_proto_p2p_proto_enumTypes[0]
+}
+
+func (x NatHolePunchState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use NatHolePunchState.Descriptor instead.
+func (NatHolePunchState) EnumDescriptor() ([]byte, []int) {
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{0}
+}
+
+// NatHoleRole: which side initiates the punch
+type NatHoleRole int32
+
+const (
+	NatHoleRole_DetectRoleSender   NatHoleRole = 0
+	NatHoleRole_DetectRoleReceiver NatHoleRole = 1
+)
+
+// Enum value maps for NatHoleRole.
+var (
+	NatHoleRole_name = map[int32]string{
+		0: "DetectRoleSender",
+		1: "DetectRoleReceiver",
+	}
+	NatHoleRole_value = map[string]int32{
+		"DetectRoleSender":   0,
+		"DetectRoleReceiver": 1,
+	}
+)
+
+func (x NatHoleRole) Enum() *NatHoleRole {
+	p := new(NatHoleRole)
+	*p = x
+	return p
+}
+
+func (x NatHoleRole) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (NatHoleRole) Descriptor() protoreflect.EnumDescriptor {
+	return file_pkg_p2p_proto_p2p_proto_enumTypes[1].Descriptor()
+}
+
+func (NatHoleRole) Type() protoreflect.EnumType {
+	return &file_pkg_p2p_proto_p2p_proto_enumTypes[1]
+}
+
+func (x NatHoleRole) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use NatHoleRole.Descriptor instead.
+func (NatHoleRole) EnumDescriptor() ([]byte, []int) {
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{1}
+}
+
 // 对应 Go 中的 PeerInfo
 type PeerInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VirtualIp     string                 `protobuf:"bytes,1,opt,name=virtual_ip,json=virtualIp,proto3" json:"virtual_ip,omitempty"`
-	MacAddr       []byte                 `protobuf:"bytes,2,opt,name=mac_addr,json=macAddr,proto3" json:"mac_addr,omitempty"`
-	PubSocket     string                 `protobuf:"bytes,3,opt,name=pub_socket,json=pubSocket,proto3" json:"pub_socket,omitempty"`
-	Community     string                 `protobuf:"bytes,4,opt,name=community,proto3" json:"community,omitempty"`
-	Desc          string                 `protobuf:"bytes,5,opt,name=desc,proto3" json:"desc,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	VirtualIp       string                 `protobuf:"bytes,1,opt,name=virtual_ip,json=virtualIp,proto3" json:"virtual_ip,omitempty"`
+	MacAddr         []byte                 `protobuf:"bytes,2,opt,name=mac_addr,json=macAddr,proto3" json:"mac_addr,omitempty"`
+	PubSocket       string                 `protobuf:"bytes,3,opt,name=pub_socket,json=pubSocket,proto3" json:"pub_socket,omitempty"`
+	Community       string                 `protobuf:"bytes,4,opt,name=community,proto3" json:"community,omitempty"`
+	Desc            string                 `protobuf:"bytes,5,opt,name=desc,proto3" json:"desc,omitempty"`
+	P2PEndpoint     string                 `protobuf:"bytes,6,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
+	P2PCapabilities []string               `protobuf:"bytes,7,rep,name=p2p_capabilities,json=p2pCapabilities,proto3" json:"p2p_capabilities,omitempty"`
+	NatType         string                 `protobuf:"bytes,8,opt,name=nat_type,json=natType,proto3" json:"nat_type,omitempty"`
+	LastSeen        uint64                 `protobuf:"varint,9,opt,name=last_seen,json=lastSeen,proto3" json:"last_seen,omitempty"`
+	// NatHole instruction for relay-coordinated NAT hole-punching.
+	// When set, the receiving edge should act on the instruction to punch
+	// through the NAT together with the peer identified by target_mac.
+	NatHoleInstruction *NatHoleInstruction `protobuf:"bytes,10,opt,name=nat_hole_instruction,json=natHoleInstruction,proto3" json:"nat_hole_instruction,omitempty"`
+	// Observed source address (host:port) that this edge's P2P socket actually
+	// receives packets from. Under a NAT that assigns a different port per
+	// destination, this differs from the STUN-discovered pub_socket, which is
+	// only a point-in-time snapshot and often stale by the time punching runs.
+	// The peer that observes us sends this back so we can punch to the
+	// verified-reachable address instead of the predicted one.
+	ObservedRaddr string `protobuf:"bytes,11,opt,name=observed_raddr,json=observedRaddr,proto3" json:"observed_raddr,omitempty"`
+	// NatHolePunchResult reports the outcome of this edge's most recent
+	// hole-punch attempt, so the relay can stop re-broadcasting instructions
+	// for pairs that already established P2P and immediately re-arm the ones
+	// that just failed.
+	PunchResult *NatHolePunchResult `protobuf:"bytes,12,opt,name=punch_result,json=punchResult,proto3" json:"punch_result,omitempty"`
+	// MAC of the peer this punch_result refers to. Empty means "no attempt
+	// in flight", which lets the relay distinguish a fresh report from a
+	// stale one.
+	PunchResultPeerMac string `protobuf:"bytes,13,opt,name=punch_result_peer_mac,json=punchResultPeerMac,proto3" json:"punch_result_peer_mac,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *PeerInfo) Reset() {
@@ -98,6 +231,124 @@ func (x *PeerInfo) GetDesc() string {
 	return ""
 }
 
+func (x *PeerInfo) GetP2PEndpoint() string {
+	if x != nil {
+		return x.P2PEndpoint
+	}
+	return ""
+}
+
+func (x *PeerInfo) GetP2PCapabilities() []string {
+	if x != nil {
+		return x.P2PCapabilities
+	}
+	return nil
+}
+
+func (x *PeerInfo) GetNatType() string {
+	if x != nil {
+		return x.NatType
+	}
+	return ""
+}
+
+func (x *PeerInfo) GetLastSeen() uint64 {
+	if x != nil {
+		return x.LastSeen
+	}
+	return 0
+}
+
+func (x *PeerInfo) GetNatHoleInstruction() *NatHoleInstruction {
+	if x != nil {
+		return x.NatHoleInstruction
+	}
+	return nil
+}
+
+func (x *PeerInfo) GetObservedRaddr() string {
+	if x != nil {
+		return x.ObservedRaddr
+	}
+	return ""
+}
+
+func (x *PeerInfo) GetPunchResult() *NatHolePunchResult {
+	if x != nil {
+		return x.PunchResult
+	}
+	return nil
+}
+
+func (x *PeerInfo) GetPunchResultPeerMac() string {
+	if x != nil {
+		return x.PunchResultPeerMac
+	}
+	return ""
+}
+
+type NatHolePunchResult struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	State NatHolePunchState      `protobuf:"varint,1,opt,name=state,proto3,enum=p2p.NatHolePunchState" json:"state,omitempty"`
+	// Number of attempts the edge burned on the current round.
+	Attempts uint32 `protobuf:"varint,2,opt,name=attempts,proto3" json:"attempts,omitempty"`
+	// Human-readable reason, for relay-side logging only.
+	Detail        string `protobuf:"bytes,3,opt,name=detail,proto3" json:"detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NatHolePunchResult) Reset() {
+	*x = NatHolePunchResult{}
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NatHolePunchResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NatHolePunchResult) ProtoMessage() {}
+
+func (x *NatHolePunchResult) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NatHolePunchResult.ProtoReflect.Descriptor instead.
+func (*NatHolePunchResult) Descriptor() ([]byte, []int) {
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *NatHolePunchResult) GetState() NatHolePunchState {
+	if x != nil {
+		return x.State
+	}
+	return NatHolePunchState_PunchStateNone
+}
+
+func (x *NatHolePunchResult) GetAttempts() uint32 {
+	if x != nil {
+		return x.Attempts
+	}
+	return 0
+}
+
+func (x *NatHolePunchResult) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
+}
+
 // 对应 Go 中的 PeerInfoList
 type PeerInfoList struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -111,7 +362,7 @@ type PeerInfoList struct {
 
 func (x *PeerInfoList) Reset() {
 	*x = PeerInfoList{}
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[1]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -123,7 +374,7 @@ func (x *PeerInfoList) String() string {
 func (*PeerInfoList) ProtoMessage() {}
 
 func (x *PeerInfoList) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[1]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -136,7 +387,7 @@ func (x *PeerInfoList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerInfoList.ProtoReflect.Descriptor instead.
 func (*PeerInfoList) Descriptor() ([]byte, []int) {
-	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{1}
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PeerInfoList) GetHasOrigin() bool {
@@ -178,7 +429,7 @@ type PeerP2PInfos struct {
 
 func (x *PeerP2PInfos) Reset() {
 	*x = PeerP2PInfos{}
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[2]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -190,7 +441,7 @@ func (x *PeerP2PInfos) String() string {
 func (*PeerP2PInfos) ProtoMessage() {}
 
 func (x *PeerP2PInfos) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[2]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -203,7 +454,7 @@ func (x *PeerP2PInfos) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerP2PInfos.ProtoReflect.Descriptor instead.
 func (*PeerP2PInfos) Descriptor() ([]byte, []int) {
-	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{2}
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *PeerP2PInfos) GetFrom() *PeerInfo {
@@ -235,7 +486,7 @@ type P2PFullState struct {
 
 func (x *P2PFullState) Reset() {
 	*x = P2PFullState{}
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[3]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -247,7 +498,7 @@ func (x *P2PFullState) String() string {
 func (*P2PFullState) ProtoMessage() {}
 
 func (x *P2PFullState) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[3]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -260,7 +511,7 @@ func (x *P2PFullState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use P2PFullState.ProtoReflect.Descriptor instead.
 func (*P2PFullState) Descriptor() ([]byte, []int) {
-	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{3}
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *P2PFullState) GetCommunityName() string {
@@ -306,7 +557,7 @@ type PeerCachedInfo struct {
 
 func (x *PeerCachedInfo) Reset() {
 	*x = PeerCachedInfo{}
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[4]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -318,7 +569,7 @@ func (x *PeerCachedInfo) String() string {
 func (*PeerCachedInfo) ProtoMessage() {}
 
 func (x *PeerCachedInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[4]
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -331,7 +582,7 @@ func (x *PeerCachedInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerCachedInfo.ProtoReflect.Descriptor instead.
 func (*PeerCachedInfo) Descriptor() ([]byte, []int) {
-	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{4}
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *PeerCachedInfo) GetDesc() string {
@@ -369,11 +620,288 @@ func (x *PeerCachedInfo) GetLastUpdateNs() int64 {
 	return 0
 }
 
+// NatHole message: relay server coordinates NAT hole-punching between
+// two HardNAT peers. Sent via PeerInfoList to both edges.
+type NatHole struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Role  NatHoleRole            `protobuf:"varint,1,opt,name=role,proto3,enum=p2p.NatHoleRole" json:"role,omitempty"`
+	// port range to try (inclusive)
+	PortsRangeFrom uint32 `protobuf:"varint,2,opt,name=ports_range_from,json=portsRangeFrom,proto3" json:"ports_range_from,omitempty"`
+	PortsRangeTo   uint32 `protobuf:"varint,3,opt,name=ports_range_to,json=portsRangeTo,proto3" json:"ports_range_to,omitempty"`
+	// TTL in seconds for the punch packet
+	Ttl uint32 `protobuf:"varint,4,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	// MAC address of the edge that should send the punch packets
+	TargetMac []byte `protobuf:"bytes,5,opt,name=target_mac,json=targetMac,proto3" json:"target_mac,omitempty"`
+	// MAC address of the edge that should receive the punch packets
+	SenderMac []byte `protobuf:"bytes,6,opt,name=sender_mac,json=senderMac,proto3" json:"sender_mac,omitempty"`
+	// P2P endpoint (ip:port) of the sender
+	SenderP2PEndpoint string `protobuf:"bytes,7,opt,name=sender_p2p_endpoint,json=senderP2pEndpoint,proto3" json:"sender_p2p_endpoint,omitempty"`
+	// pub_socket (ip:port) of the sender
+	SenderPubSocket string `protobuf:"bytes,8,opt,name=sender_pub_socket,json=senderPubSocket,proto3" json:"sender_pub_socket,omitempty"`
+	// NAT type of the sender
+	SenderNatType string `protobuf:"bytes,9,opt,name=sender_nat_type,json=senderNatType,proto3" json:"sender_nat_type,omitempty"`
+	// NAT behavior of the sender
+	SenderBehavior string `protobuf:"bytes,10,opt,name=sender_behavior,json=senderBehavior,proto3" json:"sender_behavior,omitempty"`
+	// Port difference observed by the sender
+	PortsDifference int32 `protobuf:"varint,11,opt,name=ports_difference,json=portsDifference,proto3" json:"ports_difference,omitempty"`
+	// Whether the sender has regular port changes
+	RegularPortsChange bool `protobuf:"varint,12,opt,name=regular_ports_change,json=regularPortsChange,proto3" json:"regular_ports_change,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *NatHole) Reset() {
+	*x = NatHole{}
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NatHole) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NatHole) ProtoMessage() {}
+
+func (x *NatHole) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NatHole.ProtoReflect.Descriptor instead.
+func (*NatHole) Descriptor() ([]byte, []int) {
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *NatHole) GetRole() NatHoleRole {
+	if x != nil {
+		return x.Role
+	}
+	return NatHoleRole_DetectRoleSender
+}
+
+func (x *NatHole) GetPortsRangeFrom() uint32 {
+	if x != nil {
+		return x.PortsRangeFrom
+	}
+	return 0
+}
+
+func (x *NatHole) GetPortsRangeTo() uint32 {
+	if x != nil {
+		return x.PortsRangeTo
+	}
+	return 0
+}
+
+func (x *NatHole) GetTtl() uint32 {
+	if x != nil {
+		return x.Ttl
+	}
+	return 0
+}
+
+func (x *NatHole) GetTargetMac() []byte {
+	if x != nil {
+		return x.TargetMac
+	}
+	return nil
+}
+
+func (x *NatHole) GetSenderMac() []byte {
+	if x != nil {
+		return x.SenderMac
+	}
+	return nil
+}
+
+func (x *NatHole) GetSenderP2PEndpoint() string {
+	if x != nil {
+		return x.SenderP2PEndpoint
+	}
+	return ""
+}
+
+func (x *NatHole) GetSenderPubSocket() string {
+	if x != nil {
+		return x.SenderPubSocket
+	}
+	return ""
+}
+
+func (x *NatHole) GetSenderNatType() string {
+	if x != nil {
+		return x.SenderNatType
+	}
+	return ""
+}
+
+func (x *NatHole) GetSenderBehavior() string {
+	if x != nil {
+		return x.SenderBehavior
+	}
+	return ""
+}
+
+func (x *NatHole) GetPortsDifference() int32 {
+	if x != nil {
+		return x.PortsDifference
+	}
+	return 0
+}
+
+func (x *NatHole) GetRegularPortsChange() bool {
+	if x != nil {
+		return x.RegularPortsChange
+	}
+	return false
+}
+
+// NatHole instruction embedded in PeerInfoList for relay-coordinated punching
+type NatHoleInstruction struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Role               NatHoleRole            `protobuf:"varint,1,opt,name=role,proto3,enum=p2p.NatHoleRole" json:"role,omitempty"`
+	PortsRangeFrom     uint32                 `protobuf:"varint,2,opt,name=ports_range_from,json=portsRangeFrom,proto3" json:"ports_range_from,omitempty"`
+	PortsRangeTo       uint32                 `protobuf:"varint,3,opt,name=ports_range_to,json=portsRangeTo,proto3" json:"ports_range_to,omitempty"`
+	Ttl                uint32                 `protobuf:"varint,4,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	TargetMac          []byte                 `protobuf:"bytes,5,opt,name=target_mac,json=targetMac,proto3" json:"target_mac,omitempty"`
+	SenderMac          []byte                 `protobuf:"bytes,6,opt,name=sender_mac,json=senderMac,proto3" json:"sender_mac,omitempty"`
+	SenderP2PEndpoint  string                 `protobuf:"bytes,7,opt,name=sender_p2p_endpoint,json=senderP2pEndpoint,proto3" json:"sender_p2p_endpoint,omitempty"`
+	SenderPubSocket    string                 `protobuf:"bytes,8,opt,name=sender_pub_socket,json=senderPubSocket,proto3" json:"sender_pub_socket,omitempty"`
+	SenderNatType      string                 `protobuf:"bytes,9,opt,name=sender_nat_type,json=senderNatType,proto3" json:"sender_nat_type,omitempty"`
+	SenderBehavior     string                 `protobuf:"bytes,10,opt,name=sender_behavior,json=senderBehavior,proto3" json:"sender_behavior,omitempty"`
+	PortsDifference    int32                  `protobuf:"varint,11,opt,name=ports_difference,json=portsDifference,proto3" json:"ports_difference,omitempty"`
+	RegularPortsChange bool                   `protobuf:"varint,12,opt,name=regular_ports_change,json=regularPortsChange,proto3" json:"regular_ports_change,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *NatHoleInstruction) Reset() {
+	*x = NatHoleInstruction{}
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NatHoleInstruction) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NatHoleInstruction) ProtoMessage() {}
+
+func (x *NatHoleInstruction) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_p2p_proto_p2p_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NatHoleInstruction.ProtoReflect.Descriptor instead.
+func (*NatHoleInstruction) Descriptor() ([]byte, []int) {
+	return file_pkg_p2p_proto_p2p_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *NatHoleInstruction) GetRole() NatHoleRole {
+	if x != nil {
+		return x.Role
+	}
+	return NatHoleRole_DetectRoleSender
+}
+
+func (x *NatHoleInstruction) GetPortsRangeFrom() uint32 {
+	if x != nil {
+		return x.PortsRangeFrom
+	}
+	return 0
+}
+
+func (x *NatHoleInstruction) GetPortsRangeTo() uint32 {
+	if x != nil {
+		return x.PortsRangeTo
+	}
+	return 0
+}
+
+func (x *NatHoleInstruction) GetTtl() uint32 {
+	if x != nil {
+		return x.Ttl
+	}
+	return 0
+}
+
+func (x *NatHoleInstruction) GetTargetMac() []byte {
+	if x != nil {
+		return x.TargetMac
+	}
+	return nil
+}
+
+func (x *NatHoleInstruction) GetSenderMac() []byte {
+	if x != nil {
+		return x.SenderMac
+	}
+	return nil
+}
+
+func (x *NatHoleInstruction) GetSenderP2PEndpoint() string {
+	if x != nil {
+		return x.SenderP2PEndpoint
+	}
+	return ""
+}
+
+func (x *NatHoleInstruction) GetSenderPubSocket() string {
+	if x != nil {
+		return x.SenderPubSocket
+	}
+	return ""
+}
+
+func (x *NatHoleInstruction) GetSenderNatType() string {
+	if x != nil {
+		return x.SenderNatType
+	}
+	return ""
+}
+
+func (x *NatHoleInstruction) GetSenderBehavior() string {
+	if x != nil {
+		return x.SenderBehavior
+	}
+	return ""
+}
+
+func (x *NatHoleInstruction) GetPortsDifference() int32 {
+	if x != nil {
+		return x.PortsDifference
+	}
+	return 0
+}
+
+func (x *NatHoleInstruction) GetRegularPortsChange() bool {
+	if x != nil {
+		return x.RegularPortsChange
+	}
+	return false
+}
+
 var File_pkg_p2p_proto_p2p_proto protoreflect.FileDescriptor
 
 const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\n" +
-	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\x95\x01\n" +
+	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xfc\x03\n" +
 	"\bPeerInfo\x12\x1d\n" +
 	"\n" +
 	"virtual_ip\x18\x01 \x01(\tR\tvirtualIp\x12\x19\n" +
@@ -381,7 +909,20 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\n" +
 	"pub_socket\x18\x03 \x01(\tR\tpubSocket\x12\x1c\n" +
 	"\tcommunity\x18\x04 \x01(\tR\tcommunity\x12\x12\n" +
-	"\x04desc\x18\x05 \x01(\tR\x04desc\"\xa1\x01\n" +
+	"\x04desc\x18\x05 \x01(\tR\x04desc\x12!\n" +
+	"\fp2p_endpoint\x18\x06 \x01(\tR\vp2pEndpoint\x12)\n" +
+	"\x10p2p_capabilities\x18\a \x03(\tR\x0fp2pCapabilities\x12\x19\n" +
+	"\bnat_type\x18\b \x01(\tR\anatType\x12\x1b\n" +
+	"\tlast_seen\x18\t \x01(\x04R\blastSeen\x12I\n" +
+	"\x14nat_hole_instruction\x18\n" +
+	" \x01(\v2\x17.p2p.NatHoleInstructionR\x12natHoleInstruction\x12%\n" +
+	"\x0eobserved_raddr\x18\v \x01(\tR\robservedRaddr\x12:\n" +
+	"\fpunch_result\x18\f \x01(\v2\x17.p2p.NatHolePunchResultR\vpunchResult\x121\n" +
+	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\"v\n" +
+	"\x12NatHolePunchResult\x12,\n" +
+	"\x05state\x18\x01 \x01(\x0e2\x16.p2p.NatHolePunchStateR\x05state\x12\x1a\n" +
+	"\battempts\x18\x02 \x01(\rR\battempts\x12\x16\n" +
+	"\x06detail\x18\x03 \x01(\tR\x06detail\"\xa1\x01\n" +
 	"\fPeerInfoList\x12\x1d\n" +
 	"\n" +
 	"has_origin\x18\x01 \x01(\bR\thasOrigin\x12%\n" +
@@ -413,7 +954,47 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\n" +
 	"virtual_ip\x18\x03 \x01(\tR\tvirtualIp\x12\x1c\n" +
 	"\tcommunity\x18\x04 \x01(\tR\tcommunity\x12$\n" +
-	"\x0elast_update_ns\x18\x05 \x01(\x03R\flastUpdateNsB\x13Z\x11n2n-go/pkg/p2p/pbb\x06proto3"
+	"\x0elast_update_ns\x18\x05 \x01(\x03R\flastUpdateNs\"\xd9\x03\n" +
+	"\aNatHole\x12$\n" +
+	"\x04role\x18\x01 \x01(\x0e2\x10.p2p.NatHoleRoleR\x04role\x12(\n" +
+	"\x10ports_range_from\x18\x02 \x01(\rR\x0eportsRangeFrom\x12$\n" +
+	"\x0eports_range_to\x18\x03 \x01(\rR\fportsRangeTo\x12\x10\n" +
+	"\x03ttl\x18\x04 \x01(\rR\x03ttl\x12\x1d\n" +
+	"\n" +
+	"target_mac\x18\x05 \x01(\fR\ttargetMac\x12\x1d\n" +
+	"\n" +
+	"sender_mac\x18\x06 \x01(\fR\tsenderMac\x12.\n" +
+	"\x13sender_p2p_endpoint\x18\a \x01(\tR\x11senderP2pEndpoint\x12*\n" +
+	"\x11sender_pub_socket\x18\b \x01(\tR\x0fsenderPubSocket\x12&\n" +
+	"\x0fsender_nat_type\x18\t \x01(\tR\rsenderNatType\x12'\n" +
+	"\x0fsender_behavior\x18\n" +
+	" \x01(\tR\x0esenderBehavior\x12)\n" +
+	"\x10ports_difference\x18\v \x01(\x05R\x0fportsDifference\x120\n" +
+	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\"\xe4\x03\n" +
+	"\x12NatHoleInstruction\x12$\n" +
+	"\x04role\x18\x01 \x01(\x0e2\x10.p2p.NatHoleRoleR\x04role\x12(\n" +
+	"\x10ports_range_from\x18\x02 \x01(\rR\x0eportsRangeFrom\x12$\n" +
+	"\x0eports_range_to\x18\x03 \x01(\rR\fportsRangeTo\x12\x10\n" +
+	"\x03ttl\x18\x04 \x01(\rR\x03ttl\x12\x1d\n" +
+	"\n" +
+	"target_mac\x18\x05 \x01(\fR\ttargetMac\x12\x1d\n" +
+	"\n" +
+	"sender_mac\x18\x06 \x01(\fR\tsenderMac\x12.\n" +
+	"\x13sender_p2p_endpoint\x18\a \x01(\tR\x11senderP2pEndpoint\x12*\n" +
+	"\x11sender_pub_socket\x18\b \x01(\tR\x0fsenderPubSocket\x12&\n" +
+	"\x0fsender_nat_type\x18\t \x01(\tR\rsenderNatType\x12'\n" +
+	"\x0fsender_behavior\x18\n" +
+	" \x01(\tR\x0esenderBehavior\x12)\n" +
+	"\x10ports_difference\x18\v \x01(\x05R\x0fportsDifference\x120\n" +
+	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange*p\n" +
+	"\x11NatHolePunchState\x12\x12\n" +
+	"\x0ePunchStateNone\x10\x00\x12\x18\n" +
+	"\x14PunchStateInProgress\x10\x01\x12\x14\n" +
+	"\x10PunchStateFailed\x10\x02\x12\x17\n" +
+	"\x13PunchStateSucceeded\x10\x03*;\n" +
+	"\vNatHoleRole\x12\x14\n" +
+	"\x10DetectRoleSender\x10\x00\x12\x16\n" +
+	"\x12DetectRoleReceiver\x10\x01B\x10Z\x0en2n-go/pkg/p2pb\x06proto3"
 
 var (
 	file_pkg_p2p_proto_p2p_proto_rawDescOnce sync.Once
@@ -427,30 +1008,41 @@ func file_pkg_p2p_proto_p2p_proto_rawDescGZIP() []byte {
 	return file_pkg_p2p_proto_p2p_proto_rawDescData
 }
 
-var file_pkg_p2p_proto_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_pkg_p2p_proto_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_pkg_p2p_proto_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_pkg_p2p_proto_p2p_proto_goTypes = []any{
-	(*PeerInfo)(nil),       // 0: p2p.PeerInfo
-	(*PeerInfoList)(nil),   // 1: p2p.PeerInfoList
-	(*PeerP2PInfos)(nil),   // 2: p2p.PeerP2PInfos
-	(*P2PFullState)(nil),   // 3: p2p.P2PFullState
-	(*PeerCachedInfo)(nil), // 4: p2p.PeerCachedInfo
-	nil,                    // 5: p2p.P2PFullState.ReachablesEntry
-	nil,                    // 6: p2p.P2PFullState.UnreachablesEntry
+	(NatHolePunchState)(0),     // 0: p2p.NatHolePunchState
+	(NatHoleRole)(0),           // 1: p2p.NatHoleRole
+	(*PeerInfo)(nil),           // 2: p2p.PeerInfo
+	(*NatHolePunchResult)(nil), // 3: p2p.NatHolePunchResult
+	(*PeerInfoList)(nil),       // 4: p2p.PeerInfoList
+	(*PeerP2PInfos)(nil),       // 5: p2p.PeerP2PInfos
+	(*P2PFullState)(nil),       // 6: p2p.P2PFullState
+	(*PeerCachedInfo)(nil),     // 7: p2p.PeerCachedInfo
+	(*NatHole)(nil),            // 8: p2p.NatHole
+	(*NatHoleInstruction)(nil), // 9: p2p.NatHoleInstruction
+	nil,                        // 10: p2p.P2PFullState.ReachablesEntry
+	nil,                        // 11: p2p.P2PFullState.UnreachablesEntry
 }
 var file_pkg_p2p_proto_p2p_proto_depIdxs = []int32{
-	0, // 0: p2p.PeerInfoList.origin:type_name -> p2p.PeerInfo
-	0, // 1: p2p.PeerInfoList.peer_infos:type_name -> p2p.PeerInfo
-	0, // 2: p2p.PeerP2PInfos.from:type_name -> p2p.PeerInfo
-	0, // 3: p2p.PeerP2PInfos.to:type_name -> p2p.PeerInfo
-	5, // 4: p2p.P2PFullState.reachables:type_name -> p2p.P2PFullState.ReachablesEntry
-	6, // 5: p2p.P2PFullState.unreachables:type_name -> p2p.P2PFullState.UnreachablesEntry
-	2, // 6: p2p.P2PFullState.ReachablesEntry.value:type_name -> p2p.PeerP2PInfos
-	4, // 7: p2p.P2PFullState.UnreachablesEntry.value:type_name -> p2p.PeerCachedInfo
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	9,  // 0: p2p.PeerInfo.nat_hole_instruction:type_name -> p2p.NatHoleInstruction
+	3,  // 1: p2p.PeerInfo.punch_result:type_name -> p2p.NatHolePunchResult
+	0,  // 2: p2p.NatHolePunchResult.state:type_name -> p2p.NatHolePunchState
+	2,  // 3: p2p.PeerInfoList.origin:type_name -> p2p.PeerInfo
+	2,  // 4: p2p.PeerInfoList.peer_infos:type_name -> p2p.PeerInfo
+	2,  // 5: p2p.PeerP2PInfos.from:type_name -> p2p.PeerInfo
+	2,  // 6: p2p.PeerP2PInfos.to:type_name -> p2p.PeerInfo
+	10, // 7: p2p.P2PFullState.reachables:type_name -> p2p.P2PFullState.ReachablesEntry
+	11, // 8: p2p.P2PFullState.unreachables:type_name -> p2p.P2PFullState.UnreachablesEntry
+	1,  // 9: p2p.NatHole.role:type_name -> p2p.NatHoleRole
+	1,  // 10: p2p.NatHoleInstruction.role:type_name -> p2p.NatHoleRole
+	5,  // 11: p2p.P2PFullState.ReachablesEntry.value:type_name -> p2p.PeerP2PInfos
+	7,  // 12: p2p.P2PFullState.UnreachablesEntry.value:type_name -> p2p.PeerCachedInfo
+	13, // [13:13] is the sub-list for method output_type
+	13, // [13:13] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_pkg_p2p_proto_p2p_proto_init() }
@@ -463,13 +1055,14 @@ func file_pkg_p2p_proto_p2p_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_p2p_proto_p2p_proto_rawDesc), len(file_pkg_p2p_proto_p2p_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   7,
+			NumEnums:      2,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_pkg_p2p_proto_p2p_proto_goTypes,
 		DependencyIndexes: file_pkg_p2p_proto_p2p_proto_depIdxs,
+		EnumInfos:         file_pkg_p2p_proto_p2p_proto_enumTypes,
 		MessageInfos:      file_pkg_p2p_proto_p2p_proto_msgTypes,
 	}.Build()
 	File_pkg_p2p_proto_p2p_proto = out.File

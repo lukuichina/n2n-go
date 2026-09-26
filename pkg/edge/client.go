@@ -16,8 +16,8 @@ import (
 	"n2n-go/pkg/protocol/spec"
 	"n2n-go/pkg/syshosts"
 	transform "n2n-go/pkg/tranform"
-	"n2n-go/pkg/tuntap"
 	"n2n-go/pkg/transport"
+	"n2n-go/pkg/tuntap"
 	"net"
 	"runtime"
 	"sync"
@@ -35,16 +35,33 @@ type EdgeClient struct {
 	Community     string
 	SupernodeAddr *net.UDPAddr
 	Conn          *net.UDPConn
-	wssConfig *transport.WSSTransportConfig
-	WSSTransport *transport.WSSTransport
-	TAP           *tuntap.Interface
-	seq           uint32
+	P2PConn       *net.UDPConn
+	P2PAddr       *net.UDPAddr
+	// natHolePunching guards against overlapping NAT hole punch rounds.
+	// A round ends with a long wait (FRP's ReadTimeoutMs), and the punch is
+	// driven from a short ticker, so without this a pending instruction
+	// would spawn a new goroutine every tick while the previous one is still
+	// waiting.
+	natHolePunching atomic.Bool
+	// unknownPunchAck tracks the last time we answered a punch from a source
+	// that matches no known peer. The punch magic is four public bytes, so
+	// without a throttle any host that learns the socket address could use it
+	// to make us emit a reply per datagram — the amplification the ACK echo
+	// loop already demonstrated, just driven from outside.
+	unknownPunchAckMu sync.Mutex
+	unknownPunchAck   map[string]time.Time
+	wssConfig         *transport.WSSTransportConfig
+	WSSTransport      *transport.WSSTransport
+	TAP               *tuntap.Interface
+	seq               uint32
 
 	//EncryptionKey     []byte
 	//encryptionEnabled bool
 
 	protocolVersion   uint8
 	heartbeatInterval time.Duration
+	keepAliveInterval time.Duration
+	keepAliveTimeout  time.Duration
 	verifyHash        bool
 	enableVFuze       bool
 	communityHash     uint32
@@ -79,6 +96,15 @@ type EdgeClient struct {
 
 	EAPI *EdgeClientApi
 	Mgmt *management.ManagementServer
+
+	// STUN
+	STUNClient *STUNClient
+	NatFeature *NatFeature
+
+	// cachedPubSocket caches the STUN-discovered public socket address
+	// so that subsequent calls to pubSocketString() (e.g. during retry
+	// registration) reuse the cached value if STUN discovery fails.
+	cachedPubSocket string
 
 	SNPubKey *rsa.PublicKey
 
@@ -143,7 +169,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		log.Fatalf("hosts file: access-denied for writing into hostsfile (community entries)")
 	}
 
-	conn, wssTransport, tap, snAddr, wssConfig, err := setupNetworkComponents(cfg, tapcfg)
+	conn, wssTransport, tap, snAddr, wssConfig, p2pAddr, err := setupNetworkComponents(cfg, tapcfg)
 	if err != nil {
 		return nil, err
 	}
@@ -204,12 +230,22 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		log.Fatalf("Failed to start management server: %v", err)
 	}
 
+	// In WS/WSS mode, conn is the dedicated P2P UDP socket, not a supernode
+	// socket. Set Conn to nil so handleP2P doesn't early-return (it checks
+	// e.P2PConn == e.Conn), and supernode traffic goes through WSSTransport.
+	var connField *net.UDPConn
+	if wssTransport == nil {
+		connField = conn // UDP mode: shared supernode/P2P socket
+	}
+
 	edge := &EdgeClient{
 		Peers:             p2p.NewPeerRegistry(cfg.Community),
 		ID:                cfg.EdgeID,
 		Community:         cfg.Community,
 		SupernodeAddr:     snAddr,
-		Conn:              conn,
+		Conn:              connField,
+		P2PConn:           conn,
+		P2PAddr:           p2pAddr,
 		WSSTransport:      wssTransport,
 		wssConfig:         wssConfig,
 		TAP:               tap,
@@ -221,6 +257,8 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		machineId:         machineId,
 		protocolVersion:   cfg.ProtocolVersion,
 		heartbeatInterval: cfg.HeartbeatInterval,
+		keepAliveInterval: cfg.KeepAliveInterval,
+		keepAliveTimeout:  cfg.KeepAliveTimeout,
 		verifyHash:        cfg.VerifyHash,
 		enableVFuze:       cfg.EnableVFuze,
 		communityHash:     communityHash,
@@ -232,6 +270,7 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		config:            &cfg,
 		payloadProcessor:  payloadProcessor,
 		Hosts:             hosts,
+		STUNClient:        NewSTUNClient(conn, cfg.STUNServers),
 	}
 	edge.messageHandlers[spec.TypeData] = edge.handleDataMessage
 	edge.messageHandlers[spec.TypePeerInfo] = edge.handlePeerInfoMessage
@@ -266,6 +305,7 @@ func (e *EdgeClient) Run() {
 	go e.handleHeartbeat()
 	go e.handleTAP()
 	go e.handleUDP()
+	go e.handleP2P()
 
 	log.Printf("sending preliminary Peer List Request")
 	err := e.sendPeerListRequest()
@@ -276,6 +316,12 @@ func (e *EdgeClient) Run() {
 	log.Printf("starting P2PUpdate routines...")
 	go e.handleP2PUpdates()
 	go e.handleP2PInfos()
+	if e.keepAliveInterval > 0 {
+		log.Printf("starting P2P keepalive (interval=%v timeout=%v)", e.keepAliveInterval, e.keepAliveTimeout)
+		go e.handleP2PKeepAlive()
+	} else {
+		log.Printf("P2P keepalive disabled (p2p_keepalive_interval=0)")
+	}
 
 	log.Printf("starting management api...")
 	eapi := NewEdgeApi(e)
@@ -366,6 +412,7 @@ func (e *EdgeClient) ProcessOutgoingPayload(payload []byte) ([]byte, error) {
 func (e *EdgeClient) ProcessIncomingPayload(payload []byte) ([]byte, error) {
 	return e.payloadProcessor.ParseInput(payload)
 }
+
 // EdgeClient helper methods for WSS/UDP compatibility
 
 func (e *EdgeClient) setReadDeadline(t time.Time) error {

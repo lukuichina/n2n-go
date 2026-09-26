@@ -6,10 +6,112 @@ import (
 	"fmt"
 	"n2n-go/pkg/protocol"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 )
+
+// stringSliceFlag implements flag.Value for []string CLI args.
+type stringSliceFlag struct {
+	value *[]string
+}
+
+func (f *stringSliceFlag) String() string { return strings.Join(*f.value, ",") }
+func (f *stringSliceFlag) Set(v string) error {
+	*f.value = append(*f.value, v)
+	return nil
+}
+
+// ParseListenAddr normalizes an "addr:port" listen specification in which
+// BOTH parts are optional, and returns the combined "addr:port" form.
+//
+//	""            -> defaultAddr:defaultPort
+//	":7778"       -> defaultAddr:7778   (addr omitted)
+//	"7778"        -> defaultAddr:7778   (bare number reads as a port)
+//	"0.0.0.0:9000"-> 0.0.0.0:9000
+//	"[::1]:9000"  -> [::1]:9000         (bracketed IPv6)
+//	"::1"         -> ::1:defaultPort    (bare IPv6 literal, no port)
+//
+// A bare number is read as a port rather than an address, because that is what
+// someone typing `-P 7778` means; a non-numeric bare token is read as an address
+// with the default port. IPv6 literals need care: a bare "::1" contains colons
+// that would otherwise split into three fields, so anything with more than one
+// colon and no brackets is treated as a host-less IPv6 address.
+func ParseListenAddr(spec, defaultAddr, defaultPort string) (string, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return defaultAddr + ":" + defaultPort, nil
+	}
+
+	var addr, port string
+	switch {
+	case strings.HasPrefix(spec, "["):
+		// Bracketed IPv6, e.g. [::1]:9000 or [::1]
+		end := strings.Index(spec, "]")
+		if end < 0 {
+			return "", fmt.Errorf("invalid listen address %q: missing ']' closing the IPv6 literal", spec)
+		}
+		addr = spec[1:end]
+		rest := spec[end+1:]
+		if rest != "" {
+			if !strings.HasPrefix(rest, ":") {
+				return "", fmt.Errorf("invalid listen address %q: expected ':port' after the IPv6 literal", spec)
+			}
+			port = rest[1:]
+		}
+		// Preserve the brackets so the result is a valid "host:port" string.
+		if addr == "" {
+			addr = defaultAddr
+		} else {
+			addr = "[" + addr + "]"
+		}
+
+	default:
+		switch strings.Count(spec, ":") {
+		case 0:
+			if isAllDigits(spec) {
+				port = spec
+			} else {
+				addr = spec
+			}
+		case 1:
+			i := strings.Index(spec, ":")
+			addr, port = spec[:i], spec[i+1:]
+		default:
+			// More than one colon and no brackets: a bare IPv6 literal.
+			addr = spec
+		}
+	}
+
+	if addr == "" {
+		addr = defaultAddr
+	}
+	if port == "" {
+		port = defaultPort
+	}
+	if !isAllDigits(port) {
+		return "", fmt.Errorf("invalid listen address %q: port %q is not a number", spec, port)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return "", fmt.Errorf("invalid listen address %q: port %q is out of range 0-65535", spec, port)
+	}
+	return addr + ":" + port, nil
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 type Config struct {
 	UDPBufferSize        int           `mapstructure:"udp_buffer_size"` // Use mapstructure for Viper
@@ -28,14 +130,46 @@ type Config struct {
 	CompressPayload      bool          `mapstructure:"compress_payload"`
 
 	// WS configuration
-	WSEnabled    bool   `mapstructure:"ws_enabled"`
+	WSEnabled bool `mapstructure:"ws_enabled"`
 
 	// WSS configuration
 	SupernodeURL string `mapstructure:"supernode_url" env:"N2N_SUPERNODE_URL"`
 	WSSCert      string `mapstructure:"wss_cert" env:"N2N_WSS_CERT"`
 	WSSKey       string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
 	WSSEnabled   bool   `mapstructure:"wss_enabled"`
-	ProxyURL      string `mapstructure:"proxy_url" env:"N2N_PROXY_URL"`
+	ProxyURL     string `mapstructure:"proxy_url" env:"N2N_PROXY_URL"`
+
+	// P2P configuration
+	P2PListenAddr string `mapstructure:"p2p_listen_addr"`
+	P2PListenPort int    `mapstructure:"p2p_listen_port"`
+
+	// STUN configuration
+	STUNServers []string `mapstructure:"stun_servers"`
+
+	// P2P keepalive configuration
+	//
+	// A UDP NAT mapping expires when nothing is sent through it, typically
+	// after 30s-2min depending on the gateway. When ours expired, the peer
+	// could no longer reach us: its ARP replies went out over P2P and were
+	// dropped, our ARP entry went INCOMPLETE, and the tunnel was dead even
+	// though it still reported FullDuplex. Sending something on a timer
+	// keeps the mapping open.
+	//
+	// KeepAliveInterval must be comfortably shorter than the shortest NAT
+	// idle timeout in the path. FRP does not rely on this for the mapping —
+	// its yamux keepalive is 10s but its KCP layer retransmits underneath —
+	// so it can be comparatively lazy (its 90s ticker is a reconnect check).
+	// We have no such lower layer, so this value is the only thing holding
+	// the mapping open; keep it conservative.
+	//
+	// 0 disables the keepalive entirely.
+	KeepAliveInterval time.Duration `mapstructure:"p2p_keepalive_interval"`
+	// KeepAliveTimeout is how long a peer may go without any inbound frame
+	// before we stop trusting FullDuplex. FRP's analogue is yamux's
+	// ConnectionWriteTimeout, applied to the ping/pong round trip. Must be
+	// greater than KeepAliveInterval so a single lost keepalive does not
+	// tear the state down.
+	KeepAliveTimeout time.Duration `mapstructure:"p2p_keepalive_timeout"`
 }
 
 func DefaultConfig() *Config {
@@ -43,22 +177,55 @@ func DefaultConfig() *Config {
 		HeartbeatInterval: 30 * time.Second,
 		ProtocolVersion:   protocol.VersionV,
 		VerifyHash:        true,
-		EnableVFuze:       true,
-		UDPBufferSize:     8388608,
-		TapName:           "n2n_tap0",
-		LocalPort:         0,           // 0 means automatically assigned
-		ConfigFile:        "edge.yaml", // Default config file name.
-		APIListenAddr:     ":7778",
+		// VFuze is the fast path; ProtoV-only is the slow path. The CLI flag
+		// already defaults to true, but this config default is what applies
+		// when edge is started via a YAML config (or any path that does not
+		// go through the CLI flag), so leaving it false meant the two entry
+		// points disagreed.
+		EnableVFuze:   true,
+		UDPBufferSize: 8388608,
+		TapName:       "n2n_tap0",
+		LocalPort:     0,           // 0 means automatically assigned
+		ConfigFile:    "edge.yaml", // Default config file name.
+		APIListenAddr: ":7778",
 
 		// WS defaults
-		WSEnabled:    false,
+		WSEnabled: false,
 
 		// WSS defaults
 		WSSEnabled:   false,
-		ProxyURL:      "",
+		ProxyURL:     "",
 		SupernodeURL: "",
 		WSSCert:      "",
 		WSSKey:       "",
+
+		// P2P defaults
+		P2PListenAddr: "",
+		P2PListenPort: 0, // 0 means auto-assigned
+
+		// STUN defaults
+		//
+		// stun.easyvoip.com is listed first on purpose: it is the server
+		// FRP uses (frp pkg/config/v1/client.go DefaultNatHoleSTUNServer),
+		// and it is the only one verified to answer from both edge hosts.
+		// The Google STUN endpoints time out here — the cloud NAT swallows
+		// their replies — which left pubSocket stale and made every hole
+		// punch target a dead address. Keep them as fallbacks only.
+		STUNServers: []string{
+			"stun.easyvoip.com:3478",
+			"stun.l.google.com:19302",
+			"stun1.l.google.com:19302",
+		},
+
+		// P2P keepalive defaults
+		//
+		// FRP uses a 10s yamux keepalive (client/visitor/xtcp.go:351) and a
+		// 90s tunnel re-check (MinRetryInterval, default 90). We mirror the
+		// 10s for the mapping, but the timeout is 3x rather than
+		// ConnectionWriteTimeout, so one dropped keepalive amid normal
+		// jitter does not drop FullDuplex.
+		KeepAliveInterval: 10 * time.Second,
+		KeepAliveTimeout:  30 * time.Second,
 	}
 }
 
@@ -109,6 +276,9 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 		flag.StringVar(&cfg.APIListenAddr, "api-listen", cfg.APIListenAddr, "API listen address")
 		flag.StringVar(&cfg.EncryptionPassphrase, "encryption-passphrase", cfg.EncryptionPassphrase, "Passphrase to encryption key derivation")
 		flag.BoolVar(&cfg.CompressPayload, "compress-payload", cfg.CompressPayload, "Add zstd fast compression/decompression to data packets")
+		flag.StringVar(&cfg.P2PListenAddr, "p2p-listen-addr", cfg.P2PListenAddr, "P2P UDP listen address (empty = auto-detect)")
+		flag.IntVar(&cfg.P2PListenPort, "p2p-listen-port", cfg.P2PListenPort, "P2P UDP listen port (0 = system-assigned)")
+		flag.Var(&stringSliceFlag{&cfg.STUNServers}, "stun-servers", "STUN servers for NAT traversal (comma-separated)")
 
 		flag.Parse() // MUST call this to parse the flags
 	}

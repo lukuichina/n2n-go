@@ -225,6 +225,7 @@ func (s *Supernode) handleSNPublicSecretMessage(r *protocol.RawMessage) error {
 	if !secretMsg.Msg.IsRequest {
 		return fmt.Errorf("supernode handle only snpublicsecret requests")
 	}
+	log.Printf("DEBUG supernode handlers: sending PemData length=%d, first 200 bytes=%q", len(s.SNSecrets.Pem), string(s.SNSecrets.Pem[:min(200, len(s.SNSecrets.Pem))]))
 	resp := &netstruct.SnPublicSecret{
 		IsRequest: false,
 		PemData:   s.SNSecrets.Pem,

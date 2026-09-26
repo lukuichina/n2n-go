@@ -5,12 +5,9 @@ package tuntap
 import (
 	"fmt"
 	"net"
-	"os"
-
-	// "time" // No longer needed
+	"time"
 
 	"golang.org/x/sys/unix"
-	// REMOVED: "golang.org/x/sys/windows"
 )
 
 // --- Linux IOCTL/Flags Constants ---
@@ -68,9 +65,89 @@ func Create(config Config) (*Device, error) {
 		return nil, fmt.Errorf("linux: set nonblock: %w", err)
 	}
 	// ... (Owner/Group/Persist logic) ...
-	file := os.NewFile(uintptr(fd), "/dev/net/tun/"+actualName)
-	dev := &Device{devIo: file, Name: actualName, DevType: config.DevType, Config: config /* Other fields zero */}
+	// Use a custom DeviceIO that calls unix.Poll + unix.Read directly,
+	// bypassing Go's internal/poll which returns "not pollable" for
+	// TUN/TAP character devices after a process restart.
+	devIo := &linuxDeviceIO{fd: fd, name: actualName}
+	dev := &Device{devIo: devIo, Name: actualName, DevType: config.DevType, Config: config}
 	return dev, nil
+}
+
+// linuxDeviceIO implements DeviceIO for Linux using direct unix syscalls.
+// This bypasses Go's internal/poll which can return "not pollable" for
+// TUN/TAP character devices, especially after a process restart.
+type linuxDeviceIO struct {
+	fd   int
+	name string
+}
+
+func (io *linuxDeviceIO) Read(b []byte) (int, error) {
+	// Use unix.Poll to wait for data (handles EINTR by retrying)
+	// On some kernels, TUN/TAP character devices return POLLNVAL
+	// ("not pollable") after a process restart. When that happens,
+	// we fall back to a direct blocking unix.Read by temporarily
+	// switching the fd to blocking mode.
+	for {
+		pfds := []unix.PollFd{{
+			Fd:     int32(io.fd),
+			Events: unix.POLLIN,
+		}}
+		nEvents, err := unix.Poll(pfds, 100)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			fmt.Printf("linuxDeviceIO.Read: Poll error on fd %d: %v\n", io.fd, err)
+			return 0, err
+		}
+		if nEvents == 0 {
+			// Timeout with no data — return nil so handleTAP can
+			// check for shutdown.
+			return 0, nil
+		}
+		revents := pfds[0].Revents
+		// POLLNVAL: fd is not pollable (e.g. after process restart).
+		// Fall back to a blocking read by temporarily setting the fd
+		// to blocking mode.
+		if revents&unix.POLLNVAL != 0 {
+			fmt.Printf("linuxDeviceIO.Read: POLLNVAL on fd %d, falling back to blocking read\n", io.fd)
+			unix.SetNonblock(io.fd, false)
+			n, readErr := unix.Read(io.fd, b)
+			unix.SetNonblock(io.fd, true)
+			return n, readErr
+		}
+		if revents&(unix.POLLIN|unix.POLLERR|unix.POLLHUP) != 0 {
+			n, readErr := unix.Read(io.fd, b)
+			if readErr == unix.EAGAIN || readErr == unix.EWOULDBLOCK {
+				continue
+			}
+			if readErr != nil {
+				fmt.Printf("linuxDeviceIO.Read: unix.Read error on fd %d: %v\n", io.fd, readErr)
+			}
+			return n, readErr
+		}
+		// Other revents bits set (e.g., only POLLOUT) — retry
+	}
+}
+
+func (io *linuxDeviceIO) Write(b []byte) (int, error) {
+	return unix.Write(io.fd, b)
+}
+
+func (io *linuxDeviceIO) Close() error {
+	return unix.Close(io.fd)
+}
+
+func (io *linuxDeviceIO) Fd() uintptr {
+	return uintptr(io.fd)
+}
+
+func (io *linuxDeviceIO) SetReadDeadline(t time.Time) error {
+	return nil // Not supported with direct unix calls
+}
+
+func (io *linuxDeviceIO) SetWriteDeadline(t time.Time) error {
+	return nil
 }
 
 // --- Platform-specific implementations for Device methods ---
