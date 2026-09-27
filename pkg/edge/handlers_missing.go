@@ -148,12 +148,15 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 	portsFrom := instr.GetPortsRangeFrom()
 	portsTo := instr.GetPortsRangeTo()
 	ttl := instr.GetTtl()
+	mode := instr.GetMode()
+	behaviorIndex := instr.GetBehaviorIndex()
+	sendDelayMs := instr.GetSendDelayMs()
 	senderMAC := macBytesToStr(instr.GetSenderMac())
 	senderP2PEndpoint := instr.GetSenderP2PEndpoint()
 	senderPubSocket := instr.GetSenderPubSocket()
 
-	log.Printf("[Edge] NatHoleInstruction: role=%d senderNatType=%s senderBehavior=%s portsDiff=%d regularChange=%v portsRange=%d-%d ttl=%d senderMAC=%s senderP2P=%s senderPubSocket=%s",
-		role, senderNatType, senderBehavior, portsDiff, regularChange, portsFrom, portsTo, ttl, senderMAC, senderP2PEndpoint, senderPubSocket)
+	log.Printf("[Edge] NatHoleInstruction: role=%d senderNatType=%s senderBehavior=%s portsDiff=%d regularChange=%v portsRange=%d-%d ttl=%d senderMAC=%s senderP2P=%s senderPubSocket=%s ladder=mode%d/index%d sendDelay=%dms",
+		role, senderNatType, senderBehavior, portsDiff, regularChange, portsFrom, portsTo, ttl, senderMAC, senderP2PEndpoint, senderPubSocket, mode, behaviorIndex, sendDelayMs)
 
 	// Determine whether we are the sender or receiver.
 	// Use the instruction's role field directly, not a MAC comparison,
@@ -259,6 +262,9 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		PortsRangeFrom:     portsFrom,
 		PortsRangeTo:       portsTo,
 		Ttl:                ttl,
+		Mode:               mode,
+		BehaviorIndex:      behaviorIndex,
+		SendDelayMs:        sendDelayMs,
 	})
 
 	return nil

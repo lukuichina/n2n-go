@@ -293,7 +293,16 @@ type NatHolePunchResult struct {
 	// Number of attempts the edge burned on the current round.
 	Attempts uint32 `protobuf:"varint,2,opt,name=attempts,proto3" json:"attempts,omitempty"`
 	// Human-readable reason, for relay-side logging only.
-	Detail        string `protobuf:"bytes,3,opt,name=detail,proto3" json:"detail,omitempty"`
+	Detail string `protobuf:"bytes,3,opt,name=detail,proto3" json:"detail,omitempty"`
+	// Index into the relay's behaviour ladder that this round actually ran.
+	//
+	// The relay keeps a per-pair score per ladder rung and needs to know which
+	// one to credit or blame (FRP parity: pkg/nathole/controller.go:271
+	// HandleReport calls ReportSuccess(m.Mode, m.Behavior) with the behavior
+	// the client reports). Reporting it beats having the relay guess from its
+	// own last dispatch, which is wrong whenever an instruction was replaced
+	// between being sent and the outcome coming back.
+	BehaviorIndex uint32 `protobuf:"varint,4,opt,name=behavior_index,json=behaviorIndex,proto3" json:"behavior_index,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -347,6 +356,13 @@ func (x *NatHolePunchResult) GetDetail() string {
 		return x.Detail
 	}
 	return ""
+}
+
+func (x *NatHolePunchResult) GetBehaviorIndex() uint32 {
+	if x != nil {
+		return x.BehaviorIndex
+	}
+	return 0
 }
 
 // 对应 Go 中的 PeerInfoList
@@ -779,8 +795,22 @@ type NatHoleInstruction struct {
 	SenderBehavior     string                 `protobuf:"bytes,10,opt,name=sender_behavior,json=senderBehavior,proto3" json:"sender_behavior,omitempty"`
 	PortsDifference    int32                  `protobuf:"varint,11,opt,name=ports_difference,json=portsDifference,proto3" json:"ports_difference,omitempty"`
 	RegularPortsChange bool                   `protobuf:"varint,12,opt,name=regular_ports_change,json=regularPortsChange,proto3" json:"regular_ports_change,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Coordination mode this instruction was decided under (FRP nathole mode).
+	// 0 = EasyNAT-EasyNAT (no port scan), 3 = HardNAT pair (scan a port range).
+	Mode uint32 `protobuf:"varint,13,opt,name=mode,proto3" json:"mode,omitempty"`
+	// Index into the behaviour ladder (FRP pkg/nathole/analysis.go
+	// mode0Behaviors) this instruction was drawn from.
+	//
+	// Carried explicitly because protobuf3 cannot distinguish an unset uint32
+	// ttl from "no ttl at all", and "no ttl at all" is precisely what ladder
+	// entries 4 and 5 mean: both roles emit their probe with the socket's
+	// normal TTL, so it traverses the full path instead of dying at hop 4.
+	BehaviorIndex uint32 `protobuf:"varint,14,opt,name=behavior_index,json=behaviorIndex,proto3" json:"behavior_index,omitempty"`
+	// Milliseconds the relay held this instruction back relative to its
+	// counterpart. 0 means "use the relay's configured default".
+	SendDelayMs   uint32 `protobuf:"varint,15,opt,name=send_delay_ms,json=sendDelayMs,proto3" json:"send_delay_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NatHoleInstruction) Reset() {
@@ -897,6 +927,27 @@ func (x *NatHoleInstruction) GetRegularPortsChange() bool {
 	return false
 }
 
+func (x *NatHoleInstruction) GetMode() uint32 {
+	if x != nil {
+		return x.Mode
+	}
+	return 0
+}
+
+func (x *NatHoleInstruction) GetBehaviorIndex() uint32 {
+	if x != nil {
+		return x.BehaviorIndex
+	}
+	return 0
+}
+
+func (x *NatHoleInstruction) GetSendDelayMs() uint32 {
+	if x != nil {
+		return x.SendDelayMs
+	}
+	return 0
+}
+
 var File_pkg_p2p_proto_p2p_proto protoreflect.FileDescriptor
 
 const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
@@ -918,11 +969,12 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	" \x01(\v2\x17.p2p.NatHoleInstructionR\x12natHoleInstruction\x12%\n" +
 	"\x0eobserved_raddr\x18\v \x01(\tR\robservedRaddr\x12:\n" +
 	"\fpunch_result\x18\f \x01(\v2\x17.p2p.NatHolePunchResultR\vpunchResult\x121\n" +
-	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\"v\n" +
+	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\"\x9d\x01\n" +
 	"\x12NatHolePunchResult\x12,\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x16.p2p.NatHolePunchStateR\x05state\x12\x1a\n" +
 	"\battempts\x18\x02 \x01(\rR\battempts\x12\x16\n" +
-	"\x06detail\x18\x03 \x01(\tR\x06detail\"\xa1\x01\n" +
+	"\x06detail\x18\x03 \x01(\tR\x06detail\x12%\n" +
+	"\x0ebehavior_index\x18\x04 \x01(\rR\rbehaviorIndex\"\xa1\x01\n" +
 	"\fPeerInfoList\x12\x1d\n" +
 	"\n" +
 	"has_origin\x18\x01 \x01(\bR\thasOrigin\x12%\n" +
@@ -970,7 +1022,7 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\x0fsender_behavior\x18\n" +
 	" \x01(\tR\x0esenderBehavior\x12)\n" +
 	"\x10ports_difference\x18\v \x01(\x05R\x0fportsDifference\x120\n" +
-	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\"\xe4\x03\n" +
+	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\"\xc3\x04\n" +
 	"\x12NatHoleInstruction\x12$\n" +
 	"\x04role\x18\x01 \x01(\x0e2\x10.p2p.NatHoleRoleR\x04role\x12(\n" +
 	"\x10ports_range_from\x18\x02 \x01(\rR\x0eportsRangeFrom\x12$\n" +
@@ -986,7 +1038,10 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\x0fsender_behavior\x18\n" +
 	" \x01(\tR\x0esenderBehavior\x12)\n" +
 	"\x10ports_difference\x18\v \x01(\x05R\x0fportsDifference\x120\n" +
-	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange*p\n" +
+	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\x12\x12\n" +
+	"\x04mode\x18\r \x01(\rR\x04mode\x12%\n" +
+	"\x0ebehavior_index\x18\x0e \x01(\rR\rbehaviorIndex\x12\"\n" +
+	"\rsend_delay_ms\x18\x0f \x01(\rR\vsendDelayMs*p\n" +
 	"\x11NatHolePunchState\x12\x12\n" +
 	"\x0ePunchStateNone\x10\x00\x12\x18\n" +
 	"\x14PunchStateInProgress\x10\x01\x12\x14\n" +

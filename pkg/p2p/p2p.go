@@ -448,7 +448,10 @@ func (reg *PeerRegistry) GetPeerBySocketIP(ip net.IP) (*Peer, error) {
 // peer so it can be reported to the relay via GetPeerP2PInfos. The relay uses
 // this to stop re-broadcasting for pairs that are already connected and to
 // immediately re-arm pairs whose latest round failed.
-func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHolePunchState, attempts uint32, detail string) {
+// behaviorIndex is the relay behaviour-ladder rung this outcome belongs to,
+// so the relay can credit or blame the right one. 0 is a valid rung, so it is
+// always meaningful; callers that have no instruction in hand pass 0.
+func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32) {
 	if peerMAC == "" {
 		return
 	}
@@ -458,9 +461,10 @@ func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHoleP
 		reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
 	}
 	reg.natHolePunchResults[peerMAC] = &NatHolePunchResult{
-		State:    state,
-		Attempts: attempts,
-		Detail:   detail,
+		State:         state,
+		Attempts:      attempts,
+		Detail:        detail,
+		BehaviorIndex: behaviorIndex,
 	}
 	// A new outcome must reach the relay on the next P2PStateInfo, and a
 	// success must also refresh the peer list the relay builds instructions
@@ -821,6 +825,31 @@ func (reg *PeerRegistry) LookupPeerByPubSocket(pubSocket string) *Peer {
 	return nil
 }
 
+// CurrentNatHoleBehaviorIndex reports which behaviour-ladder rung the
+// instruction currently targeting peerMAC was drawn from, so a success
+// observed for that peer can be attributed to the right rung.
+//
+// Instructions are keyed by our own MAC (SetNatHoleInstruction stores under
+// the caller's), so this scans for the one whose target is peerMAC. 0 is a
+// valid rung and is also the honest answer when there is no instruction --
+// the relay treats a report with no rung as attributable to nothing.
+func (reg *PeerRegistry) CurrentNatHoleBehaviorIndex(peerMAC string) uint32 {
+	if peerMAC == "" {
+		return 0
+	}
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
+	for _, instr := range reg.natHoleInstrs {
+		if instr == nil {
+			continue
+		}
+		if tm := instr.GetTargetMac(); len(tm) > 0 && macAddrStr(tm) == peerMAC {
+			return instr.GetBehaviorIndex()
+		}
+	}
+	return 0
+}
+
 // SetNatHoleInstruction stores a relay-coordinated NAT hole instruction
 // for the given MAC address. The instruction is then executed by
 // executeNatHolePunch().
@@ -960,13 +989,93 @@ func (reg *PeerRegistry) ReArmNatHoleInstruction(peerMAC []byte) {
 // same but keep the window short, because the socket is shared: handleP2P
 // may be writing a punch ACK from another goroutine while the TTL is lowered,
 // and an ACK sent with TTL 7 would be lost.
-const receiverProbeIPTTL = 7
+//
+// Configurable via `--nat-hole-probe-ttl`. 7 is the FRP value and is correct
+// for a consumer router, where the NAT lookup happens at hop 1. On a cloud
+// network the EIP translation can sit several hops away, and a probe that
+// dies before reaching it never creates the mapping it exists to create --
+// measured here: E1<->E2 is a 12-hop path, so TTL 7 cannot possibly open the
+// mapping and the pair can never punch. Raise it to the measured hop count
+// (or set 0 to disable the probe entirely) when the path is long.
+//
+// A value of 0 means "never lower the TTL": the receiver's packet goes out
+// with the socket's normal TTL and is simply a normal punch.
+var receiverProbeIPTTL = 7
+
+// SetReceiverProbeIPTTL overrides the default probe TTL. 0 disables the
+// low-TTL pre-mapping probe. Values outside 1..255 are clamped.
+func SetReceiverProbeIPTTL(ttl int) {
+	if ttl < 0 {
+		ttl = 0
+	}
+	if ttl > 255 {
+		ttl = 255
+	}
+	receiverProbeIPTTL = ttl
+}
+
+// ReceiverProbeIPTTL reports the configured default probe TTL.
+func ReceiverProbeIPTTL() int { return receiverProbeIPTTL }
+
+// Coordination modes and ladder positions, mirroring FRP's nathole analyser
+// (pkg/nathole/analysis.go). Only the ones the relay actually emits are
+// named here; an unknown value falls through to the ttl field.
+const (
+	// natHoleModeEasyNATPair is FRP Mode 0: both peers are behind a
+	// port-preserving cone NAT, so the STUN-discovered pub_socket is exact
+	// and no port scan is performed.
+	natHoleModeEasyNATPair = 0
+
+	// Mode 0 ladder entries 4 and 5 -- the "no TTL" pair, where both roles
+	// emit with the socket's normal TTL.
+	natHoleBehaviorNoTTLSenderFirst   = 4
+	natHoleBehaviorNoTTLReceiverFirst = 5
+)
 
 // sendWithIPTTL writes pkt to every addr with a temporarily lowered IP TTL.
 //
 // The TTL is a property of the socket, not of the individual datagram, so
 // this is inherently racy against other writers on the same socket; that is
 // why callers keep the burst short. Returns the number of successful writes.
+// natHoleProbeTTL returns the IP TTL to use for the receiver's pre-mapping
+// probe, or 0 when the chosen behaviour does not use one (the probe is then
+// just an ordinary full-path punch).
+//
+// FRP encodes "do not touch the TTL" as ttl 0 in DetectBehavior --
+// pkg/nathole/nathole.go:363 guards the SetTTL call with `if ttl > 0`, and
+// mode0Behaviors entries 4 and 5 (analysis.go:38-39) carry no ttl at all:
+//
+//	lo.T2(RecommandBehavior{Role: DetectRoleSender},   RecommandBehavior{Role: DetectRoleReceiver}),
+//	lo.T2(RecommandBehavior{Role: DetectRoleReceiver}, RecommandBehavior{Role: DetectRoleSender}),
+//
+// Those are the entries that work on a path longer than the TTL, which is
+// the whole point of carrying the ladder rather than one hardcoded strategy.
+//
+// The wire format cannot express that: protobuf3 encodes an unset uint32 and
+// a zero uint32 identically, so a `ttl: 0` instruction is ambiguous between
+// "unset" and "deliberately no TTL". The ladder position travels in
+// nat_hole_instruction.behavior_index and is what disambiguates.
+//
+// fallback is used when the instruction predates the field (an older relay
+// that only ever emits ttl 7), so behaviour is unchanged in that case.
+func natHoleProbeTTL(instr *NatHoleInstruction, fallback int) int {
+	if instr == nil {
+		return fallback
+	}
+	// Entries 4 and 5 of the Mode 0 ladder are the "no TTL" pair. Any other
+	// index that explicitly says 0 (e.g. the sender's own instruction, which
+	// always has ttl 0) is not a receiver probe, and entries outside the
+	// ladder predate the feature.
+	if instr.GetMode() == natHoleModeEasyNATPair && (instr.GetBehaviorIndex() == natHoleBehaviorNoTTLSenderFirst ||
+		instr.GetBehaviorIndex() == natHoleBehaviorNoTTLReceiverFirst) {
+		return 0
+	}
+	if t := int(instr.GetTtl()); t > 0 {
+		return t
+	}
+	return fallback
+}
+
 func sendWithIPTTL(conn *net.UDPConn, pkt []byte, addrs []*net.UDPAddr, ttl int, gap time.Duration) int {
 	if len(addrs) == 0 || ttl <= 0 {
 		return 0
@@ -1374,17 +1483,32 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// === FRP Mode 0: low-TTL pre-mapping probe ===
 				//
 				// Before anything else, push a few copies of the punch
-				// packet at the sender with IP TTL 7. The datagrams are
-				// discarded somewhere along the path and never reach the
-				// sender, but the NAT on the way out has already allocated
-				// a mapping for (our socket, sender's pubSocket) — which is
-				// exactly the mapping the sender's own punch needs the
-				// receiver's NAT to have open.
+				// packet at the sender with a lowered IP TTL. The datagrams
+				// are discarded somewhere along the path and never reach
+				// the sender, but the NAT on the way out has already
+				// allocated a mapping for (our socket, sender's pubSocket)
+				// -- which is exactly the mapping the sender's own punch
+				// needs the receiver's NAT to have open.
 				//
 				// The delay that used to be missing is the whole point of
 				// this probe: it front-loads our mapping by the time the
 				// sender starts punching, without waiting for the sender's
 				// first packet to arrive and be accepted.
+				//
+				// FRP parity, Mode 0 (analysis.go:33-49). Ladder entries 0-3
+				// carry a TTL and get the probe; entries 4 and 5 carry none
+				// at all, and sendSidMessage (nathole.go:363 `if ttl > 0`)
+				// leaves the socket's normal TTL in place for them. Those are
+				// the entries to reach for on a path longer than the TTL:
+				// a probe that dies before the NAT translation point creates
+				// no mapping at all, so the pair can never punch. Protobuf3
+				// cannot tell an unset ttl from 0, so the ladder position
+				// travels in its own field and is what we consult here.
+				probeTTL := natHoleProbeTTL(instr, receiverProbeIPTTL)
+				if probeTTL <= 0 {
+					log.Printf("[P2P] Receiver: ladder entry mode=%d index=%d carries no TTL — sending the probe with the socket's normal TTL (full path)",
+						instr.GetMode(), instr.GetBehaviorIndex())
+				}
 				probeTargets := []*net.UDPAddr{senderAddr}
 				for port := int(portsFrom); port >= 1 && port <= int(portsTo) && len(probeTargets) < 32; port++ {
 					if port == senderAddr.Port {
@@ -1392,9 +1516,9 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 					}
 					probeTargets = append(probeTargets, &net.UDPAddr{IP: senderIP, Port: port})
 				}
-				if n := sendWithIPTTL(p2pConn, punchPacket, probeTargets, receiverProbeIPTTL, 20*time.Millisecond); n > 0 {
-					log.Printf("[P2P] Receiver: sent %d/%d low-TTL(IP TTL=%d) pre-mapping probe(s) to %s (FRP Mode 0)",
-						n, len(probeTargets), receiverProbeIPTTL, punchTarget)
+				if n := sendWithIPTTL(p2pConn, punchPacket, probeTargets, probeTTL, 20*time.Millisecond); n > 0 {
+					log.Printf("[P2P] Receiver: sent %d/%d pre-mapping probe(s) to %s (IP TTL=%d, mode=%d index=%d, --nat-hole-probe-ttl default=%d)",
+						n, len(probeTargets), punchTarget, probeTTL, instr.GetMode(), instr.GetBehaviorIndex(), receiverProbeIPTTL)
 				}
 
 				// FRP parity: one datagram at the exact address, then wait.
@@ -1507,9 +1631,10 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 							reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
 						}
 						reg.natHolePunchResults[tmStr] = &NatHolePunchResult{
-							State:    NatHolePunchState_PunchStateInProgress,
-							Attempts: uint32(retryCount + 1),
-							Detail:   "retrying",
+							State:         NatHolePunchState_PunchStateInProgress,
+							Attempts:      uint32(retryCount + 1),
+							Detail:        "retrying",
+							BehaviorIndex: currentInstr.GetBehaviorIndex(),
 						}
 						reg.hasPendingChanges = true
 					}
@@ -1544,9 +1669,10 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 							reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
 						}
 						reg.natHolePunchResults[targetMACStr] = &NatHolePunchResult{
-							State:    NatHolePunchState_PunchStateFailed,
-							Attempts: 5,
-							Detail:   "exhausted 5 punch attempts",
+							State:         NatHolePunchState_PunchStateFailed,
+							Attempts:      5,
+							Detail:        "exhausted 5 punch attempts",
+							BehaviorIndex: currentInstr.GetBehaviorIndex(),
 						}
 						reg.hasPendingChanges = true
 						log.Printf("[P2P] Reported punch FAILED for %s to relay", targetMACStr)
@@ -1643,8 +1769,26 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 			}
 		}
 	case TypeUnregister:
+		// FRP parity: pkg/nathole/controller.go:269-274
+		//
+		//   session, ok := c.sessions[m.Sid]
+		//   if !ok { return }
+		//
+		// A frpc never holds a registry of its peers, so a peer leaving can
+		// only ever be expressed as "this one specific node is gone" -- and
+		// even that is not modelled as a removal, only as the expiry of the
+		// per-pair session. Nothing a remote peer does can reach into this
+		// process and delete an unrelated entry.
+		//
+		// The self-skip matters because the relay may legitimately include
+		// our own entry (it is building the list from the full peer table,
+		// and we are one of its peers). Deleting our own registry entry
+		// silently breaks GetPeer/AddPeer for every later message.
 		for _, info := range peerInfoList.GetPeerInfos() {
 			macAddr := net.HardwareAddr(info.MacAddr).String()
+			if ourMAC != "" && macAddr == ourMAC {
+				continue
+			}
 			err := reg.RemovePeer(macAddr)
 			if err != nil {
 				return fmt.Errorf("failed to remove peer: %v", err)

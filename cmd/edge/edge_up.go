@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"n2n-go/pkg/edge"
 	"n2n-go/pkg/log"
+	"n2n-go/pkg/p2p"
 	"net"
 	"os"
 	"os/signal"
@@ -90,6 +91,11 @@ var (
 				Name:    "p2p-listen",
 				Aliases: []string{"P"},
 				Usage:   "P2P UDP listen endpoint for hole punching, as `addr:port`. The addr may be omitted (defaults to 0.0.0.0) and the port may be omitted (defaults to 0, system-assigned). Examples: `-P :7777`, `-P 7777`, `-P 10.0.0.5:7777`",
+			},
+			&cli.IntFlag{
+				Name:  "nat-hole-probe-ttl",
+				Usage: "IP TTL for the NAT-hole receiver's pre-mapping probe (default: 7). The probe exists to make the local NAT allocate a mapping towards the sender before the sender punches, and is deliberately low so the datagram never reaches the sender. 7 is FRP's value and is right for a consumer router, where the NAT lookup happens at hop 1 -- on a cloud network the EIP translation can sit further out, and a probe that dies before reaching it opens no mapping at all. Set this to at least the measured hop count to the peer, or 0 to disable the probe and send with the socket's normal TTL",
+				Value: 7,
 			},
 			&cli.BoolFlag{
 				Name:    "enableFuze",
@@ -258,6 +264,10 @@ func up(c *cli.Context) {
 		port, _ := strconv.Atoi(portStr)
 		cfg.P2PListenAddr = host
 		cfg.P2PListenPort = port
+	}
+	if c.IsSet("nat-hole-probe-ttl") {
+		p2p.SetReceiverProbeIPTTL(c.Int("nat-hole-probe-ttl"))
+		log.Printf("NAT hole receiver pre-mapping probe IP TTL set to %d (0 disables the probe)", p2p.ReceiverProbeIPTTL())
 	}
 	if c.IsSet("api-listen") {
 		normalized, err := edge.ParseListenAddr(c.String("api-listen"), "127.0.0.1", "7778")

@@ -614,7 +614,11 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 	e.Peers.RecordNatHolePunchResult(
 		mac,
 		p2p.NatHolePunchState_PunchStateSucceeded, 1,
-		fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr))
+		fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
+		// Name the rung this success belongs to, so the relay's per-pair
+		// strategy memory credits the ladder entry that actually worked
+		// rather than whatever it last happened to dispatch.
+		e.Peers.CurrentNatHoleBehaviorIndex(mac))
 }
 
 // allowUnknownPunchAck rate-limits ACK replies to sources that match no known
