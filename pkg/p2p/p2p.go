@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"n2n-go/pkg/log"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -470,6 +471,38 @@ func (p *Peer) lookupSockets() []string {
 		out = append(out, key)
 	}
 	return out
+}
+
+// addrInLocalPrefix reports whether ip sits inside one of the subnets this
+// host is also attached to. A peer address that does is reachable by direct
+// routing, so it beats any predicted public address.
+func addrInLocalPrefix(ip net.IP, prefixes []netip.Prefix) bool {
+	if ip == nil {
+		return false
+	}
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	a = a.Unmap()
+	for _, p := range prefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAddr(list []*net.UDPAddr, a *net.UDPAddr) bool {
+	if a == nil {
+		return false
+	}
+	for _, c := range list {
+		if c != nil && c.String() == a.String() {
+			return true
+		}
+	}
+	return false
 }
 
 // SelfMAC returns this host's own n2n MAC as a string, which is also the MAC
@@ -1582,6 +1615,48 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				if len(assisted) > 0 {
 					log.Printf("[P2P] Sender: target %s reported %d LAN address(es) (%v), added as punch candidates",
 						macAddrStr(targetMAC), len(assisted), assisted)
+				}
+
+				// Ranked-first is not the same as tried-first. The
+				// same-subnet reordering above only reorders the peer's own
+				// addresses, but the STUN-reflexive pubSocket was appended
+				// unconditionally as candidate 0 -- so for a peer on the
+				// same LAN behind the same NAT we tried the public address
+				// first and the reachable one last:
+				//
+				//   candidate 0  111.101.5.1:61706    CGNAT, needs hairpin
+				//   ...
+				//   candidate 5  192.168.10.7:61706   one hop away
+				//
+				// The public address is the *hardest* path for such a peer
+				// and the LAN address the easiest, so ordering them the other
+				// way round spends the whole punch budget on a detour. FRP
+				// tries m.AssistedAddrs ahead of the predicted public
+				// address (nathole.go:210-215) for exactly this reason.
+				//
+				// Promote only addresses that sit on a subnet we are also on
+				// -- an address on some other LAN is no better than the
+				// public one, it just fails differently.
+				var lanFirst []*net.UDPAddr
+				for _, raw := range assisted {
+					ep, err2 := net.ResolveUDPAddr("udp", raw)
+					if err2 != nil || ep == nil {
+						continue
+					}
+					if addrInLocalPrefix(ep.IP, localPrefixes) {
+						lanFirst = append(lanFirst, ep)
+					}
+				}
+				if len(lanFirst) > 0 {
+					rest := candidates[:0]
+					for _, c := range candidates {
+						if !containsAddr(lanFirst, c) {
+							rest = append(rest, c)
+						}
+					}
+					candidates = append(append([]*net.UDPAddr{}, lanFirst...), rest...)
+					log.Printf("[P2P] Sender: promoted %d same-subnet candidate(s) %v ahead of the public address %s for %s",
+						len(lanFirst), lanFirst, punchTarget, macAddrStr(targetMAC))
 				}
 
 				// Try P2PEndpoint as an additional candidate
