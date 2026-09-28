@@ -238,8 +238,13 @@ func NewEdgeClient(cfg Config) (*EdgeClient, error) {
 		connField = conn // UDP mode: shared supernode/P2P socket
 	}
 
+	peers := p2p.NewPeerRegistry(cfg.Community)
+	// The registry needs our own tap name to keep the overlay subnet out of
+	// same-subnet scoring -- see PeerRegistry.SelfTapName.
+	peers.SelfTapName = cfg.TapName
+
 	edge := &EdgeClient{
-		Peers:             p2p.NewPeerRegistry(cfg.Community),
+		Peers:             peers,
 		ID:                cfg.EdgeID,
 		Community:         cfg.Community,
 		SupernodeAddr:     snAddr,

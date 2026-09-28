@@ -155,8 +155,18 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 	senderP2PEndpoint := instr.GetSenderP2PEndpoint()
 	senderPubSocket := instr.GetSenderPubSocket()
 
-	log.Printf("[Edge] NatHoleInstruction: role=%d senderNatType=%s senderBehavior=%s portsDiff=%d regularChange=%v portsRange=%d-%d ttl=%d senderMAC=%s senderP2P=%s senderPubSocket=%s ladder=mode%d/index%d sendDelay=%dms",
-		role, senderNatType, senderBehavior, portsDiff, regularChange, portsFrom, portsTo, ttl, senderMAC, senderP2PEndpoint, senderPubSocket, mode, behaviorIndex, sendDelayMs)
+	// The sender's LAN addresses, which this side will try BEFORE the
+	// STUN-reflexive senderPubSocket when it is itself the sender. Printed
+	// for both roles because the relay hands the same instruction to both,
+	// and "present but ignored" otherwise looks like a missing field.
+	senderAssisted := instr.GetSenderAssistedEndpoints()
+	assistedStr := "<none>"
+	if len(senderAssisted) > 0 {
+		assistedStr = strings.Join(senderAssisted, ",")
+	}
+
+	log.Printf("[Edge] NatHoleInstruction: role=%d senderNatType=%s senderBehavior=%s portsDiff=%d regularChange=%v portsRange=%d-%d ttl=%d senderMAC=%s senderP2P=%s senderPubSocket=%s senderAssisted=[%s] ladder=mode%d/index%d sendDelay=%dms",
+		role, senderNatType, senderBehavior, portsDiff, regularChange, portsFrom, portsTo, ttl, senderMAC, senderP2PEndpoint, senderPubSocket, assistedStr, mode, behaviorIndex, sendDelayMs)
 
 	// Determine whether we are the sender or receiver.
 	// Use the instruction's role field directly, not a MAC comparison,

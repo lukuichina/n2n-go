@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.12
 // 	protoc        v3.21.12
-// source: register.proto
+// source: pkg/protocol/netstruct/proto/register.proto
 
 package netstruct
 
@@ -32,7 +32,7 @@ type SnPublicSecret struct {
 
 func (x *SnPublicSecret) Reset() {
 	*x = SnPublicSecret{}
-	mi := &file_register_proto_msgTypes[0]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -44,7 +44,7 @@ func (x *SnPublicSecret) String() string {
 func (*SnPublicSecret) ProtoMessage() {}
 
 func (x *SnPublicSecret) ProtoReflect() protoreflect.Message {
-	mi := &file_register_proto_msgTypes[0]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -57,7 +57,7 @@ func (x *SnPublicSecret) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnPublicSecret.ProtoReflect.Descriptor instead.
 func (*SnPublicSecret) Descriptor() ([]byte, []int) {
-	return file_register_proto_rawDescGZIP(), []int{0}
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *SnPublicSecret) GetIsRequest() bool {
@@ -86,13 +86,23 @@ type RegisterRequest struct {
 	P2PCapabilities    []string               `protobuf:"bytes,7,rep,name=p2p_capabilities,json=p2pCapabilities,proto3" json:"p2p_capabilities,omitempty"`
 	NatType            string                 `protobuf:"bytes,8,opt,name=nat_type,json=natType,proto3" json:"nat_type,omitempty"`
 	PubSocket          string                 `protobuf:"bytes,9,opt,name=pub_socket,json=pubSocket,proto3" json:"pub_socket,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// This edge's own LAN addresses, each paired with the local port of its P2P
+	// socket, so a peer on the same broadcast domain can address it directly
+	// instead of hairpinning through the local router.
+	//
+	// FRP parity: pkg/nathole/nathole.go:145-149 builds the same list into
+	// NatHoleReport.AssistedAddrs from ListLocalIPsForNatHole. It is reported
+	// alongside pub_socket rather than merged into it because the two are tried
+	// in a fixed order by the punching side (assisted first), not as an
+	// unordered set.
+	AssistedSockets []string `protobuf:"bytes,10,rep,name=assisted_sockets,json=assistedSockets,proto3" json:"assisted_sockets,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RegisterRequest) Reset() {
 	*x = RegisterRequest{}
-	mi := &file_register_proto_msgTypes[1]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -104,7 +114,7 @@ func (x *RegisterRequest) String() string {
 func (*RegisterRequest) ProtoMessage() {}
 
 func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_register_proto_msgTypes[1]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -117,7 +127,7 @@ func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterRequest.ProtoReflect.Descriptor instead.
 func (*RegisterRequest) Descriptor() ([]byte, []int) {
-	return file_register_proto_rawDescGZIP(), []int{1}
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *RegisterRequest) GetEdgeMacAddr() string {
@@ -183,6 +193,13 @@ func (x *RegisterRequest) GetPubSocket() string {
 	return ""
 }
 
+func (x *RegisterRequest) GetAssistedSockets() []string {
+	if x != nil {
+		return x.AssistedSockets
+	}
+	return nil
+}
+
 // 对应 Go 中的 RetryRegisterRequest
 type RetryRegisterRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -192,7 +209,7 @@ type RetryRegisterRequest struct {
 
 func (x *RetryRegisterRequest) Reset() {
 	*x = RetryRegisterRequest{}
-	mi := &file_register_proto_msgTypes[2]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -204,7 +221,7 @@ func (x *RetryRegisterRequest) String() string {
 func (*RetryRegisterRequest) ProtoMessage() {}
 
 func (x *RetryRegisterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_register_proto_msgTypes[2]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -217,7 +234,7 @@ func (x *RetryRegisterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetryRegisterRequest.ProtoReflect.Descriptor instead.
 func (*RetryRegisterRequest) Descriptor() ([]byte, []int) {
-	return file_register_proto_rawDescGZIP(), []int{2}
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP(), []int{2}
 }
 
 // 对应 Go 中的 RegisterResponse
@@ -232,7 +249,7 @@ type RegisterResponse struct {
 
 func (x *RegisterResponse) Reset() {
 	*x = RegisterResponse{}
-	mi := &file_register_proto_msgTypes[3]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -244,7 +261,7 @@ func (x *RegisterResponse) String() string {
 func (*RegisterResponse) ProtoMessage() {}
 
 func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_register_proto_msgTypes[3]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -257,7 +274,7 @@ func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterResponse.ProtoReflect.Descriptor instead.
 func (*RegisterResponse) Descriptor() ([]byte, []int) {
-	return file_register_proto_rawDescGZIP(), []int{3}
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *RegisterResponse) GetIsRegisterOk() bool {
@@ -294,7 +311,7 @@ type HeartbeatPulse struct {
 
 func (x *HeartbeatPulse) Reset() {
 	*x = HeartbeatPulse{}
-	mi := &file_register_proto_msgTypes[4]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -306,7 +323,7 @@ func (x *HeartbeatPulse) String() string {
 func (*HeartbeatPulse) ProtoMessage() {}
 
 func (x *HeartbeatPulse) ProtoReflect() protoreflect.Message {
-	mi := &file_register_proto_msgTypes[4]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -319,7 +336,7 @@ func (x *HeartbeatPulse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatPulse.ProtoReflect.Descriptor instead.
 func (*HeartbeatPulse) Descriptor() ([]byte, []int) {
-	return file_register_proto_rawDescGZIP(), []int{4}
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *HeartbeatPulse) GetEdgeMacAddr() string {
@@ -362,7 +379,7 @@ type UnregisterRequest struct {
 
 func (x *UnregisterRequest) Reset() {
 	*x = UnregisterRequest{}
-	mi := &file_register_proto_msgTypes[5]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -374,7 +391,7 @@ func (x *UnregisterRequest) String() string {
 func (*UnregisterRequest) ProtoMessage() {}
 
 func (x *UnregisterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_register_proto_msgTypes[5]
+	mi := &file_pkg_protocol_netstruct_proto_register_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -387,7 +404,7 @@ func (x *UnregisterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnregisterRequest.ProtoReflect.Descriptor instead.
 func (*UnregisterRequest) Descriptor() ([]byte, []int) {
-	return file_register_proto_rawDescGZIP(), []int{5}
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *UnregisterRequest) GetEdgeMacAddr() string {
@@ -411,15 +428,15 @@ func (x *UnregisterRequest) GetEncryptedMachineId() []byte {
 	return nil
 }
 
-var File_register_proto protoreflect.FileDescriptor
+var File_pkg_protocol_netstruct_proto_register_proto protoreflect.FileDescriptor
 
-const file_register_proto_rawDesc = "" +
+const file_pkg_protocol_netstruct_proto_register_proto_rawDesc = "" +
 	"\n" +
-	"\x0eregister.proto\x12\tnetstruct\"J\n" +
+	"+pkg/protocol/netstruct/proto/register.proto\x12\tnetstruct\"J\n" +
 	"\x0eSnPublicSecret\x12\x1d\n" +
 	"\n" +
 	"is_request\x18\x01 \x01(\bR\tisRequest\x12\x19\n" +
-	"\bpem_data\x18\x02 \x01(\fR\apemData\"\xdd\x02\n" +
+	"\bpem_data\x18\x02 \x01(\fR\apemData\"\x88\x03\n" +
 	"\x0fRegisterRequest\x12\"\n" +
 	"\redge_mac_addr\x18\x01 \x01(\tR\vedgeMacAddr\x12\x1b\n" +
 	"\tedge_desc\x18\x02 \x01(\tR\bedgeDesc\x12%\n" +
@@ -430,7 +447,9 @@ const file_register_proto_rawDesc = "" +
 	"\x10p2p_capabilities\x18\a \x03(\tR\x0fp2pCapabilities\x12\x19\n" +
 	"\bnat_type\x18\b \x01(\tR\anatType\x12\x1d\n" +
 	"\n" +
-	"pub_socket\x18\t \x01(\tR\tpubSocket\"\x16\n" +
+	"pub_socket\x18\t \x01(\tR\tpubSocket\x12)\n" +
+	"\x10assisted_sockets\x18\n" +
+	" \x03(\tR\x0fassistedSockets\"\x16\n" +
 	"\x14RetryRegisterRequest\"q\n" +
 	"\x10RegisterResponse\x12$\n" +
 	"\x0eis_register_ok\x18\x01 \x01(\bR\fisRegisterOk\x12\x1d\n" +
@@ -448,19 +467,19 @@ const file_register_proto_rawDesc = "" +
 	"\x14encrypted_machine_id\x18\x03 \x01(\fR\x12encryptedMachineIdB\x1fZ\x1dn2n-go/pkg/protocol/netstructb\x06proto3"
 
 var (
-	file_register_proto_rawDescOnce sync.Once
-	file_register_proto_rawDescData []byte
+	file_pkg_protocol_netstruct_proto_register_proto_rawDescOnce sync.Once
+	file_pkg_protocol_netstruct_proto_register_proto_rawDescData []byte
 )
 
-func file_register_proto_rawDescGZIP() []byte {
-	file_register_proto_rawDescOnce.Do(func() {
-		file_register_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_register_proto_rawDesc), len(file_register_proto_rawDesc)))
+func file_pkg_protocol_netstruct_proto_register_proto_rawDescGZIP() []byte {
+	file_pkg_protocol_netstruct_proto_register_proto_rawDescOnce.Do(func() {
+		file_pkg_protocol_netstruct_proto_register_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_pkg_protocol_netstruct_proto_register_proto_rawDesc), len(file_pkg_protocol_netstruct_proto_register_proto_rawDesc)))
 	})
-	return file_register_proto_rawDescData
+	return file_pkg_protocol_netstruct_proto_register_proto_rawDescData
 }
 
-var file_register_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
-var file_register_proto_goTypes = []any{
+var file_pkg_protocol_netstruct_proto_register_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_pkg_protocol_netstruct_proto_register_proto_goTypes = []any{
 	(*SnPublicSecret)(nil),       // 0: netstruct.SnPublicSecret
 	(*RegisterRequest)(nil),      // 1: netstruct.RegisterRequest
 	(*RetryRegisterRequest)(nil), // 2: netstruct.RetryRegisterRequest
@@ -468,7 +487,7 @@ var file_register_proto_goTypes = []any{
 	(*HeartbeatPulse)(nil),       // 4: netstruct.HeartbeatPulse
 	(*UnregisterRequest)(nil),    // 5: netstruct.UnregisterRequest
 }
-var file_register_proto_depIdxs = []int32{
+var file_pkg_protocol_netstruct_proto_register_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
 	0, // [0:0] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
@@ -476,26 +495,26 @@ var file_register_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_register_proto_init() }
-func file_register_proto_init() {
-	if File_register_proto != nil {
+func init() { file_pkg_protocol_netstruct_proto_register_proto_init() }
+func file_pkg_protocol_netstruct_proto_register_proto_init() {
+	if File_pkg_protocol_netstruct_proto_register_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_register_proto_rawDesc), len(file_register_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_protocol_netstruct_proto_register_proto_rawDesc), len(file_pkg_protocol_netstruct_proto_register_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_register_proto_goTypes,
-		DependencyIndexes: file_register_proto_depIdxs,
-		MessageInfos:      file_register_proto_msgTypes,
+		GoTypes:           file_pkg_protocol_netstruct_proto_register_proto_goTypes,
+		DependencyIndexes: file_pkg_protocol_netstruct_proto_register_proto_depIdxs,
+		MessageInfos:      file_pkg_protocol_netstruct_proto_register_proto_msgTypes,
 	}.Build()
-	File_register_proto = out.File
-	file_register_proto_goTypes = nil
-	file_register_proto_depIdxs = nil
+	File_pkg_protocol_netstruct_proto_register_proto = out.File
+	file_pkg_protocol_netstruct_proto_register_proto_goTypes = nil
+	file_pkg_protocol_netstruct_proto_register_proto_depIdxs = nil
 }

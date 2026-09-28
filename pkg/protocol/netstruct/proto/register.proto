@@ -21,6 +21,16 @@ message RegisterRequest {
   repeated string p2p_capabilities = 7;
   string nat_type = 8;
   string pub_socket = 9;
+  // This edge's own LAN addresses, each paired with the local port of its P2P
+  // socket, so a peer on the same broadcast domain can address it directly
+  // instead of hairpinning through the local router.
+  //
+  // FRP parity: pkg/nathole/nathole.go:145-149 builds the same list into
+  // NatHoleReport.AssistedAddrs from ListLocalIPsForNatHole. It is reported
+  // alongside pub_socket rather than merged into it because the two are tried
+  // in a fixed order by the punching side (assisted first), not as an
+  // unordered set.
+  repeated string assisted_sockets = 10;
 }
 
 // 对应 Go 中的 RetryRegisterRequest

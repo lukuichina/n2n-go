@@ -461,6 +461,11 @@ func (e *EdgeClient) RequestRegister() error {
 		P2PCapabilities:    p2pCapabilities,
 		NatType:            natType,
 		PubSocket:          pubSocket,
+		// Our own LAN addresses, so a peer sharing this broadcast domain
+		// can address us directly. Reported separately from PubSocket
+		// because the punching side tries them first -- FRP parity, see
+		// AssistedEndpoints.
+		AssistedSockets: e.AssistedEndpoints(),
 	}
 
 	return e.SendStruct(regReq, nil, p2p.UDPEnforceSupernode)

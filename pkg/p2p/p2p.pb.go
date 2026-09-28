@@ -162,8 +162,11 @@ type PeerInfo struct {
 	// in flight", which lets the relay distinguish a fresh report from a
 	// stale one.
 	PunchResultPeerMac string `protobuf:"bytes,13,opt,name=punch_result_peer_mac,json=punchResultPeerMac,proto3" json:"punch_result_peer_mac,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// The peer's LAN addresses (see RegisterRequest.assisted_sockets), carried
+	// so the relay can copy them into NatHoleInstruction.sender_assisted_endpoints.
+	AssistedSockets []string `protobuf:"bytes,14,rep,name=assisted_sockets,json=assistedSockets,proto3" json:"assisted_sockets,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PeerInfo) Reset() {
@@ -285,6 +288,13 @@ func (x *PeerInfo) GetPunchResultPeerMac() string {
 		return x.PunchResultPeerMac
 	}
 	return ""
+}
+
+func (x *PeerInfo) GetAssistedSockets() []string {
+	if x != nil {
+		return x.AssistedSockets
+	}
+	return nil
 }
 
 type NatHolePunchResult struct {
@@ -808,9 +818,22 @@ type NatHoleInstruction struct {
 	BehaviorIndex uint32 `protobuf:"varint,14,opt,name=behavior_index,json=behaviorIndex,proto3" json:"behavior_index,omitempty"`
 	// Milliseconds the relay held this instruction back relative to its
 	// counterpart. 0 means "use the relay's configured default".
-	SendDelayMs   uint32 `protobuf:"varint,15,opt,name=send_delay_ms,json=sendDelayMs,proto3" json:"send_delay_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SendDelayMs uint32 `protobuf:"varint,15,opt,name=send_delay_ms,json=sendDelayMs,proto3" json:"send_delay_ms,omitempty"`
+	// The SENDER's LAN addresses, as the receiver will see them.
+	//
+	// Only the sender acts on these: it tries them before the sender's
+	// STUN-reflexive pub_socket, because when both peers share a LAN a direct
+	// delivery needs no NAT mapping on either side and cannot be defeated by a
+	// router that does not hairpin.
+	//
+	// FRP parity: pkg/nathole/nathole.go:210-215 -- `detectAddrs =
+	// m.AssistedAddrs; detectAddrs = append(detectAddrs, m.CandidateAddrs...)`
+	// for the sender, and `detectAddrs = m.CandidateAddrs` for the receiver.
+	// The receiver deliberately gets no assisted list: opening a mapping on its
+	// own NAT is its job, and addressing a LAN address would do nothing for that.
+	SenderAssistedEndpoints []string `protobuf:"bytes,16,rep,name=sender_assisted_endpoints,json=senderAssistedEndpoints,proto3" json:"sender_assisted_endpoints,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *NatHoleInstruction) Reset() {
@@ -948,11 +971,18 @@ func (x *NatHoleInstruction) GetSendDelayMs() uint32 {
 	return 0
 }
 
+func (x *NatHoleInstruction) GetSenderAssistedEndpoints() []string {
+	if x != nil {
+		return x.SenderAssistedEndpoints
+	}
+	return nil
+}
+
 var File_pkg_p2p_proto_p2p_proto protoreflect.FileDescriptor
 
 const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\n" +
-	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xfc\x03\n" +
+	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xa7\x04\n" +
 	"\bPeerInfo\x12\x1d\n" +
 	"\n" +
 	"virtual_ip\x18\x01 \x01(\tR\tvirtualIp\x12\x19\n" +
@@ -969,7 +999,8 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	" \x01(\v2\x17.p2p.NatHoleInstructionR\x12natHoleInstruction\x12%\n" +
 	"\x0eobserved_raddr\x18\v \x01(\tR\robservedRaddr\x12:\n" +
 	"\fpunch_result\x18\f \x01(\v2\x17.p2p.NatHolePunchResultR\vpunchResult\x121\n" +
-	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\"\x9d\x01\n" +
+	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\x12)\n" +
+	"\x10assisted_sockets\x18\x0e \x03(\tR\x0fassistedSockets\"\x9d\x01\n" +
 	"\x12NatHolePunchResult\x12,\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x16.p2p.NatHolePunchStateR\x05state\x12\x1a\n" +
 	"\battempts\x18\x02 \x01(\rR\battempts\x12\x16\n" +
@@ -1022,7 +1053,7 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\x0fsender_behavior\x18\n" +
 	" \x01(\tR\x0esenderBehavior\x12)\n" +
 	"\x10ports_difference\x18\v \x01(\x05R\x0fportsDifference\x120\n" +
-	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\"\xc3\x04\n" +
+	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\"\xff\x04\n" +
 	"\x12NatHoleInstruction\x12$\n" +
 	"\x04role\x18\x01 \x01(\x0e2\x10.p2p.NatHoleRoleR\x04role\x12(\n" +
 	"\x10ports_range_from\x18\x02 \x01(\rR\x0eportsRangeFrom\x12$\n" +
@@ -1041,7 +1072,8 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\x14regular_ports_change\x18\f \x01(\bR\x12regularPortsChange\x12\x12\n" +
 	"\x04mode\x18\r \x01(\rR\x04mode\x12%\n" +
 	"\x0ebehavior_index\x18\x0e \x01(\rR\rbehaviorIndex\x12\"\n" +
-	"\rsend_delay_ms\x18\x0f \x01(\rR\vsendDelayMs*p\n" +
+	"\rsend_delay_ms\x18\x0f \x01(\rR\vsendDelayMs\x12:\n" +
+	"\x19sender_assisted_endpoints\x18\x10 \x03(\tR\x17senderAssistedEndpoints*p\n" +
 	"\x11NatHolePunchState\x12\x12\n" +
 	"\x0ePunchStateNone\x10\x00\x12\x18\n" +
 	"\x14PunchStateInProgress\x10\x01\x12\x14\n" +

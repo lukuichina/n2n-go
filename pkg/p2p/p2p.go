@@ -198,7 +198,26 @@ func (p *Peer) resetPendingTTL() {
 }
 
 type PeerRegistry struct {
-	CommunityName   string
+	CommunityName string
+	// SelfTapName is this host's own n2n tap interface (config TapName,
+	// e.g. "n2n_tap0").
+	//
+	// It is needed because the tap carries an address inside the overlay
+	// network, and *the peer has one in the same subnet*. Two consequences,
+	// both of which are self-reference bugs if ignored:
+	//
+	//  1. Advertising it would tell the peer to punch an address that
+	//     resolves back to the overlay, not to a direct path.
+	//  2. Scoring it as "same subnet" would rank it as highly as the real
+	//     LAN -- both are /24 -- so the sort would actively promote it
+	//     ahead of the address that can actually connect.
+	//
+	// Filtering by interface identity rather than by a hardcoded CIDR is
+	// deliberate: the overlay network is derived from the community hash
+	// over a configurable base+mask (see supernode.NetworkAllocator), so
+	// the range is 100.64.0.0/10 in some deployments and 10.171.51.0/24 in
+	// others. A constant would go quietly stale.
+	SelfTapName     string
 	peerMu          sync.RWMutex
 	Me              *Peer
 	Peers           map[string]*Peer //keyed by MACAddr.String()
@@ -408,6 +427,73 @@ func (reg *PeerRegistry) GetPeer(MACAddr string) (*Peer, error) {
 		return nil, fmt.Errorf("peer with MAC address %s not found", MACAddr)
 	}
 	return peer, nil
+}
+
+// lookupSockets returns every address a peer may legitimately be reached
+// at, and therefore every address its inbound packets may legitimately
+// appear to come from.
+//
+// The LAN addresses must be in this set, not just the STUN-reflexive
+// pubSocket: we actively ask the peer to punch at them (FRP parity,
+// m.AssistedAddrs), so once it does, its packets arrive sourced from one
+// of them. Matching only pubSocket would then classify a perfectly good
+// packet as coming from an "unknown peer", and handlePunchDatagram would
+// drop it -- the symptom being a punch that provably completes on the wire
+// yet never registers as a success.
+//
+// Keys are normalised through net.ResolveUDPAddr so that "1.2.3.4:5678"
+// and any spelling of the same endpoint collapse to one entry.
+func (p *Peer) lookupSockets() []string {
+	if p == nil {
+		return nil
+	}
+	raw := make([]string, 0, 1+len(p.Infos.GetAssistedSockets()))
+	if a := p.UDPAddr(); a != nil {
+		raw = append(raw, a.String())
+	}
+	raw = append(raw, p.Infos.GetAssistedSockets()...)
+
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		if r == "" {
+			continue
+		}
+		key := r
+		if ua, err := net.ResolveUDPAddr("udp", r); err == nil && ua != nil {
+			key = ua.String()
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	return out
+}
+
+// SelfMAC returns this host's own n2n MAC as a string, which is also the MAC
+// n2n assigns to our tap. Empty until the MAC is known.
+//
+// This is the one tap identifier guaranteed to be available while building
+// the registration request: the interface name does not match the OS name on
+// Windows, and the virtual IP only arrives in the registration response.
+func (reg *PeerRegistry) SelfMAC() string {
+	if reg == nil || reg.Me == nil {
+		return ""
+	}
+	return net.HardwareAddr(reg.Me.Infos.MacAddr).String()
+}
+
+// SelfTapIP returns this host's own n2n virtual IP, i.e. the address carried
+// on our tap. Empty until we have registered. See PeerRegistry.SelfTapName for
+// why both identifiers exist: the name is a convenience, this is the
+// authoritative one.
+func (reg *PeerRegistry) SelfTapIP() string {
+	if reg == nil || reg.Me == nil {
+		return ""
+	}
+	return reg.Me.Infos.GetVirtualIp()
 }
 
 func (reg *PeerRegistry) GetPeerBySocket(addr *net.UDPAddr) (*Peer, error) {
@@ -640,8 +726,16 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 		log.Printf("updated peer now hold of %s MACAddr:", macAddr)
 		log.Printf(" was: vip=%s PubSocket=%s desc=%s", origPeer.Infos.VirtualIp, origPeer.Infos.PubSocket, origPeer.Infos.Desc)
 		log.Printf(" now: vip=%s PubSocket=%s desc=%s", existingPeer.Infos.VirtualIp, existingPeer.Infos.PubSocket, existingPeer.Infos.Desc)
-		delete(reg.peerBySocket, origPeer.UDPAddr().String())
-		reg.peerBySocket[existingPeer.UDPAddr().String()] = existingPeer
+		// Re-key every address, not just pubSocket: the assisted set can
+		// change between updates (an interface came up or went down), and a
+		// stale key would keep resolving to this peer for an address it no
+		// longer claims -- and would shadow a different peer that does.
+		for _, k := range origPeer.lookupSockets() {
+			delete(reg.peerBySocket, k)
+		}
+		for _, k := range existingPeer.lookupSockets() {
+			reg.peerBySocket[k] = existingPeer
+		}
 		if origPeer.P2PEndpoint != "" {
 			delete(reg.peerByP2PSocket, origPeer.P2PEndpoint)
 		}
@@ -660,7 +754,9 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 		UpdatedAt:       time.Now(),
 	}
 	reg.Peers[macAddr] = peer
-	reg.peerBySocket[peer.UDPAddr().String()] = peer
+	for _, k := range peer.lookupSockets() {
+		reg.peerBySocket[k] = peer
+	}
 	if peer.P2PEndpoint != "" {
 		reg.peerByP2PSocket[peer.P2PEndpoint] = peer
 	}
@@ -684,9 +780,14 @@ func (reg *PeerRegistry) RemovePeer(MACAddr string) error {
 
 	dDesc := p.Infos.Desc
 	dVip := p.Infos.VirtualIp
-	dUDPAddrString := p.UDPAddr().String()
+	// Release every address key, not just pubSocket. A key left behind after
+	// the peer is gone keeps resolving to a dead *Peer, so a punch from the
+	// next machine to take that address would attach to a tombstone instead
+	// of failing the lookup and taking the unknown-peer path.
+	for _, k := range p.lookupSockets() {
+		delete(reg.peerBySocket, k)
+	}
 	delete(reg.Peers, MACAddr)
-	delete(reg.peerBySocket, dUDPAddrString)
 	if p.P2PEndpoint != "" {
 		delete(reg.peerByP2PSocket, p.P2PEndpoint)
 	}
@@ -1322,28 +1423,100 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 		}
 
 		// Build list of candidate addresses to punch.
+		//
+		// FRP parity, and the order is the whole point --
+		// pkg/nathole/nathole.go:210-215:
+		//
+		//	if role == DetectRoleSender {
+		//		detectAddrs = m.AssistedAddrs
+		//		detectAddrs = append(detectAddrs, m.CandidateAddrs...)
+		//	} else {
+		//		detectAddrs = m.CandidateAddrs
+		//	}
+		//
+		// The peer's LAN addresses come first because when both ends share
+		// a broadcast domain the delivery is direct: no NAT mapping has to
+		// exist yet, and no router has to hairpin. The STUN-reflexive
+		// address -- the one every other candidate resolves to, and the
+		// only one that can work across the internet -- comes after.
+		//
+		// This is not a fallback arrangement: on a shared LAN the assisted
+		// address is answered by the peer itself, while the public one
+		// depends on the local router supporting hairpinning, which many do
+		// not. Putting it second would mean paying a full punch timeout
+		// before trying the one address that actually works.
+		//
+		// Ordering across networks: the loop below sends one datagram per
+		// candidate and only then waits, so a private address that is
+		// unroutable from here costs a single dropped sendto, never a
+		// timeout -- which is why FRP can list every local IP unconditionally
+		// without caring whether the peer is actually on the same segment.
+		//
+		// The peer's OBSERVED raddr is still prepended ahead of all of this
+		// further below: it is the address we most recently proved is
+		// reachable, which outranks anything merely predicted.
 		var candidates []*net.UDPAddr
-		if targetAddr != nil && targetAddr.IP != nil {
-			candidates = append(candidates, targetAddr)
+		seenCandidate := map[string]bool{}
+		appendCandidate := func(a *net.UDPAddr) {
+			if a == nil || a.IP == nil {
+				return
+			}
+			key := a.String()
+			if seenCandidate[key] {
+				return
+			}
+			seenCandidate[key] = true
+			candidates = append(candidates, a)
 		}
+
+		// NOTE: instr.SenderAssistedEndpoints is deliberately NOT read here.
+		//
+		// It carries the SENDER's own LAN addresses, so a sender that
+		// punched at it would be sending to itself. FRP's equivalent
+		// (nathole.go:210-215, `detectAddrs = m.AssistedAddrs`) reads a
+		// field holding the PEER's addresses, because frps builds each
+		// side's NatHoleResp separately and fills it with the other side's
+		// data (controller.go:365). n2n-go broadcasts one instruction to
+		// both roles instead, so the `sender*` fields can only describe the
+		// sender -- which makes them usable by the RECEIVER (it needs the
+		// sender's addresses) and useless to the sender.
+		//
+		// The receiver's LAN addresses therefore come from the peer
+		// registry below, keyed on TargetMac. That is the same source as
+		// P2PRaddr and P2PEndpoint, so all three are consistent snapshots
+		// of one peer rather than a mix of instruction-time and
+		// registry-time addresses.
+
+		// The STUN-reflexive address, and everything else the registry knows.
+		appendCandidate(targetAddr)
 
 		// FRP fix 3: also try the target's P2PEndpoint (TAP-side address).
 		// In some configurations, the peer's P2P endpoint is directly
 		// routable even when the STUN-discovered pubSocket is not.
 		if peerInfo := reg.LookupPeerByPubSocket(punchTarget); peerInfo != nil {
 			if peerInfo.P2PEndpoint != "" {
-				if ep, err := net.ResolveUDPAddr("udp", peerInfo.P2PEndpoint); err == nil && ep != nil {
-					// Only add if not the same as targetAddr
-					if ep.String() != targetAddr.String() {
-						candidates = append(candidates, ep)
-					}
+				if ep, err := net.ResolveUDPAddr("udp", peerInfo.P2PEndpoint); err == nil {
+					appendCandidate(ep)
+				}
+			}
+			// FRP parity: the peer also advertises its LAN addresses.
+			// Normally already present via the instruction, but the
+			// instruction is a snapshot and the registry entry may be
+			// newer (or the instruction may predate this field entirely,
+			// when talking to an older relay).
+			for _, raw := range peerInfo.Infos.GetAssistedSockets() {
+				if raw == "" {
+					continue
+				}
+				if ep, err := net.ResolveUDPAddr("udp", raw); err == nil {
+					appendCandidate(ep)
 				}
 			}
 		} else {
 			// Also try resolving targetP2PEndpoint from the instruction.
 			if targetP2PEndpoint != "" && targetP2PEndpoint != punchTarget {
-				if ep, err := net.ResolveUDPAddr("udp", targetP2PEndpoint); err == nil && ep != nil {
-					candidates = append(candidates, ep)
+				if ep, err := net.ResolveUDPAddr("udp", targetP2PEndpoint); err == nil {
+					appendCandidate(ep)
 				}
 			}
 		}
@@ -1372,6 +1545,45 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 							p.P2PRaddr, macAddrStr(targetMAC))
 					}
 				}
+				// The receiver's own LAN addresses -- FRP's m.AssistedAddrs,
+				// which the sender tries ahead of the predicted/public
+				// candidates. Same reason as above: on a shared LAN the
+				// packet is answered by the peer itself and needs no NAT
+				// mapping to exist yet, whereas the public address depends
+				// on the local router hairpinning.
+				//
+				// Added right after the observed address rather than ahead
+				// of it: raddr was proven reachable by an actual packet,
+				// these are only claims. Order among themselves is the
+				// order the peer reported them, so a multi-homed host
+				// keeps its own preference.
+				assistedRaw := p.Infos.GetAssistedSockets()
+				// Rank the peer's LAN addresses by whether they sit on a
+				// subnet this host is also on, so the one address that can
+				// actually complete a shared-LAN punch is tried first
+				// instead of after every guaranteed-to-fail virtual
+				// interface the peer happens to own. Reported order is kept
+				// among equally-ranked entries (stable sort).
+				localPrefixes := localNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC())
+				assisted := sortAssistedByLocalAffinity(assistedRaw, localPrefixes)
+				if !sameOrder(assistedRaw, assisted) {
+					log.Printf("[P2P] Sender: target %s reported LAN addresses %v, reordered to %v "+
+						"(same-subnet-first against our %d local subnet(s))",
+						macAddrStr(targetMAC), assistedRaw, assisted, len(localPrefixes))
+				}
+				for _, raw := range assisted {
+					if raw == "" {
+						continue
+					}
+					if ep, err2 := net.ResolveUDPAddr("udp", raw); err2 == nil {
+						appendCandidate(ep)
+					}
+				}
+				if len(assisted) > 0 {
+					log.Printf("[P2P] Sender: target %s reported %d LAN address(es) (%v), added as punch candidates",
+						macAddrStr(targetMAC), len(assisted), assisted)
+				}
+
 				// Try P2PEndpoint as an additional candidate
 				if p.P2PEndpoint != "" {
 					if ep, err2 := net.ResolveUDPAddr("udp", p.P2PEndpoint); err2 == nil && ep != nil {

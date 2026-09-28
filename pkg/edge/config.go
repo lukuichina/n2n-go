@@ -146,6 +146,18 @@ type Config struct {
 	// STUN configuration
 	STUNServers []string `mapstructure:"stun_servers"`
 
+	// DisableAssistedAddrs stops the edge from advertising its own LAN
+	// addresses to the relay (FRP parity: natHole.disableAssistedAddrs).
+	//
+	// The addresses are what let two peers on the same LAN find each other
+	// directly instead of hairpinning through the local router. Turn this
+	// off only when the extra sendto per address is measurably harmful -- the
+	// peer simply skips them, so the worst case is a slightly slower punch,
+	// not a failure. Leaving it on costs nothing in the common case: a host
+	// with a single interface contributes exactly one address, and the peer
+	// reaches it in the first sendto of the first round.
+	DisableAssistedAddrs bool `mapstructure:"disable_assisted_addrs" env:"N2N_DISABLE_ASSISTED_ADDRS"`
+
 	// P2P keepalive configuration
 	//
 	// A UDP NAT mapping expires when nothing is sent through it, typically
@@ -279,6 +291,7 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 		flag.StringVar(&cfg.P2PListenAddr, "p2p-listen-addr", cfg.P2PListenAddr, "P2P UDP listen address (empty = auto-detect)")
 		flag.IntVar(&cfg.P2PListenPort, "p2p-listen-port", cfg.P2PListenPort, "P2P UDP listen port (0 = system-assigned)")
 		flag.Var(&stringSliceFlag{&cfg.STUNServers}, "stun-servers", "STUN servers for NAT traversal (comma-separated)")
+		flag.BoolVar(&cfg.DisableAssistedAddrs, "nat-hole-disable-assisted-addrs", false, "Do not advertise this edge's LAN addresses to the relay (FRP parity: natHole.disableAssistedAddrs). The addresses let a peer on the same LAN address this machine directly instead of hairpinning through the local router")
 
 		flag.Parse() // MUST call this to parse the flags
 	}
