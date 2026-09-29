@@ -121,6 +121,24 @@ type EdgeClient struct {
 	isWaitingForSNPubKeyUpdate          bool
 	isWaitingForSNRetryRegisterResponse bool
 
+	// expectedPunchPeerMAC is the peer MAC the supernode named in the
+	// NatHoleInstruction we are currently executing, valid only for the
+	// duration of that instruction. It exists because a source address is
+	// not always an address the peer published: a router between the two
+	// that forwards and rewrites the source (SNAT) turns it into an
+	// address neither side ever advertised, and every lookup by socket or
+	// by IP then misses. The field logs showed exactly that -- a peer
+	// reached by the supernode as 52:eb:72:ed:64:1f arriving as
+	// 172.22.1.17:49585, answered once and then discarded 18 times, so the
+	// path was never recorded and never completed.
+	//
+	// Naming the peer in advance is not the same as inventing one: the
+	// pairing was already authorised by the supernode, so attributing an
+	// arriving punch to that MAC during this window records a fact about a
+	// peer that is known to exist, and it expires with the instruction.
+	expectedPunchPeerMACMu sync.RWMutex
+	expectedPunchPeerMAC   string
+
 	payloadProcessor *transform.PayloadProcessor
 }
 

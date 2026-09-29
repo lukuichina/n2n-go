@@ -12,6 +12,14 @@ import (
 	"time"
 )
 
+// sendProbeSlowThreshold is when a single send is worth a [SEND-SLOW] line.
+//
+// The data path is one goroutine (handleTAP), so its per-packet cost is the
+// queueing delay every later packet inherits. A few milliseconds is normal
+// for the peer lookup plus the raddr resolve; anything past this is the range
+// that showed up as three-digit ping latency, so it is the range worth naming.
+const sendProbeSlowThreshold = 20 * time.Millisecond
+
 func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPWriteStrategy) (*net.UDPAddr, bool, error) {
 	var udpSocket *net.UDPAddr
 	isP2P := false
@@ -27,7 +35,32 @@ func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPW
 			udpSocket = e.SupernodeAddr
 			break
 		}
+		// The route decision is on the per-packet path and runs on the
+		// handleTAP goroutine, so its cost is paid by every later packet in the
+		// queue. Split the stages so a slow [TAP-SLOW] with no [SEND-SLOW] can
+		// be attributed: the peer lookup, the ResolveUDPAddr on the observed
+		// raddr, or the route log -- which Sprintf's the strategy and target on
+		// every call before LogRouteDecision decides whether to print at all.
+		decStarted := time.Now()
+		var looked, decided time.Time
+		var peerStatus p2p.P2PCapacity
+		var peerRaddr string
+		defer func() {
+			if d := time.Since(decStarted); d >= sendProbeSlowThreshold {
+				log.Printf("[DECISION-SLOW] total=%v lookup=%v decide=%v routeLog=%v dst=%s strat=%v pstatus=%v raddr=%s p2p=%v",
+					d.Truncate(time.Microsecond), looked.Sub(decStarted).Truncate(time.Microsecond),
+					decided.Sub(looked).Truncate(time.Microsecond),
+					time.Since(decided).Truncate(time.Microsecond), dst, strategy,
+					peerStatus, peerRaddr, isP2P)
+			}
+		}()
+
 		p, err := e.Peers.GetPeer(dst.String())
+		looked = time.Now()
+		if err == nil {
+			peerStatus = p.P2PStatus
+			peerRaddr = p.GetP2PRaddr()
+		}
 		if err != nil {
 			log.Printf("[P2P-DEBUG] peer lookup failed for %s: %v, using supernode", dst.String(), err)
 			if strategy == p2p.UDPEnforceP2P {
@@ -65,7 +98,7 @@ func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPW
 				// behind a cloud NAT with no UDP port forwarding will report
 				// FullDuplex based on tiny punch packets getting through, but
 				// larger Data/ICMP packets are silently dropped on direct UDP.
-				if raddr := p.P2PRaddr; raddr != "" {
+				if raddr := p.GetP2PRaddr(); raddr != "" {
 					if resolvedRaddr, err := net.ResolveUDPAddr("udp", raddr); err == nil && resolvedRaddr != nil {
 						udpSocket = resolvedRaddr
 						isP2P = true
@@ -92,7 +125,7 @@ func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPW
 			// a different port per destination — the probe was silently
 			// dropped every time even though the punch (which targets the
 			// observed source address) worked fine.
-			if raddr := p.P2PRaddr; raddr != "" {
+			if raddr := p.GetP2PRaddr(); raddr != "" {
 				if resolvedRaddr, err := net.ResolveUDPAddr("udp", raddr); err == nil && resolvedRaddr != nil {
 					udpSocket = resolvedRaddr
 					isP2P = true
@@ -103,6 +136,7 @@ func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPW
 			udpSocket = p.UDPAddr()
 		}
 		decide()
+		decided = time.Now()
 		p.LogRouteDecision(fmt.Sprintf("%v", strategy), udpSocket, isP2P)
 	}
 	return udpSocket, isP2P, nil
@@ -127,50 +161,73 @@ func (e *EdgeClient) EdgeHeader(pt spec.PacketType, dst net.HardwareAddr) *proto
 }
 
 func (e *EdgeClient) WritePacket(pt spec.PacketType, dst net.HardwareAddr, payload []byte, strategy p2p.UDPWriteStrategy) error {
+	// Send-side timing probe. handleTAP reads the TAP, decides the route and
+	// writes the packet all on one goroutine, so anything slow here stalls the
+	// whole queue and shows up at the peer as a latency spike on an otherwise
+	// idle, fully direct tunnel. Split the measurement so the slow stage is
+	// named rather than guessed at: decision covers the peer lookup, the raddr
+	// resolve and the route log; write covers the actual socket or WSS write.
+	started := time.Now()
 	udpSocket, isP2P, err := e.UDPAddrWithStrategy(dst, strategy)
 	if err != nil {
 		return err
 	}
+	decided := time.Now()
 
 	header := e.EdgeHeader(pt, dst)
 	e.PacketsSent.Add(1)
 
 	packet := protocol.PackProtoVDatagram(header, payload)
 
-	// P2P direct send takes priority over WSS
-	if isP2P && e.P2PConn != nil {
-		_, err = e.P2PConn.WriteToUDP(packet, udpSocket)
-		if err != nil {
-			return fmt.Errorf("failed to send P2P UDP packet: %w", err)
+	var sent int
+	var werr error
+	via := "relay"
+	switch {
+	case isP2P && e.P2PConn != nil:
+		via = "p2p"
+		sent, werr = e.P2PConn.WriteToUDP(packet, udpSocket)
+		if werr != nil {
+			err = fmt.Errorf("failed to send P2P UDP packet: %w", werr)
 		}
-		return nil
-	}
-
-	// Use WSS transport if available
-	if e.WSSTransport != nil {
-		_, err = e.WSSTransport.Write(packet, nil)
-		if err != nil {
-			return fmt.Errorf("failed to send WSS packet: %w", err)
+	case e.WSSTransport != nil:
+		via = "wss"
+		sent, werr = e.WSSTransport.Write(packet, nil)
+		if werr != nil {
+			err = fmt.Errorf("failed to send WSS packet: %w", werr)
 		}
-		return nil
+	case e.Conn == nil:
+		err = fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+	default:
+		sent, werr = e.Conn.WriteToUDP(packet, udpSocket)
+		if werr != nil {
+			err = fmt.Errorf("failed to send UDP packet: %w", werr)
+		}
 	}
-
-	// Use UDP
-	if e.Conn == nil {
-		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
-	}
-	_, err = e.Conn.WriteToUDP(packet, udpSocket)
 	if err != nil {
-		return fmt.Errorf("failed to send UDP packet: %w", err)
+		return err
+	}
+
+	// Only the outliers are logged: a per-packet line here would itself become
+	// the bottleneck this probe exists to measure.
+	if d := time.Since(started); d >= sendProbeSlowThreshold {
+		log.Printf("[SEND-SLOW] total=%v decision=%v write=%v via=%s strat=%v bytes=%d dst=%s ptype=%v",
+			d.Truncate(time.Microsecond), decided.Sub(started).Truncate(time.Microsecond),
+			time.Since(decided).Truncate(time.Microsecond), via, strategy, sent, dst, pt)
 	}
 	return nil
 }
 
 func (e *EdgeClient) SendStruct(s netstruct.PacketTyped, dst net.HardwareAddr, strategy p2p.UDPWriteStrategy) error {
+	// Same rationale as WritePacket: keepalive and path-verification probes run
+	// on their own goroutines but share the P2P socket and the peer registry, so
+	// a slow decision here contends with the data path even though the packet is
+	// only a few dozen bytes.
+	started := time.Now()
 	udpSocket, isP2P, err := e.UDPAddrWithStrategy(dst, strategy)
 	if err != nil {
 		return err
 	}
+	decided := time.Now()
 
 	header := e.EdgeHeader(s.PacketType(), dst)
 
@@ -181,40 +238,51 @@ func (e *EdgeClient) SendStruct(s netstruct.PacketTyped, dst net.HardwareAddr, s
 
 	packet := protocol.PackProtoVDatagram(header, payload)
 
-	// P2P direct send takes priority over WSS
-	if isP2P && e.P2PConn != nil {
+	via := "relay"
+	switch {
+	case isP2P && e.P2PConn != nil:
+		via = "p2p"
 		_, err = e.P2PConn.WriteToUDP(packet, udpSocket)
 		if err != nil {
 			return fmt.Errorf("failed to send P2P UDP packet: %w", err)
 		}
-		return nil
-	}
-
-	// Use WSS transport if available
-	if e.WSSTransport != nil {
+	case e.WSSTransport != nil:
+		via = "wss"
 		_, err = e.WSSTransport.Write(packet, nil)
 		if err != nil {
 			return fmt.Errorf("failed to send WSS packet: %w", err)
 		}
-		return nil
+	case e.Conn == nil:
+		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+	default:
+		_, err = e.Conn.WriteToUDP(packet, udpSocket)
+		if err != nil {
+			return fmt.Errorf("failed to send UDP packet: %w", err)
+		}
 	}
 
-	// Use UDP
-	if e.Conn == nil {
-		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
-	}
-	_, err = e.Conn.WriteToUDP(packet, udpSocket)
-	if err != nil {
-		return fmt.Errorf("failed to send UDP packet: %w", err)
+	// Outliers only: a per-probe line here would be more traffic than the
+	// probes themselves generate.
+	if d := time.Since(started); d >= sendProbeSlowThreshold {
+		log.Printf("[SEND-SLOW] total=%v decision=%v write=%v via=%s strat=%v dst=%s ptype=%v path=struct",
+			d.Truncate(time.Microsecond), decided.Sub(started).Truncate(time.Microsecond),
+			time.Since(decided).Truncate(time.Microsecond), via, strategy, dst, s.PacketType())
 	}
 	return nil
 }
 
 func (e *EdgeClient) SendVFuze(dst net.HardwareAddr, n int, payload []byte, strategy p2p.UDPWriteStrategy) error {
+	// Instrumented for the same reason as WritePacket. This path carries the
+	// bulk of the traffic whenever VFuze is on (every packet is tagged 0x51),
+	// and it shares UDPAddrWithStrategy with WritePacket -- so when a slow
+	// frame showed up under [TAP-SLOW] with no matching [SEND-SLOW], the gap
+	// was precisely that this function had no probe of its own.
+	started := time.Now()
 	udpSocket, isP2P, err := e.UDPAddrWithStrategy(dst, strategy)
 	if err != nil {
 		return err
 	}
+	decided := time.Now()
 
 	vfuzh := protocol.VFuzeHeaderBytes(dst)
 	totalLen := protocol.ProtoVFuzeSize + len(payload)
@@ -224,30 +292,32 @@ func (e *EdgeClient) SendVFuze(dst net.HardwareAddr, n int, payload []byte, stra
 	e.PacketsSent.Add(1)
 
 	// P2P direct send takes priority over WSS
+	via := "relay"
 	if isP2P && e.P2PConn != nil {
+		via = "p2p"
 		_, err = e.P2PConn.WriteToUDP(packet[:totalLen], udpSocket)
 		if err != nil {
 			return fmt.Errorf("failed to send P2P VFuze packet: %w", err)
 		}
-		return nil
-	}
-
-	// Use WSS transport if available
-	if e.WSSTransport != nil {
+	} else if e.WSSTransport != nil {
+		via = "wss"
 		_, err = e.WSSTransport.Write(packet, nil)
 		if err != nil {
 			return fmt.Errorf("failed to send WSS packet: %w", err)
 		}
-		return nil
+	} else if e.Conn == nil {
+		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+	} else {
+		_, err = e.Conn.WriteToUDP(packet[:totalLen], udpSocket)
+		if err != nil {
+			return err
+		}
 	}
 
-	// Use UDP
-	if e.Conn == nil {
-		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
-	}
-	_, err = e.Conn.WriteToUDP(packet[:totalLen], udpSocket)
-	if err != nil {
-		return err
+	if d := time.Since(started); d >= sendProbeSlowThreshold {
+		log.Printf("[SEND-SLOW] total=%v decision=%v write=%v via=%s strat=%v bytes=%d dst=%s ptype=%v path=vfuze",
+			d.Truncate(time.Microsecond), decided.Sub(started).Truncate(time.Microsecond),
+			time.Since(decided).Truncate(time.Microsecond), via, strategy, totalLen, dst, spec.TypeData)
 	}
 	return nil
 }

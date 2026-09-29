@@ -10,6 +10,7 @@ import (
 	"n2n-go/pkg/protocol/netstruct"
 	"n2n-go/pkg/protocol/spec"
 	"net"
+	"time"
 )
 
 var ErrNACKRegister = errors.New("Edge: supernode refused register request. Aborting")
@@ -146,7 +147,18 @@ func (e *EdgeClient) handleDataPayload(payload []byte) error {
 		// data-path problem into a hard outage. Report it instead.
 		return fmt.Errorf("TAP device is nil, dropping %d-byte payload", len(payload))
 	}
+	// The receive path writes the TAP from the network goroutines, and
+	// handleTAP reads it on the data goroutine. On Windows the TAP handle is an
+	// overlapped handle with a shared event pool, so a blocking write here shows
+	// up as a second-long stall in [TAP-SLOW] on the other side of the device --
+	// with no matching [SEND-SLOW] or [DECISION-SLOW], because the time was
+	// never spent sending. Instrumented so the two can be told apart.
+	started := time.Now()
 	_, err = e.TAP.Write(payload)
+	if d := time.Since(started); d >= sendProbeSlowThreshold {
+		log.Printf("[TAP-WRITE-SLOW] write=%v bytes=%d",
+			d.Truncate(time.Microsecond), len(payload))
+	}
 	if err != nil {
 		return fmt.Errorf("TAP write error: %w", err)
 	}

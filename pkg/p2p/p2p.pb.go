@@ -162,6 +162,17 @@ type PeerInfo struct {
 	// in flight", which lets the relay distinguish a fresh report from a
 	// stale one.
 	PunchResultPeerMac string `protobuf:"bytes,13,opt,name=punch_result_peer_mac,json=punchResultPeerMac,proto3" json:"punch_result_peer_mac,omitempty"`
+	// This edge's current P2P status toward the peer named by
+	// punch_result_peer_mac, as a P2PCapacity value (0=Unknown,
+	// 1=Pending, 2=Available, 3=FullDuplex, 4=Unavailable).
+	//
+	// The relay needs this to decide whether a recorded punch success still
+	// describes a live tunnel. Without it the relay can see that a punch once
+	// succeeded but never that it later stopped working, so it must either
+	// suppress the pair forever or re-punch a pair that is already healthy.
+	// Both failure modes were seen in the field: a 300s instruction loop
+	// against an up pair, and vice versa.
+	P2PStatus uint32 `protobuf:"varint,15,opt,name=p2p_status,json=p2pStatus,proto3" json:"p2p_status,omitempty"`
 	// The peer's LAN addresses (see RegisterRequest.assisted_sockets), carried
 	// so the relay can copy them into NatHoleInstruction.sender_assisted_endpoints.
 	AssistedSockets []string `protobuf:"bytes,14,rep,name=assisted_sockets,json=assistedSockets,proto3" json:"assisted_sockets,omitempty"`
@@ -288,6 +299,13 @@ func (x *PeerInfo) GetPunchResultPeerMac() string {
 		return x.PunchResultPeerMac
 	}
 	return ""
+}
+
+func (x *PeerInfo) GetP2PStatus() uint32 {
+	if x != nil {
+		return x.P2PStatus
+	}
+	return 0
 }
 
 func (x *PeerInfo) GetAssistedSockets() []string {
@@ -982,7 +1000,7 @@ var File_pkg_p2p_proto_p2p_proto protoreflect.FileDescriptor
 
 const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\n" +
-	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xa7\x04\n" +
+	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xc6\x04\n" +
 	"\bPeerInfo\x12\x1d\n" +
 	"\n" +
 	"virtual_ip\x18\x01 \x01(\tR\tvirtualIp\x12\x19\n" +
@@ -999,7 +1017,9 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	" \x01(\v2\x17.p2p.NatHoleInstructionR\x12natHoleInstruction\x12%\n" +
 	"\x0eobserved_raddr\x18\v \x01(\tR\robservedRaddr\x12:\n" +
 	"\fpunch_result\x18\f \x01(\v2\x17.p2p.NatHolePunchResultR\vpunchResult\x121\n" +
-	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\x12)\n" +
+	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\x12\x1d\n" +
+	"\n" +
+	"p2p_status\x18\x0f \x01(\rR\tp2pStatus\x12)\n" +
 	"\x10assisted_sockets\x18\x0e \x03(\tR\x0fassistedSockets\"\x9d\x01\n" +
 	"\x12NatHolePunchResult\x12,\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x16.p2p.NatHolePunchStateR\x05state\x12\x1a\n" +

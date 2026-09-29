@@ -120,9 +120,26 @@ func ListLocalIPsForNatHoleExcluding(maxCount int, excludeIface, tapIP, excludeM
 			ifc.Name, ifc.HardwareAddr, tapIP, excluded)
 	}
 
+	return collectAssistedIPs(ifaces, maxCount, excluded, excludeIface, tapIP)
+}
+
+func collectAssistedIPs(ifaces []net.Interface, maxCount int, excluded map[string]bool, excludeIface, tapIP string) []string {
 	var ips []net.IP
 	for i := range ifaces {
 		ifc := &ifaces[i]
+		// An interface that is administratively or carrier-down cannot
+		// receive anything, so its address is not merely useless to a peer,
+		// it is actively misleading: the peer spends a punch budget on it and
+		// can never get an answer.
+		//
+		// This is not hypothetical. A host with a connected Ethernet link and
+		// an out-of-range WiFi (associated to nothing) reported the WiFi's
+		// address to its peer, and the peer -- matching prefixes against its
+		// own interfaces, which included the same down WiFi -- ranked that
+		// address first, ahead of one the field log had just shown working.
+		if ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
 		addrs, aerr := ifc.Addrs()
 		if aerr != nil {
 			continue

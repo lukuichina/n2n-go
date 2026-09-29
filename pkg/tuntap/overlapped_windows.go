@@ -91,11 +91,17 @@ func (f *Handle) asyncIo(fn func(h windows.Handle, p []byte, n *uint32, o *windo
 
 	if errors.Is(err, windows.ERROR_IO_PENDING) {
 		var waitTimeout uint32
-		// Note: milliseconds == 0 means non-blocking check, > 0 means timeout, < 0 means infinite
-		if milliseconds < 0 {
+		// Note: milliseconds == 0 or < 0 both mean an indefinite blocking
+		// wait on this handle; only a positive value imposes a real deadline.
+		//
+		// milliseconds == 0 is what NewOverlapped(winHandle, 0) installs as
+		// defaultTimeout, i.e. the normal Read/Write path on the TAP device.
+		// It MUST block: the TAP read loop relies on it to park until the
+		// next frame arrives. Turning it into a poll that returns
+		// ERROR_IO_PENDING starves the data plane entirely.
+		if milliseconds <= 0 {
 			waitTimeout = windows.INFINITE
 		} else {
-			// Treat 0ms timeout correctly
 			waitTimeout = uint32(milliseconds)
 		}
 
@@ -112,13 +118,11 @@ func (f *Handle) asyncIo(fn func(h windows.Handle, p []byte, n *uint32, o *windo
 			// --- FIX ---
 			// Check if the timeout was due to a non-blocking request (milliseconds == 0)
 			// or an actual expired timer (milliseconds > 0).
-			if milliseconds == 0 {
-				// Non-blocking call, operation is still pending.
-				// Return the original ERROR_IO_PENDING to indicate this state.
-				// The caller (ReadTimeout/WriteTimeout) requested non-blocking,
-				// so "pending" is the expected status if it wasn't immediately ready.
+			if milliseconds <= 0 {
+				// Blocking request: a timeout here is spurious because we asked
+				// for INFINITE above, so fall through to the blocking
+				// GetOverlappedResult below rather than reporting a deadline.
 				break
-				//return 0, windows.ERROR_IO_PENDING
 			} else {
 				// Actual timeout (milliseconds > 0 expired). Cancel and return deadline error.
 				_ = windows.CancelIoEx(f.h, o)

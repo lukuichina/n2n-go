@@ -394,6 +394,23 @@ func (e *EdgeClient) InitialRegister() error {
 		net.HardwareAddr(macBytes).String(),
 		meInfo.VirtualIp, meInfo.PubSocket, meInfo.NatType, meInfo.P2PEndpoint)
 
+	// Ask for a hole-punch instruction now rather than waiting for the
+	// handleP2PInfos ticker. The Worker drives coordination entirely off
+	// inbound P2PStateInfo (coordinateNatHole is only called from
+	// handleP2PStateInfoMessage), so the interval between registering and
+	// the first P2PStateInfo is dead time during which the peer cannot
+	// punch and cannot be punched.
+	//
+	// reg.Me is fully populated by now -- STUN finished before the
+	// registration ACK, so NatType and P2PEndpoint are real values, not
+	// placeholders -- so this first report is immediately actionable and the
+	// Worker can schedule the pair on this very pass.
+	//
+	// One announce is not enough on its own: if the Worker's stagger gate
+	// defers the pair it relies on a Durable Object alarm to come back, and
+	// the burst below re-announces while that window is open.
+	e.requestNatHoleAfterRegister()
+
 	return nil
 }
 

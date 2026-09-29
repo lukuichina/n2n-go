@@ -275,6 +275,14 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		Mode:               mode,
 		BehaviorIndex:      behaviorIndex,
 		SendDelayMs:        sendDelayMs,
+		// The sender's LAN addresses. Without this the receiver's
+		// rankReceiverCandidates sees an empty list and falls back to
+		// punching the STUN-reflexive pubSocket only -- which is exactly
+		// the address a carrier NAT cannot hairpin. The field was logged
+		// two lines above (from the protobuf) but silently dropped here,
+		// so the log looked healthy while the receiver had no candidate
+		// but the public one.
+		SenderAssistedEndpoints: senderAssisted,
 	})
 
 	return nil

@@ -300,6 +300,15 @@ func (i *Interface) IfMac(macAddr string) error {
 		return fmt.Errorf("underlying device is nil")
 	}
 
+	// Fast path: if the adapter already reports the requested MAC there is
+	// nothing to set. Previously two PowerShell round-trips (~7s on this host)
+	// were paid on every start even when the MAC was already correct -- and in
+	// that case both attempts failed anyway before being found to be a no-op.
+	if cur := i.HardwareAddr(); cur != nil && cur.String() == macAddr {
+		log.Printf("Note: MAC address for IfIndex %d is already %s, skipping set", i.GetIfIndex(), macAddr)
+		return nil
+	}
+
 	ifIndex := i.GetIfIndex()
 	log.Printf("Note: Setting MAC address (%s) for IfIndex %d", macAddr, ifIndex)
 

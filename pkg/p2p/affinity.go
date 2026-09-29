@@ -51,18 +51,37 @@ func localNATPunchPrefixes(selfTapName, selfTapIP, selfTapMAC string) []netip.Pr
 	if err != nil {
 		return nil
 	}
+	return collectLocalPrefixes(ifaces, selfTapName, wantMACOf(selfTapMAC), dropOverlay, haveOverlay)
+}
+
+func wantMACOf(s string) net.HardwareAddr {
+	if s == "" {
+		return nil
+	}
+	hw, _ := net.ParseMAC(s)
+	return hw
+}
+
+func collectLocalPrefixes(ifaces []net.Interface, selfTapName string, wantMAC net.HardwareAddr, dropOverlay netip.Prefix, haveOverlay bool) []netip.Prefix {
 	var out []netip.Prefix
 	seen := make(map[netip.Prefix]bool)
-	var wantMAC net.HardwareAddr
-	if selfTapMAC != "" {
-		wantMAC, _ = net.ParseMAC(selfTapMAC)
-	}
 	for i := range ifaces {
 		ifc := &ifaces[i]
 		// Identify our tap by MAC as well as by name. n2n assigns the edge
 		// MAC to the tap at construction, so this works on Windows (where the
 		// adapter has a system-assigned name and InterfaceByName fails) and
 		// before registration has told us the virtual IP.
+		// Skip interfaces that are down. A down interface cannot carry
+		// traffic, and counting its subnet here is worse than ignoring it:
+		// it hands a same-subnet bonus to the peer's address on that same
+		// dead interface, promoting an unreachable candidate above one
+		// that actually works. The field logs showed exactly that -- a
+		// disconnected WiFi's address promoted to candidate 0 while a peer
+		// address on a live link, provably reachable by ping, was pushed
+		// behind it.
+		if ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
 		isTap := (selfTapName != "" && ifc.Name == selfTapName) ||
 			(wantMAC != nil && len(ifc.HardwareAddr) > 0 &&
 				bytes.Equal(ifc.HardwareAddr, wantMAC))

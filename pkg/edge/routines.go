@@ -176,6 +176,11 @@ func (e *EdgeClient) executeNatHolePunchLoop() {
 	if e.natHolePunching.CompareAndSwap(false, true) {
 		go func() {
 			defer e.natHolePunching.Store(false)
+			// Bound the attribution window to this instruction: while it
+			// runs, a punch from an address we cannot match may still be
+			// this named peer behind a rewriting router.
+			e.setExpectedPunchPeerMAC(e.Peers.ExpectedPunchPeerMAC())
+			defer e.setExpectedPunchPeerMAC("")
 			e.Peers.ExecuteNatHolePunch(e.P2PConn)
 			// FRP writes real data immediately after the punch rather than
 			// waiting for the next user packet. With no user data queued
@@ -403,7 +408,7 @@ func (e *EdgeClient) sendPathVerificationProbe(p *p2p.Peer) {
 	if p.P2PStatus == p2p.P2PFullDuplex && p.IsFullDuplex {
 		return // already promoted; the keepalive ping is enough
 	}
-	if p.P2PRaddr == "" && p.UDPAddr() == nil {
+	if p.GetP2PRaddr() == "" && p.UDPAddr() == nil {
 		return // no known address to probe
 	}
 	checkid := fmt.Sprintf("vp.%s.%s.%d", e.ID, net.HardwareAddr(p.Infos.MacAddr).String(), time.Now().UnixNano())
@@ -441,7 +446,9 @@ func (e *EdgeClient) handleTAP() {
 		}
 
 		// Read directly into payload area to avoid a copy
+		frameStart := time.Now()
 		n, err := e.TAP.Read(frameBuf)
+		readDone := time.Now()
 		if err != nil {
 			if strings.Contains(err.Error(), "file already closed") {
 				return
@@ -506,6 +513,10 @@ func (e *EdgeClient) handleTAP() {
 						return
 					}
 					log.Printf("Error sending packet with enableVFuze from TAP: %v", err)
+				} else if d := time.Since(frameStart); d >= sendProbeSlowThreshold {
+					log.Printf("[TAP-SLOW] frame=%v read=%v process=%v bytes=%d dst=%s strat=%v path=vfuze",
+						d.Truncate(time.Microsecond), readDone.Sub(frameStart).Truncate(time.Microsecond),
+						time.Since(readDone).Truncate(time.Microsecond), n, destMAC, strategy)
 				}
 				continue
 			}
@@ -517,6 +528,17 @@ func (e *EdgeClient) handleTAP() {
 				return
 			}
 			log.Printf("Error sending packet to supernode: %v", err)
+		}
+
+		// Whole-frame probe: TAP read -> parse -> route -> write, on the one
+		// goroutine every outbound frame shares. WritePacket's own [SEND-SLOW]
+		// line names the send half; this catches a frame that was slow for some
+		// other reason (parsing, a blocking ARP path, or a long stall in the
+		// read itself) so the two probes together account for the whole loop.
+		if d := time.Since(frameStart); d >= sendProbeSlowThreshold {
+			log.Printf("[TAP-SLOW] frame=%v read=%v process=%v bytes=%d dst=%s strat=%v ptype=%v",
+				d.Truncate(time.Microsecond), readDone.Sub(frameStart).Truncate(time.Microsecond),
+				time.Since(readDone).Truncate(time.Microsecond), n, destMAC, strategy, spec.TypeData)
 		}
 	}
 }
@@ -565,6 +587,26 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 			log.Printf("[P2P] Ignoring punch ACK from unknown peer at %v", addr)
 			return
 		}
+		// Before giving up, check whether we are mid-instruction with a peer
+		// the supernode named. A router that forwards the punch and rewrites
+		// the source address produces a source neither side ever advertised,
+		// so both lookups above miss -- and the path then dies even though
+		// the packets are demonstrably arriving. Attributing it to the peer
+		// the instruction already names records a fact about a peer known to
+		// exist; it is not the fabrication the branch above is guarding
+		// against, and the window closes with the instruction.
+		if mac := e.loadExpectedPunchPeerMAC(); mac != "" {
+			if named, nerr := e.Peers.GetPeer(mac); nerr == nil && named != nil {
+				log.Printf("[P2P] Punch packet from %v attributed to instruction peer %s (source address was rewritten in transit)", addr, mac)
+				if named.AllowPunchAck(now) {
+					e.sendPunchAck(addr)
+				}
+				named.NotePunchPacket()
+				named.SetP2PRaddr(addr.String())
+				e.Peers.IndexPeerRaddr(named, addr.String())
+				return
+			}
+		}
 		if e.allowUnknownPunchAck(addr.String(), now) {
 			log.Printf("[P2P] Punch packet from unknown peer at %v — answering once", addr)
 			e.sendPunchAck(addr)
@@ -593,6 +635,7 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 	// must target it. This is also what lets a restarted peer — whose NAT port
 	// has changed — be re-learned without a supernode round trip.
 	p.SetP2PRaddr(addr.String())
+	e.Peers.IndexPeerRaddr(p, addr.String())
 
 	if !p.AllowPunchPublish(now) {
 		// State is already current for this peer; skip the supernode-facing
@@ -602,23 +645,61 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 	}
 
 	if changed, ferr := p.SetFullDuplex(true); changed {
-		log.Printf("[P2P] FullDuplex established with %s (punch evidence from %v)", mac, addr)
+		// SetFullDuplex refuses to promote on punch evidence alone, so
+		// reaching here means some data path has already been verified for
+		// this peer. The wording matters: an operator reading "punch
+		// evidence" here would reasonably conclude the hole is enough, which
+		// is precisely the assumption that caused the outage.
+		log.Printf("[P2P] FullDuplex established with %s (punch from %v, data path already verified)", mac, addr)
 		e.Peers.SetPendingChanges()
 	} else if ferr != nil {
 		log.Printf("[P2P] punch from %s could not set FullDuplex: %v", mac, ferr)
 	}
 
-	// Tell the relay the round succeeded, otherwise it keeps pushing fresh
+	// A punch packet proves the hole is open, not that the tunnel carries
+	// data. Under this NAT pair the two routinely diverge: a restarted peer
+	// re-punches cleanly, the relay records a success, and the path still
+	// never comes up because P2PRaddr is the only thing that can fill it and
+	// nothing is flowing yet. On 2026-09-29 that cost a five-minute outage
+	// after each edge restart.
+	//
+	// So report the round as still in progress and let the data-frame path
+	// below be the only thing that claims success. The relay suppresses a
+	// pair the moment it sees Succeeded, so claiming it on punch evidence
+	// alone is what strands the pair.
+	if p.IsFullDuplex && p.HasVerifiedDataPath() {
+		e.Peers.RecordNatHolePunchResult(
+			mac,
+			p2p.NatHolePunchState_PunchStateSucceeded, 1,
+			fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
+			e.Peers.CurrentNatHoleBehaviorIndex(mac))
+	} else {
+		e.Peers.RecordNatHolePunchResult(
+			mac,
+			p2p.NatHolePunchState_PunchStateInProgress, 1,
+			fmt.Sprintf("punch %s observed from %s, data path not yet verified",
+				map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
+			e.Peers.CurrentNatHoleBehaviorIndex(mac))
+	}
+	// Tell the relay the round advanced, otherwise it keeps pushing fresh
 	// instructions at an already-established tunnel.
 	e.Peers.SetPendingChanges()
-	e.Peers.RecordNatHolePunchResult(
-		mac,
-		p2p.NatHolePunchState_PunchStateSucceeded, 1,
-		fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
-		// Name the rung this success belongs to, so the relay's per-pair
-		// strategy memory credits the ladder entry that actually worked
-		// rather than whatever it last happened to dispatch.
-		e.Peers.CurrentNatHoleBehaviorIndex(mac))
+}
+
+// setExpectedPunchPeerMAC / loadExpectedPunchPeerMAC guard the attribution
+// window, which is written on the punch goroutine and read on the packet
+// reader goroutine.
+func (e *EdgeClient) setExpectedPunchPeerMAC(mac string) {
+	e.expectedPunchPeerMACMu.Lock()
+	e.expectedPunchPeerMAC = mac
+	e.expectedPunchPeerMACMu.Unlock()
+}
+
+func (e *EdgeClient) loadExpectedPunchPeerMAC() string {
+	e.expectedPunchPeerMACMu.RLock()
+	mac := e.expectedPunchPeerMAC
+	e.expectedPunchPeerMACMu.RUnlock()
+	return mac
 }
 
 // allowUnknownPunchAck rate-limits ACK replies to sources that match no known
@@ -752,9 +833,31 @@ func (e *EdgeClient) handleP2P() {
 			if p, perr := e.Peers.GetPeerBySocket(addr); perr == nil {
 				p.NoteDataPacket()
 				if changed, _ := p.SetFullDuplex(true); changed {
+					mac := net.HardwareAddr(p.Infos.MacAddr).String()
 					log.Printf("[P2P] FullDuplex established with %s (verified by real data frame from %v)",
-						net.HardwareAddr(p.Infos.MacAddr).String(), addr)
-					e.Peers.SetPendingChanges()
+						mac, addr)
+					// Report the success to the relay. This is the
+					// authoritative path: SetFullDuplex only promotes once a
+					// real data frame has been verified, so reaching here
+					// means the tunnel is genuinely up.
+					//
+					// Without this the relay never learns the round
+					// succeeded. It only ever sees the InProgress/Failed
+					// reports written by ExecuteNatHolePunch, so it keeps
+					// re-issuing NatHoleInstruction for a pair that is
+					// already connected -- observed as instructions every
+					// 5 minutes (the 300s backoff cap) long after FullDuplex.
+					//
+					// The punch-packet path above reports too, but the two
+					// never both fire: each keys off the same SetFullDuplex
+					// transition, and `changed` is true only on the first.
+					// Reporting from both would credit the behaviour ladder
+					// twice for one round.
+					e.Peers.RecordNatHolePunchResult(
+						mac,
+						p2p.NatHolePunchState_PunchStateSucceeded, 1,
+						fmt.Sprintf("verified by real data frame from %s", addr),
+						e.Peers.CurrentNatHoleBehaviorIndex(mac))
 				}
 			}
 		}

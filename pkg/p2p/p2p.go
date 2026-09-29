@@ -68,7 +68,17 @@ type Peer struct {
 	// equivalent in FRP — the actual address through which the peer can
 	// be reached (accounting for Symmetric NAT port remapping), which may
 	// differ from the STUN-discovered pubSocket.
-	P2PRaddr string
+	//
+	// Written from the receive goroutine on every punch/ACK and read from the
+	// data path on every packet (UDPAddrWithStrategy), so it is guarded by
+	// raddrMu. Use GetP2PRaddr/SetP2PRaddr rather than touching the field.
+	P2PRaddr   string
+	raddrMu    sync.RWMutex
+	// indexedRaddr is the key currently held in PeerRegistry.peerBySocket on
+	// this peer's behalf as an observed raddr. Guarded by the registry's
+	// peerMu, not by P2PRaddr: P2PRaddr is assigned before the index is
+	// updated, so it cannot be used to find what to retire.
+	indexedRaddr string
 
 	// punchSeenAt is when we last received a punch/ACK packet from this
 	// peer, and dataSeenAt when we last received a real ProtoV data frame
@@ -134,7 +144,7 @@ func (p *Peer) LogRouteDecision(strategy string, udpSocket *net.UDPAddr, isP2P b
 	if isP2P {
 		path = "p2p"
 	}
-	key := fmt.Sprintf("%s|%s|%s|%s", p.P2PStatus.String(), p.P2PRaddr, p.UDPAddr(), path)
+	key := fmt.Sprintf("%s|%s|%s|%s", p.P2PStatus.String(), p.GetP2PRaddr(), p.UDPAddr(), path)
 
 	p.routeDbgMu.Lock()
 	changed := key != p.routeDbgKey
@@ -147,7 +157,7 @@ func (p *Peer) LogRouteDecision(strategy string, udpSocket *net.UDPAddr, isP2P b
 
 	if changed || due {
 		log.Printf("[P2P-DEBUG] route to %s: P2PStatus=%s P2PRaddr=%s pubSocket=%s strat=%s via %s (%s)",
-			net.HardwareAddr(p.Infos.MacAddr).String(), p.P2PStatus, p.P2PRaddr, p.UDPAddr(), strategy, path, target)
+			net.HardwareAddr(p.Infos.MacAddr).String(), p.P2PStatus, p.GetP2PRaddr(), p.UDPAddr(), strategy, path, target)
 	}
 }
 
@@ -161,17 +171,81 @@ func (p *Peer) SetP2PCapabilities(caps []string) {
 	p.P2PCapabilities = caps
 }
 
+// GetP2PRaddr returns the peer's observed NAT-mapped source address.
+//
+// The data path calls this once per packet, so the read lock is taken and
+// released here rather than by the caller reaching into the field.
+func (p *Peer) GetP2PRaddr() string {
+	p.raddrMu.RLock()
+	defer p.raddrMu.RUnlock()
+	return p.P2PRaddr
+}
+
 // SetP2PRaddr stores the NAT-mapped source address observed when receiving
 // packets from this peer. This is the actual reachable address under
 // Symmetric NAT (where the STUN-discovered port may differ).
 func (p *Peer) SetP2PRaddr(addr string) {
+	p.raddrMu.Lock()
 	p.P2PRaddr = addr
+	p.raddrMu.Unlock()
 }
 
 // NotePunchPacket records that a punch/ACK arrived from this peer.
 //
 // It deliberately does NOT promote the peer to FullDuplex. See the comment on
 // punchSeenAt/dataSeenAt: a punch alone is not proof the data path works.
+// IndexPeerRaddr makes the peer's observed raddr resolvable by
+// GetPeerBySocket, and retires the previous one.
+//
+// The raddr is the source address a packet from this peer actually arrived
+// from, which under SNAT is an address neither side ever advertised: the
+// router's own WAN address. It therefore cannot appear in the assisted set
+// that lookupSockets indexes, so a data frame arriving from it failed the
+// lookup, was never attributed, and the peer was never promoted to
+// FullDuplex -- even though the packets were demonstrably getting through.
+// Punch packets escaped this only because they are matched by MAC through a
+// separate attribution window, which is why the hole looked punched while
+// the data path stayed dead.
+func (reg *PeerRegistry) IndexPeerRaddr(p *Peer, raddr string) {
+	if reg == nil || p == nil || raddr == "" {
+		return
+	}
+	key := normalizeSocketKey(raddr)
+
+	reg.peerMu.Lock()
+	defer reg.peerMu.Unlock()
+
+	// Retire the previously indexed raddr, but only if it is not also a
+	// legitimately advertised address -- deleting a pubSocket or assisted key
+	// here would break lookups that still need to resolve. The previous key
+	// comes from indexedRaddr, not from p.P2PRaddr: callers assign P2PRaddr
+	// before calling this, so reading it back would always yield the new key
+	// and the old one would live forever.
+	if prev := p.indexedRaddr; prev != "" && prev != key {
+		advertised := make(map[string]bool)
+		for _, k := range p.lookupSockets() {
+			advertised[k] = true
+		}
+		if !advertised[prev] {
+			if owner, ok := reg.peerBySocket[prev]; ok && owner == p {
+				delete(reg.peerBySocket, prev)
+			}
+		}
+	}
+	p.indexedRaddr = key
+	reg.peerBySocket[key] = p
+}
+
+func normalizeSocketKey(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if ua, err := net.ResolveUDPAddr("udp", raw); err == nil && ua != nil {
+		return ua.String()
+	}
+	return raw
+}
+
 func (p *Peer) NotePunchPacket() {
 	p.punchSeenAt = time.Now()
 }
@@ -356,6 +430,8 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 }
 
 func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
 	if reg.Me == nil {
 		return &PeerP2PInfos{}
 	}
@@ -368,19 +444,27 @@ func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
 		// instead of the STUN snapshot (which may be stale or bound to a
 		// different NAT mapping).
 		infos := v.Infos
-		if v.P2PRaddr != "" {
-			infos.ObservedRaddr = v.P2PRaddr
+		if vrd := v.GetP2PRaddr(); vrd != "" {
+			infos.ObservedRaddr = vrd
 		}
 		// Attach our latest punch outcome for this peer so the relay learns
 		// whether to keep pushing instructions (in-progress/failed) or stop
 		// entirely (succeeded). Reports are per-peer and carry the MAC they
 		// refer to, so the relay never has to guess whose round this was.
-		reg.peerMu.RLock()
+		// Already holding peerMu.RLock for the whole traversal above; taking
+		// it again here would risk a recursive-read deadlock against a waiting
+		// writer.
 		res := reg.natHolePunchResults[macAddrStr(v.Infos.MacAddr)]
-		reg.peerMu.RUnlock()
 		if res != nil {
 			infos.PunchResult = res
 			infos.PunchResultPeerMac = macAddrStr(v.Infos.MacAddr)
+			// Report the current status toward that same peer alongside the
+			// outcome, so the relay can tell whether a success it recorded
+			// still describes a live tunnel. Without this the relay only
+			// learns that a punch once worked, never that it stopped, and
+			// has to either suppress the pair forever or re-punch a healthy
+			// one -- both seen in the field.
+			infos.P2PStatus = uint32(v.P2PStatus)
 		}
 		to = append(to, &infos)
 	}
@@ -469,6 +553,89 @@ func (p *Peer) lookupSockets() []string {
 		}
 		seen[key] = true
 		out = append(out, key)
+	}
+	return out
+}
+
+// receiverPunchCandidates ranks the addresses a receiver should punch at
+// its sender, best first.
+//
+// The pubSocket is kept, but not first: it is the hardest path whenever both
+// ends sit behind the same carrier NAT, because it can only work if the CGNAT
+// hairpins. The sender's own LAN addresses come first when one of them is on
+// a subnet we share, since that is direct routing by definition.
+//
+// The sender's overlay address is dropped. Our registry already knows their
+// virtual IP, and punching an address inside the overlay delivers the packet
+// back through the tunnel -- the self-referential path that made one node log
+// 16779 packets from a peer's tap address.
+func receiverPunchCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSocket *net.UDPAddr) []*net.UDPAddr {
+	return rankReceiverCandidates(instr, reg, pubSocket,
+		localNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC()))
+}
+
+func rankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSocket *net.UDPAddr, localPrefixes []netip.Prefix) []*net.UDPAddr {
+	var out []*net.UDPAddr
+	seen := make(map[string]bool)
+	add := func(a *net.UDPAddr) {
+		if a == nil || a.IP == nil || seen[a.String()] {
+			return
+		}
+		seen[a.String()] = true
+		out = append(out, a)
+	}
+
+	// The sender is identified by its pubSocket, not by TargetMac: in this
+	// instruction TargetMac is the *receiver*, so the sender branch uses it
+	// to look up the receiver's addresses. Reading it here would have found
+	// our own overlay IP and filtered the wrong address.
+	var peerTapIP string
+	if reg != nil && pubSocket != nil {
+		if sp := reg.LookupPeerByPubSocket(pubSocket.String()); sp != nil {
+			peerTapIP = sp.Infos.GetVirtualIp()
+		}
+	}
+
+	var sameSubnet, rest []*net.UDPAddr
+	for _, raw := range instr.GetSenderAssistedEndpoints() {
+		if raw == "" {
+			continue
+		}
+		ep, err := net.ResolveUDPAddr("udp", raw)
+		if err != nil || ep == nil || ep.IP == nil {
+			continue
+		}
+		// The sender's own tap: never a punch target.
+		if peerTapIP != "" && ep.IP.Equal(net.ParseIP(peerTapIP)) {
+			continue
+		}
+		// Loopback and link-local can never be punched across.
+		if ep.IP.IsLoopback() || ep.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		if addrInLocalPrefix(ep.IP, localPrefixes) {
+			sameSubnet = append(sameSubnet, ep)
+		} else {
+			rest = append(rest, ep)
+		}
+	}
+
+	for _, a := range sameSubnet {
+		add(a)
+	}
+	add(pubSocket)
+	for _, a := range rest {
+		add(a)
+	}
+	return out
+}
+
+func addrStrings(list []*net.UDPAddr) []string {
+	out := make([]string, 0, len(list))
+	for _, a := range list {
+		if a != nil {
+			out = append(out, a.String())
+		}
 	}
 	return out
 }
@@ -871,6 +1038,11 @@ func parseUDPAddr(socket string) *net.UDPAddr {
 }
 
 func (reg *PeerRegistry) GetP2PUnknownPeers() []*Peer {
+	// reg.Peers is mutated under peerMu by AddPeer/RemovePeer; iterating it
+	// without the read lock races those writers (and can trip Go's concurrent
+	// map access detector).
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
 	var peerlist []*Peer
 	for _, p := range reg.Peers {
 		if p.P2PStatus == P2PUnknown {
@@ -881,6 +1053,11 @@ func (reg *PeerRegistry) GetP2PUnknownPeers() []*Peer {
 }
 
 func (reg *PeerRegistry) GetP2PendingPeers() []*Peer {
+	// reg.Peers is mutated under peerMu by AddPeer/RemovePeer; iterating it
+	// without the read lock races those writers (and can trip Go's concurrent
+	// map access detector).
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
 	var peerlist []*Peer
 	for _, p := range reg.Peers {
 		if p.P2PStatus == P2PPending {
@@ -895,6 +1072,11 @@ func (reg *PeerRegistry) GetP2PendingPeers() []*Peer {
 }
 
 func (reg *PeerRegistry) GetP2PAvailablePeers() []*Peer {
+	// reg.Peers is mutated under peerMu by AddPeer/RemovePeer; iterating it
+	// without the read lock races those writers (and can trip Go's concurrent
+	// map access detector).
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
 	var peerlist []*Peer
 	for _, p := range reg.Peers {
 		if p.P2PStatus == P2PAvailable {
@@ -917,6 +1099,11 @@ func (reg *PeerRegistry) GetP2PAvailablePeers() []*Peer {
 // punched by the remote while we never ran one ourselves, and that is exactly
 // the case where the probe is needed most.
 func (reg *PeerRegistry) GetPunchedNotFullDuplexPeers() []*Peer {
+	// reg.Peers is mutated under peerMu by AddPeer/RemovePeer; iterating it
+	// without the read lock races those writers (and can trip Go's concurrent
+	// map access detector).
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
 	var peerlist []*Peer
 	for _, p := range reg.Peers {
 		if p.P2PStatus == P2PFullDuplex && p.IsFullDuplex {
@@ -936,6 +1123,11 @@ func (reg *PeerRegistry) GetPunchedNotFullDuplexPeers() []*Peer {
 // nothing came back within the timeout, demotes the peer so routing falls
 // back to the relay and a fresh punch is scheduled.
 func (reg *PeerRegistry) GetFullDuplexPeers() []*Peer {
+	// reg.Peers is mutated under peerMu by AddPeer/RemovePeer; iterating it
+	// without the read lock races those writers (and can trip Go's concurrent
+	// map access detector).
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
 	var peerlist []*Peer
 	for _, p := range reg.Peers {
 		if p.P2PStatus == P2PFullDuplex && p.IsFullDuplex {
@@ -1339,6 +1531,49 @@ func waitForPunchSuccess(reg *PeerRegistry, targetMACStr string, label string) b
 // executeNatHolePunch performs the relay-coordinated NAT hole punching.
 // The caller must provide the P2P UDP connection to use for sending/receiving.
 // Returns true if FullDuplex was achieved.
+// ExpectedPunchPeerMAC returns the MAC of the peer the pending
+// NatHoleInstruction is about, or "" when there is no instruction.
+//
+// The caller uses it to bound how long it will attribute a punch arriving
+// from an unrecognised source address. The instruction names the peer, so
+// the peer is known to exist; what is unknown is only the address it is
+// currently reachable at, which a forwarding router may have rewritten.
+func (reg *PeerRegistry) ExpectedPunchPeerMAC() string {
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
+
+	// "Us" is never a valid answer: GetPeer on our own MAC always misses,
+	// which silently degrades the attribution window to its fallback branch.
+	var self string
+	if reg.Me != nil {
+		self = macAddrStr(reg.Me.Infos.GetMacAddr())
+	}
+
+	for _, instr := range reg.natHoleInstrs {
+		var sender, target string
+		if sm := instr.GetSenderMac(); len(sm) > 0 {
+			sender = macAddrStr(sm)
+		}
+		if tm := instr.GetTargetMac(); len(tm) > 0 {
+			target = macAddrStr(tm)
+		}
+		// TargetMac, not SenderMac. handleNatHoleInstruction rebuilds the
+		// instruction with SenderMac overwritten to our own MAC, so SenderMac
+		// is "us" in the rebuilt copy and names nobody. TargetMac is the
+		// peer at the other end of this punch in both roles: for a receiver
+		// instruction the Worker fills it with the sender's MAC, for a
+		// sender instruction with the receiver's.
+		if target != "" && target != self {
+			return target
+		}
+		if sender != "" && sender != self {
+			return sender
+		}
+		return ""
+	}
+	return ""
+}
+
 func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 	reg.peerMu.RLock()
 	var instr *NatHoleInstruction
@@ -1368,6 +1603,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 	// For the sender, look up the target peer's pubSocket from our registry.
 	var punchTarget string
 	if role == NatHoleRole_DetectRoleSender {
+		// Sender: send UDP punch packets to the target's public socket.
 		targetMAC := instr.GetTargetMac()
 		if targetMAC != nil && len(targetMAC) > 0 {
 			targetMACStr := macAddrStr(targetMAC)
@@ -1439,6 +1675,13 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 		log.Printf("[P2P] executeNatHolePunch: cannot resolve target %s: %v", punchTarget, err)
 		return false
 	}
+
+	// punchExchanged records whether the peer actually answered our punch
+	// packets this round. It is a separate signal from FullDuplex: reaching
+	// the peer proves the mapping opened, while FullDuplex additionally
+	// requires a verified data frame, so a round can be genuinely productive
+	// and still not be FullDuplex yet. The two are reported differently.
+	punchExchanged := false
 
 	if role == NatHoleRole_DetectRoleSender {
 		// Sender: send UDP punch packets to the target's public socket.
@@ -1569,13 +1812,13 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// it lands on nothing. FRP has the same property and solves
 				// it by always replying to the observed raddr; here we go one
 				// step further and punch straight at the observed address.
-				if p.P2PRaddr != "" {
-					if ra, err2 := net.ResolveUDPAddr("udp", p.P2PRaddr); err2 == nil && ra != nil {
+				if pRaddr := p.GetP2PRaddr(); pRaddr != "" {
+					if ra, err2 := net.ResolveUDPAddr("udp", pRaddr); err2 == nil && ra != nil {
 						// Put the observed address FIRST so it is tried
 						// before any predicted/published candidates.
 						candidates = append([]*net.UDPAddr{ra}, candidates...)
 						log.Printf("[P2P] Sender: using OBSERVED raddr %s for target %s (ahead of predicted candidates)",
-							p.P2PRaddr, macAddrStr(targetMAC))
+							pRaddr, macAddrStr(targetMAC))
 					}
 				}
 				// The receiver's own LAN addresses -- FRP's m.AssistedAddrs,
@@ -1721,7 +1964,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 
 		// Long wait, as FRP's waitDetectMessage does.
 		if tm := instr.GetTargetMac(); tm != nil && len(tm) > 0 {
-			waitForPunchSuccess(reg, macAddrStr(tm), "Sender")
+			punchExchanged = waitForPunchSuccess(reg, macAddrStr(tm), "Sender")
 		} else {
 			// Without a target MAC there is nothing to poll; fall back to
 			// the same timeout so the round still lasts as long as FRP's.
@@ -1796,7 +2039,31 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 					log.Printf("[P2P] Receiver: ladder entry mode=%d index=%d carries no TTL — sending the probe with the socket's normal TTL (full path)",
 						instr.GetMode(), instr.GetBehaviorIndex())
 				}
-				probeTargets := []*net.UDPAddr{senderAddr}
+				// The receiver used to punch exactly one address: the
+				// sender's pubSocket. The note above says
+				// SenderAssistedEndpoints is "usable by the RECEIVER", but
+				// this branch never read it, so every one of the five
+				// attempts re-sent the same datagram to the same place.
+				//
+				// That is fatal precisely in the case that should be
+				// easiest. Two hosts behind one carrier NAT share a public
+				// address, so punching it means asking the CGNAT to hairpin
+				// to itself -- which carrier-grade NATs generally refuse. The
+				// field log for a same-ISP pair showed exactly that: five
+				// attempts, all to 111.101.5.1:45848, all failed, while the
+				// sender using its full candidate list reached the peer over
+				// P2P. The receiver's own LAN addresses are the ones that can
+				// actually work, and the instruction carries them.
+				//
+				// Ranked the same way the sender ranks them, so a sender on
+				// our own subnet is punched first.
+				receiverCands := receiverPunchCandidates(instr, reg, senderAddr)
+				if len(receiverCands) > 1 {
+					log.Printf("[P2P] Receiver: sender has %d reachable candidate(s) %v, ranked ahead of the pubSocket %s",
+						len(receiverCands)-1, addrStrings(receiverCands), punchTarget)
+				}
+
+				probeTargets := receiverCands
 				for port := int(portsFrom); port >= 1 && port <= int(portsTo) && len(probeTargets) < 32; port++ {
 					if port == senderAddr.Port {
 						continue
@@ -1813,10 +2080,17 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// (like the sender branch) conflated the IP hop limit with a
 				// packet count and finished sending before the peer's mapping
 				// could plausibly have existed.
-				if err := sendPunchOnce(p2pConn, punchPacket, senderAddr, ttl, "Receiver"); err != nil {
-					log.Printf("[P2P] Receiver: punch to sender %s failed: %v", senderAddr.String(), err)
-				} else {
-					log.Printf("[P2P] Receiver: punched sender %s once (ttl=%d)", senderAddr.String(), ttl)
+				// The mapping we need is created by the datagrams leaving us,
+				// so every candidate is worth one -- not just the pubSocket.
+				for ci, cand := range receiverCands {
+					if cand == nil {
+						continue
+					}
+					if err := sendPunchOnce(p2pConn, punchPacket, cand, ttl, "Receiver"); err != nil {
+						log.Printf("[P2P] Receiver: punch to candidate %d %s failed: %v", ci, cand.String(), err)
+					} else {
+						log.Printf("[P2P] Receiver: punched candidate %d %s once (ttl=%d)", ci, cand.String(), ttl)
+					}
 				}
 
 				// Port scanning for HardNAT only. A zero range means Mode 0
@@ -1835,7 +2109,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 			// same observable: handleP2P sets FullDuplex when it recognises the
 			// peer's punch magic and ACKs the peer's source address.
 			if tm := instr.GetTargetMac(); tm != nil && len(tm) > 0 {
-				waitForPunchSuccess(reg, macAddrStr(tm), "Receiver")
+				punchExchanged = waitForPunchSuccess(reg, macAddrStr(tm), "Receiver")
 			} else {
 				log.Printf("[P2P] Receiver: instruction carries no target MAC, waiting %s without a success check", natHoleReadTimeout)
 				time.Sleep(natHoleReadTimeout)
@@ -1908,7 +2182,23 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 			if retryCount >= 0 && retryCount < 5 {
 				// Increment retry count and keep instruction for next cycle.
 				reg.natHoleRetryCounts[instrKey] = retryCount + 1
-				log.Printf("[P2P] NatHole punch attempt %d/5 failed (no FullDuplex yet), will retry in ~2s", retryCount+1)
+				// Two very different situations land here, and calling both
+				// "failed" sent a reader (me, once) looking for a relay-side
+				// penalty that does not exist: the state reported below is
+				// InProgress in both cases, and the relay escalates nothing.
+				//
+				//   - punch exchanged, data path unverified: the mapping is
+				//     open and the round did its job. The data frame is
+				//     usually already in flight; it becomes FullDuplex a
+				//     moment later.
+				//   - nothing came back: a genuine miss worth retrying.
+				if punchExchanged {
+					log.Printf("[P2P] NatHole punch attempt %d/5: peer punched back, data path not yet verified — reporting InProgress, retrying in ~2s",
+						retryCount+1)
+				} else {
+					log.Printf("[P2P] NatHole punch attempt %d/5 failed (no packet from peer), will retry in ~2s",
+						retryCount+1)
+				}
 				// Tell the relay a round is still in flight so it does not
 				// push a duplicate instruction while we are still working.
 				if currentInstr != nil {
