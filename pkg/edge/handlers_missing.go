@@ -219,29 +219,42 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 
 	if ourRole == p2p.NatHoleRole_DetectRoleSender {
 		// We are the sender; the target is the receiver.
-		// Look up the receiver's P2P endpoint from the registry.
-		// Try P2PAvailable peers first (preferred — peer has confirmed P2P connectivity).
-		peers := e.Peers.GetP2PAvailablePeers()
-		for _, p := range peers {
-			if macBytesToStr(p.Infos.MacAddr) == targetMAC {
-				targetP2PEndpoint = p.P2PEndpoint
-				targetPubSocket = p.Infos.PubSocket
-				break
-			}
+		//
+		// Prefer the endpoint the relay put in the instruction. It is
+		// assembled from the receiver's most recent PeerInfo/P2PStateInfo, so
+		// it is the freshest address we have. The local registry is NOT
+		// authoritative here: it keeps a record per MAC per update source, and
+		// a peer re-punching allocates a fresh temporary UDP socket each time
+		// (the long-lived socket is separate), so the registry accumulates
+		// dead ports -- four of them for one peer was observed (48976, 58634,
+		// 59679, 59833) while that peer had exactly one live socket.
+		//
+		// Looking the target up in the registry first, as this used to, picked
+		// whichever record came first in map iteration order and punched a port
+		// that no longer existed. The receiver was punching the right address
+		// all along, so the pair failed in one direction only -- and every
+		// punch round burned all 5 retries against a closed port.
+		targetP2PEndpoint = senderP2PEndpoint
+		targetPubSocket = senderPubSocket
+		if targetP2PEndpoint != "" {
+			log.Printf("NatHoleInstruction: sender using relay-supplied target %s (pubSocket %s)",
+				targetP2PEndpoint, targetPubSocket)
 		}
-		// Fallback: look up by MAC directly from registry. The Worker
-		// broadcasts the full PeerInfoList (with the target's P2P info)
-		// before P2P availability is confirmed, causing a race where the
-		// target is in the registry but its P2PStatus is still P2PUnknown.
+
+		// The relay may have omitted the endpoint (older relay, or a target
+		// that never reported P2P info). Fall back to the registry then. We
+		// deliberately take the freshest record rather than the first match,
+		// since several may exist for one MAC.
 		if targetP2PEndpoint == "" {
 			if p, err := e.Peers.GetPeer(targetMAC); err == nil {
 				targetP2PEndpoint = p.P2PEndpoint
 				targetPubSocket = p.Infos.PubSocket
-				log.Printf("NatHoleInstruction: found target %s in registry (P2PStatus=%s) via fallback GetPeer", targetMAC, p.P2PStatus.String())
+				log.Printf("NatHoleInstruction: relay omitted target endpoint; fell back to registry for %s (P2PStatus=%s endpoint=%s pubSocket=%s)",
+					targetMAC, p.P2PStatus.String(), targetP2PEndpoint, targetPubSocket)
 			}
 		}
 		if targetP2PEndpoint == "" {
-			log.Printf("[Edge] NatHoleInstruction: sender cannot find target %s in P2P registry", targetMAC)
+			log.Printf("[Edge] NatHoleInstruction: sender cannot resolve target %s endpoint (relay gave none, registry has none)", targetMAC)
 			return nil
 		}
 	} else {

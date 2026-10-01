@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors" // Import errors package
 	"fmt"
+	"io"
 	stdlog "log" // Use alias to avoid conflict with package name
 	"os"
 	"path"
@@ -127,7 +128,27 @@ func (w *sqliteWriter) close() error {
 // --- Package Initialization and Configuration ---
 
 func SetStd() {
+	mu.Lock()
+	defer mu.Unlock()
 	pkgLogger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Logger()
+}
+
+// SetOutput points the package logger at an arbitrary writer.
+//
+// It exists so a test can assert on what a code path does and does not log --
+// "this branch is silent" is a property worth pinning, and asserting it needs
+// somewhere to read from. Passing nil restores the silent default.
+//
+// Note that Printf/Print go to pkgLogger only; the stdlib log calls some files
+// still make do not come through here.
+func SetOutput(w io.Writer) {
+	mu.Lock()
+	defer mu.Unlock()
+	if w == nil {
+		pkgLogger = zerolog.Nop()
+		return
+	}
+	pkgLogger = zerolog.New(zerolog.ConsoleWriter{Out: w, TimeFormat: time.RFC3339}).With().Timestamp().Logger()
 }
 
 func Init(dbFile string) error {

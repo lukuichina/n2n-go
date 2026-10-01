@@ -3,6 +3,7 @@ package natclient
 import (
 	"fmt"
 	"n2n-go/pkg/log"
+	"n2n-go/pkg/p2p"
 	"net"
 	"strings"
 	"time"
@@ -44,7 +45,7 @@ func SetupNAT(conn *net.UDPConn, edgeID string, dialAddr string) NATClient {
 		return nil
 	}
 	ipv4 := net.ParseIP(localIP)
-	if !ipv4.IsPrivate() {
+	if isPublicRoutable(ipv4) {
 		log.Printf("NAT Setup: found public/routable local ip: %s no further nat setup is required", localIP)
 		return nil
 	}
@@ -153,23 +154,46 @@ func getLocalIP(dialAddr string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to get interface addresses: %w", err)
 		}
+		// Rank the candidates and take the best one. Returning whichever
+		// address happened to come first was the bug: on a host running an
+		// overlay tunnel -- NetBird, WireGuard, all drawing from 100.64.0.0/10
+		// -- the tunnel's address won and was then reported as "found
+		// public/routable local ip" (observed 2026-09-30: 100.101.102.21 and
+		// 100.76.83.147). A public address outranks every private and overlay
+		// one, so a host that has both now keeps the right answer.
 		var fallbackIP string
+		var public, private, overlay string
 		for _, address := range addrs {
-			if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				ipv4 := ipnet.IP.To4()
-				if ipv4 != nil {
-					if !ipv4.IsLinkLocalUnicast() { // Skip 169.254.x.x
-						//if !ipv4.IsPrivate() {
-						return ipv4.String(), nil // Found a public-ish IP, use it
-						//}
-						//if fallbackIP == "" { // Store the first private IP found
-						//	fallbackIP = ipv4.String()
-						//}
-					}
+			ipnet, ok := address.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ipv4 := ipnet.IP.To4()
+			switch {
+			case ipv4 == nil, ipv4.IsLoopback(), ipv4.IsLinkLocalUnicast():
+				continue
+			case isPublicRoutable(ipv4):
+				if public == "" {
+					public = ipv4.String()
+				}
+			case p2p.IsCGNATOverlayAddr(ipv4):
+				if overlay == "" {
+					overlay = ipv4.String()
+				}
+			default:
+				if private == "" {
+					private = ipv4.String()
 				}
 			}
 		}
-
+		if public != "" {
+			return public, nil
+		}
+		if private != "" {
+			fallbackIP = private
+		} else {
+			fallbackIP = overlay
+		}
 		// If we only found private IPs, return the first one
 		if fallbackIP != "" {
 			return fallbackIP, nil
@@ -203,4 +227,30 @@ func standardizeProtocol(protocol string) string {
 		return "UDP"
 	}
 	return "TCP" // Default to TCP if not UDP
+}
+
+
+// isPublicRoutable reports whether ip is reachable from the public internet, and
+// is the single test this package should use for that question.
+//
+// It replaces `!ip.IsPrivate()`, which is wrong in the direction that matters
+// here: Go's IsPrivate covers RFC1918 only, so every address in 100.64.0.0/10
+// -- carrier-grade NAT space, and the pool overlay tunnels are carved from --
+// counts as "not private" and therefore as public. On a host with NetBird that
+// made the tunnel address look like a public IP and short-circuited the UPnP
+// setup. This is the third copy of the CGNAT test in the tree, after
+// pkg/edge/natclassify.go and pkg/p2p/affinity.go; all three agree because they
+// share pkg/p2p's definition.
+func isPublicRoutable(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if v4.IsPrivate() || p2p.IsCGNATOverlayAddr(v4) {
+		return false
+	}
+	return v4.IsGlobalUnicast() && !v4.IsLinkLocalUnicast() && !v4.IsLoopback()
 }

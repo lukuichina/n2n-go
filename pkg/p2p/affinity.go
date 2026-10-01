@@ -108,6 +108,17 @@ func collectLocalPrefixes(ifaces []net.Interface, selfTapName string, wantMAC ne
 			if haveOverlay && dropOverlay.Contains(ip) {
 				continue
 			}
+			// Drop any other overlay tunnel's subnet for the same reason, more
+			// broadly. NetBird, WireGuard and friends also draw from the CGNAT
+			// pool, and a peer behind the same one hands us an address that
+			// scores as a perfect same-subnet match while being unreachable
+			// from the internet. Promoting it puts a punch target that can only
+			// work if that overlay is up -- and even then the traffic is
+			// delivered by the overlay, not by a hole we punched. The public
+			// candidate is the one that satisfies "public works, use public".
+			if isCGNATOverlay(ip) {
+				continue
+			}
 			ones, bits := n.Mask.Size()
 			// A non-canonical mask reports bits==0; skip rather than guess.
 			if !ip.Is4() || bits != 32 || ones <= 0 {
@@ -139,6 +150,17 @@ func affinityScore(addr netip.Addr, local []netip.Prefix) int {
 		return 0
 	}
 	addr = addr.Unmap()
+	// An address in the CGNAT pool is never a shared-LAN signal, whatever
+	// prefixes we were handed. NetBird, WireGuard and n2n itself all draw
+	// from 100.64.0.0/10, so two hosts behind the same overlay look like
+	// neighbours on a /10 -- far more specific than any public candidate --
+	// and the sort would then punch the overlay instead of the internet.
+	// Scoring it 0 here as well as dropping it in collectLocalPrefixes keeps
+	// the rule true for every caller, including the tests and any future one
+	// that assembles `local` some other way.
+	if isCGNATOverlay(addr) {
+		return 0
+	}
 	best := 0
 	for _, p := range local {
 		if p.Addr().Is4() != addr.Is4() {
@@ -210,3 +232,44 @@ func sameOrder(a, b []string) bool {
 // overlayPrefixBits is the width of the n2n overlay network, matching the
 // allocator's 100.64.0.0/10 default (supernode.NetworkAllocator).
 const overlayPrefixBits = 10
+
+// cgnatPrefix is RFC6598 carrier-grade NAT space, 100.64.0.0/10.
+//
+// It is also the pool that overlay networks draw from by default -- n2n itself
+// (see overlayPrefixBits above) and NetBird among them. A host running one of
+// those tunnels therefore owns an address here that a remote peer cannot reach
+// over the public internet, yet which looks perfectly "same-subnet" to the
+// affinity sort: the /10 the overlay assigns is far more specific than the
+// single-address prefix of a genuine public candidate, so affinityScore rates
+// it higher and promotes it to the front of the punch candidate list.
+//
+// The result is a hole punch that appears to succeed while actually being
+// delivered over the overlay -- the relay by another name -- and, because the
+// observed raddr then alternates between the overlay and the real public
+// address as packets arrive on either path, the peer's P2PRaddr flaps between
+// two values. Observed on 2026-09-30 with NetBird on both ends.
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// isCGNATOverlay reports whether addr belongs to the shared CGNAT pool that
+// overlay tunnels are carved from, i.e. an address that is not reachable from
+// the public internet and must not be treated as evidence of a shared LAN.
+func isCGNATOverlay(addr netip.Addr) bool {
+	return addr.Is4() && cgnatPrefix.Contains(addr)
+}
+
+// IsCGNATOverlayAddr is the net.IP form of isCGNATOverlay, for callers holding a
+// net.IP straight out of net.Interface.Addrs -- the assisted-address collector
+// in pkg/edge, which is the entry point that actually put a NetBird address
+// into senderAssisted on 2026-09-30. Keeping the single definition of "overlay
+// space" here is what stops a third copy of the CGNAT test from drifting the way
+// the ones in pkg/edge/natclassify.go and pkg/natclient/client.go already have.
+func IsCGNATOverlayAddr(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	return isCGNATOverlay(netip.AddrFrom4([4]byte(v4)))
+}

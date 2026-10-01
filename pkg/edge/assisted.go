@@ -3,6 +3,7 @@ package edge
 import (
 	"bytes"
 	"n2n-go/pkg/log"
+	"n2n-go/pkg/p2p"
 	"net"
 	"strconv"
 )
@@ -176,6 +177,25 @@ func collectAssistedIPs(ifaces []net.Interface, maxCount int, excluded map[strin
 			if ip.IsLinkLocalUnicast() {
 				continue
 			}
+			// Skip the CGNAT pool (100.64.0.0/10). This is the other source of
+			// addresses that are local, up, and not ours -- an overlay tunnel
+			// running on this host. NetBird, WireGuard and friends all draw
+			// from it, as does n2n itself, so excluding only our own tap (see
+			// ListLocalIPsForNatHoleExcluding) still leaks the tunnel's address
+			// into the assisted list.
+			//
+			// Advertising it is actively harmful, and this is the entry point
+			// rather than the scoring path: the address reaches the peer inside
+			// senderAssisted and the peer tries it first. When both ends run
+			// the same overlay the peer ranks that /10 above our public address
+			// (see p2p.affinityScore), so it punches the overlay and the bytes
+			// go over the tunnel -- the relay by another name, reporting as a
+			// successful direct path. Observed 2026-09-30 with NetBird on both
+			// ends: the punch succeeded, P2PRaddr settled on the overlay
+			// address, and 66 of the frames arrived from 100.101.102.21.
+			if !assistedAddrAcceptable(ip) {
+				continue
+			}
 			// Deduplicate: several interfaces can report the same address.
 			dup := false
 			for _, seen := range ips {
@@ -281,4 +301,16 @@ func (e *EdgeClient) edgeMAC() string {
 		return ""
 	}
 	return e.MACAddr.String()
+}
+
+// assistedAddrAcceptable reports whether an address found on a local interface
+// may be advertised to a peer as an assisted endpoint.
+//
+// Split out so the rule is testable directly. collectAssistedIPs reads the real
+// net.Interface.Addrs(), which on a host without a third-party overlay contains
+// no address this rejects -- so a test driving it proves nothing. NetBird on the
+// host is the only way the real collector sees the case, and the bug it caused
+// shipped precisely because CI had no NetBird.
+func assistedAddrAcceptable(ip net.IP) bool {
+	return !p2p.IsCGNATOverlayAddr(ip)
 }

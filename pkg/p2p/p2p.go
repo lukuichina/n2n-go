@@ -5,6 +5,7 @@ import (
 	"n2n-go/pkg/log"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -52,13 +53,30 @@ type P2PCommunityDatas struct {
 }
 
 type Peer struct {
-	Infos           PeerInfo
-	P2PStatus       P2PCapacity
-	IsFullDuplex    bool
-	P2PCheckID      string
-	pendingTTL      int
-	UpdatedAt       time.Time
-	P2PEndpoint     string
+	Infos        PeerInfo
+	P2PStatus    P2PCapacity
+	IsFullDuplex bool
+	P2PCheckID   string
+	pendingTTL   int
+	UpdatedAt    time.Time
+	P2PEndpoint  string
+	// p2pEndpointAt is when P2PEndpoint was last replaced by an
+	// announcement, and is what distinguishes a live address from a retired
+	// one.
+	//
+	// A peer re-punching allocates a fresh temporary UDP socket every time, so
+	// the endpoint it advertises changes while the process keeps running, and
+	// the previous value stops being valid the moment that socket closes. The
+	// long-lived socket is separate, so "which port does this peer answer on"
+	// is not answerable from anything but the newest announcement: observed
+	// 2026-09-30, E2 moved 59679 -> 58634 at 16:11:22 and reported the change
+	// five times, yet E1 still punched 59679 at 16:12:00, five failed rounds
+	// later. Timestamping each announced endpoint lets that staleness be
+	// detected rather than guessed at.
+	//
+	// Set by SetP2PEndpoint; read via LastP2PEndpointAt. Guarded by the
+	// registry's peerMu, like the rest of the P2P address state.
+	p2pEndpointAt   time.Time
 	P2PCapabilities []string
 	// NatHoleExecuted marks whether this peer has already executed the
 	// relay-coordinated NAT hole-punching instruction.
@@ -72,8 +90,8 @@ type Peer struct {
 	// Written from the receive goroutine on every punch/ACK and read from the
 	// data path on every packet (UDPAddrWithStrategy), so it is guarded by
 	// raddrMu. Use GetP2PRaddr/SetP2PRaddr rather than touching the field.
-	P2PRaddr   string
-	raddrMu    sync.RWMutex
+	P2PRaddr string
+	raddrMu  sync.RWMutex
 	// indexedRaddr is the key currently held in PeerRegistry.peerBySocket on
 	// this peer's behalf as an observed raddr. Guarded by the registry's
 	// peerMu, not by P2PRaddr: P2PRaddr is assigned before the index is
@@ -161,9 +179,17 @@ func (p *Peer) LogRouteDecision(strategy string, udpSocket *net.UDPAddr, isP2P b
 	}
 }
 
-// SetP2PEndpoint updates the peer's P2P endpoint address (e.g. "host:port").
+// SetP2PEndpoint updates the peer's P2P endpoint address (e.g. "host:port")
+// and stamps it as freshly announced, so LastP2PEndpointAt can order records
+// by how recently they were heard.
 func (p *Peer) SetP2PEndpoint(endpoint string) {
 	p.P2PEndpoint = endpoint
+	p.p2pEndpointAt = time.Now()
+}
+
+// LastP2PEndpointAt reports when this peer's P2P endpoint was last announced.
+func (p *Peer) LastP2PEndpointAt() time.Time {
+	return p.p2pEndpointAt
 }
 
 // SetP2PCapabilities updates the peer's P2P capability list.
@@ -321,10 +347,14 @@ type PeerRegistry struct {
 	// makeNatHole() from keepTunnelOpenWorker (client/visitor/xtcp.go:114);
 	// remembering the instruction is what lets this edge do the same.
 	lastNatHoleInstrs map[string]*NatHoleInstruction
-	// natHoleInstrKey is the key SetNatHoleInstruction stored under (our own
-	// MAC). ReArmNatHoleInstruction is called with the PEER's MAC, so it
-	// cannot derive this itself.
+	// natHoleInstrKey is the key SetNatHoleInstruction last stored under. Kept
+	// for ReArmNatHoleInstruction, which is called with the PEER's MAC and
+	// cannot always derive the current key itself.
 	natHoleInstrKey string
+	// natHoleRoundRobin rotates which pending instruction ExecuteNatHolePunch
+	// serves next, so every peer awaiting a punch gets one instead of the same
+	// one winning every round.
+	natHoleRoundRobin uint64
 	// Latest hole-punch outcome per peer MAC, reported to the relay in
 	// GetPeerP2PInfos so it can stop re-broadcasting for pairs that are
 	// already up and re-arm pairs that just failed. Without this feedback
@@ -499,7 +529,22 @@ func (reg *PeerRegistry) SetMe(infos PeerInfo) {
 	reg.Me = &Peer{
 		Infos:     infos,
 		UpdatedAt: time.Now(),
-		P2PStatus: P2PUnavailable,
+		// Available, not Unavailable.
+		//
+		// At this point we have registered and our path to the supernode is
+		// working -- the peer is reachable, merely over the relay rather than
+		// direct. Available is what that means; Unavailable reads as "cannot be
+		// reached at all", which is false from the moment STUN completes.
+		//
+		// Unavailable here was not merely a wrong label, it was load-bearing
+		// in the wrong direction: UpdateP2PStatus force-writes Unavailable
+		// whenever pendingTTL < 1 (p2p.go:919-922), and a Peer built by this
+		// constructor rather than AddPeer never gets resetPendingTTL() called on
+		// it, so its pendingTTL is the Go zero value. The peer was therefore
+		// pinned at Unavailable by every subsequent status update and could not
+		// leave that state -- observed as a peer that stayed Unavailable for the
+		// whole run while relaying normally.
+		P2PStatus: P2PAvailable,
 	}
 }
 
@@ -652,6 +697,18 @@ func addrInLocalPrefix(ip net.IP, prefixes []netip.Prefix) bool {
 		return false
 	}
 	a = a.Unmap()
+	// An address in the CGNAT pool is never "on a LAN we are also on", even
+	// when a prefix list says it is. NetBird, WireGuard and n2n itself all
+	// draw from 100.64.0.0/10, so a host behind one of those tunnels shares
+	// an overlay subnet with a peer on the same tunnel -- and this predicate
+	// is what promotes a punch candidate ahead of the public address. Left
+	// unguarded it promotes the overlay: the punch then "succeeds" while the
+	// bytes go over the overlay (the relay by another name), and the peer's
+	// P2PRaddr flaps between the overlay and the public address. Observed on
+	// 2026-09-30 with NetBird on both ends.
+	if isCGNATOverlay(a) {
+		return false
+	}
 	for _, p := range prefixes {
 		if p.Contains(a) {
 			return true
@@ -743,6 +800,19 @@ func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHoleP
 	}
 	reg.peerMu.Lock()
 	defer reg.peerMu.Unlock()
+	reg.recordNatHolePunchResultLocked(peerMAC, state, attempts, detail, behaviorIndex)
+}
+
+// recordNatHolePunchResultLocked is RecordNatHolePunchResult for callers that
+// already hold peerMu.
+//
+// ExecuteNatHolePunch reports its exhausted-round failure from inside the
+// peerMu critical section, so it cannot call the exported form: that takes the
+// write lock itself, and Go's RWMutex is not reentrant. The previous code
+// worked around this by writing reg.natHolePunchResults inline at that site,
+// which duplicated the struct literal and, more importantly, left the two
+// paths free to drift -- they already had.
+func (reg *PeerRegistry) recordNatHolePunchResultLocked(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32) {
 	if reg.natHolePunchResults == nil {
 		reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
 	}
@@ -920,7 +990,7 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 		}
 
 		existingPeer.Infos = infos
-		existingPeer.P2PEndpoint = infos.P2PEndpoint
+		existingPeer.SetP2PEndpoint(infos.P2PEndpoint)
 		existingPeer.P2PCapabilities = infos.P2PCapabilities
 		existingPeer.UpdatedAt = time.Now()
 		log.Printf("updated peer now hold of %s MACAddr:", macAddr)
@@ -949,10 +1019,12 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 	peer := &Peer{
 		Infos:           infos,
 		P2PStatus:       P2PUnknown,
-		P2PEndpoint:     infos.P2PEndpoint,
 		P2PCapabilities: infos.P2PCapabilities,
 		UpdatedAt:       time.Now(),
 	}
+	// Via the setter so the endpoint timestamp is stamped; the struct literal
+	// cannot call it.
+	peer.SetP2PEndpoint(infos.P2PEndpoint)
 	reg.Peers[macAddr] = peer
 	for _, k := range peer.lookupSockets() {
 		reg.peerBySocket[k] = peer
@@ -1176,6 +1248,20 @@ func (reg *PeerRegistry) CurrentNatHoleBehaviorIndex(peerMAC string) uint32 {
 	return 0
 }
 
+// natHoleInstrKeyFor returns the key an instruction is stored under: the
+// TARGET peer's MAC.
+//
+// Falling back to our own MAC covers the degenerate case of an instruction with
+// no target, which is not actionable anyway (ExecuteNatHolePunch has nothing to
+// wait on), but it must not collide with a real target's entry -- hence the
+// "?" prefix, which is not valid MAC syntax.
+func natHoleInstrKeyFor(instr *NatHoleInstruction, ourMAC []byte) string {
+	if tm := instr.GetTargetMac(); len(tm) == 6 {
+		return macAddrStr(tm)
+	}
+	return "?" + macAddrStr(ourMAC)
+}
+
 // SetNatHoleInstruction stores a relay-coordinated NAT hole instruction
 // for the given MAC address. The instruction is then executed by
 // executeNatHolePunch().
@@ -1188,7 +1274,22 @@ func (reg *PeerRegistry) SetNatHoleInstruction(macAddr []byte, instr *NatHoleIns
 	if reg.natHoleRetryCounts == nil {
 		reg.natHoleRetryCounts = make(map[string]int)
 	}
-	key := macAddrStr(macAddr)
+	// Key on the TARGET, not on ourselves.
+	//
+	// The key used to be our own MAC, which is the same for every instruction
+	// this edge ever receives -- so with two or more peers to punch, each new
+	// instruction silently overwrote the previous one and only the last
+	// arrival survived. Observed 2026-09-30 with three edges up: E1 was told to
+	// punch both E2 and the third host, and every round went to the third host
+	// while E2 sat as receiver punching an E1 that never punched back. E2's
+	// five attempts all timed out and the pair was marked P2PUnavailable,
+	// which is the exact failure this keying caused.
+	//
+	// Keying by target MAC makes the map a per-peer work queue: one entry per
+	// peer we owe a punch to, all live at once. SetNatHoleInstruction is
+	// idempotent per target, so the Worker re-broadcasting the same
+	// instruction every ~2s still just refreshes the entry.
+	key := natHoleInstrKeyFor(instr, macAddr)
 	// Only reset the retry count if this is a genuinely new instruction.
 	// If the Worker re-sends the same instruction (same TTL, same ports),
 	// keep the existing retry count so the edge can actually reach
@@ -1263,39 +1364,39 @@ func (reg *PeerRegistry) ReArmNatHoleInstruction(peerMAC []byte) {
 	defer reg.peerMu.Unlock()
 	peerKey := macAddrStr(peerMAC)
 
-	// Our own key is the single entry in natHoleInstrs, if any is pending.
-	ourKey := ""
-	for k := range reg.natHoleInstrs {
-		ourKey = k
-		break
-	}
-	if ourKey == "" {
-		prev, ok := reg.lastNatHoleInstrs[peerKey]
-		if !ok || prev == nil {
-			return
-		}
-		if reg.natHoleInstrs == nil {
-			reg.natHoleInstrs = make(map[string]*NatHoleInstruction)
-		}
-		if reg.natHoleRetryCounts == nil {
-			reg.natHoleRetryCounts = make(map[string]int)
-		}
-		key := reg.natHoleInstrKey
-		if key == "" {
-			// Should not happen: the key is recorded on every store. Fall
-			// back to the peer's MAC rather than dropping the re-arm, so a
-			// tunnel is never left with no punch scheduled because of a
-			// bookkeeping gap.
-			key = peerKey
-		}
-		reg.natHoleInstrs[key] = prev
-		reg.natHoleRetryCounts[key] = 0
-		log.Printf("[P2P] re-armed the punch instruction remembered for %s — its tunnel dropped after a successful round", peerKey)
+	// natHoleInstrs is keyed by target MAC, so this peer's entry is found
+	// directly. That is the lookup the comment below spent its life working
+	// around: while the map held a single entry keyed by OUR MAC, every
+	// lookup by peer MAC missed, which is bug 1 in the note above.
+	//
+	// It also means a re-arm for one peer no longer depends on whether the map
+	// happens to be empty. The old code early-returned when any instruction was
+	// pending and then only reset the retry count of whichever key the map
+	// yielded first -- so a tunnel that dropped while another peer was being
+	// punched got its re-arm applied to that peer's counter, or silently lost.
+	if _, ok := reg.natHoleInstrs[peerKey]; ok {
+		reg.natHoleRetryCounts[peerKey] = 0
+		log.Printf("[P2P] re-armed the pending punch instruction for %s — resetting its attempt count", peerKey)
 		return
 	}
-	if _, ok := reg.natHoleInstrs[ourKey]; ok {
-		reg.natHoleRetryCounts[ourKey] = 0
+
+	// Nothing pending: this is the case the function exists for. A successful
+	// round deleted the entry, so restore the last instruction the Worker
+	// negotiated for this peer. It keeps the targets (ports/TTL/role) the relay
+	// believes are current.
+	prev, ok := reg.lastNatHoleInstrs[peerKey]
+	if !ok || prev == nil {
+		return
 	}
+	if reg.natHoleInstrs == nil {
+		reg.natHoleInstrs = make(map[string]*NatHoleInstruction)
+	}
+	if reg.natHoleRetryCounts == nil {
+		reg.natHoleRetryCounts = make(map[string]int)
+	}
+	reg.natHoleInstrs[peerKey] = prev
+	reg.natHoleRetryCounts[peerKey] = 0
+	log.Printf("[P2P] re-armed the punch instruction remembered for %s — its tunnel dropped after a successful round", peerKey)
 }
 
 // receiverProbeIPTTL is the IP TTL used for the receiver's pre-mapping probe.
@@ -1574,16 +1675,78 @@ func (reg *PeerRegistry) ExpectedPunchPeerMAC() string {
 	return ""
 }
 
-func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
-	reg.peerMu.RLock()
-	var instr *NatHoleInstruction
-	instrKey := ""
-	for k, v := range reg.natHoleInstrs {
-		instr = v
-		instrKey = k
-		break
+// nextNatHoleInstruction picks the peer to punch in the next round and advances
+// the rotation.
+//
+// Round-robin over a sorted key list, not map iteration order. Go randomises map
+// iteration, so "pick whatever the range yields first" is not merely unfair
+// between peers -- it makes a peer that is punched once get picked again on the
+// very next round whenever two keys collide in the (small) random ordering,
+// which is exactly the starvation this replaces. Sorting also makes the
+// behaviour reproducible in logs, which matters when diagnosing why a
+// particular pair never came up.
+//
+// Peers that are already FullDuplex are skipped: the Worker keeps an entry
+// until the round that promoted it completes, and re-punching a working tunnel
+// is pure overhead that would delay the peers that still need it.
+func (reg *PeerRegistry) nextNatHoleInstruction() (*NatHoleInstruction, string) {
+	reg.peerMu.Lock()
+	defer reg.peerMu.Unlock()
+
+	if len(reg.natHoleInstrs) == 0 {
+		return nil, ""
 	}
-	reg.peerMu.RUnlock()
+
+	keys := make([]string, 0, len(reg.natHoleInstrs))
+	for k := range reg.natHoleInstrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Consider each candidate once before recycling, so no peer can be skipped
+	// forever by the rotation even if one round takes much longer than the
+	// others.
+	n := len(keys)
+	for i := 0; i < n; i++ {
+		idx := int(reg.natHoleRoundRobin % uint64(n))
+		reg.natHoleRoundRobin++
+		k := keys[idx]
+		instr := reg.natHoleInstrs[k]
+		if instr == nil {
+			continue
+		}
+		if tm := instr.GetTargetMac(); len(tm) == 6 {
+			if p, ok := reg.Peers[macAddrStr(tm)]; ok && p.IsFullDuplex {
+				// Already direct; the entry is waiting on the round that
+				// promoted it. Drop it now so it stops occupying the
+				// rotation -- the post-round cleanup below would have
+				// removed it anyway.
+				delete(reg.natHoleInstrs, k)
+				delete(reg.natHoleRetryCounts, k)
+				continue
+			}
+		}
+		return instr, k
+	}
+	return nil, ""
+}
+
+// ExecuteNatHolePunch runs one punch round against ONE peer and reports whether
+// that peer reached FullDuplex.
+//
+// One round per call is deliberate: a round blocks for up to natHoleReadTimeout
+// (5s) waiting for the peer's punch to come back, so running every pending
+// instruction sequentially would let a single unreachable peer stall the others
+// by 5s each. The caller re-invokes on its 3s ticker, and the round-robin
+// selection below is what guarantees every pending peer is actually served
+// rather than whichever one the map iterator happened to yield.
+//
+// The return value describes only the target this round ran against. Callers
+// that need "is anything direct now" must ask the peers themselves -- which is
+// what edge/routines.go does, via GetPunchedNotFullDuplexPeers and the
+// peer registry's own FullDuplex flags.
+func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
+	instr, instrKey := reg.nextNatHoleInstruction()
 
 	if instr == nil {
 		return false
@@ -2146,16 +2309,26 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 	}
 
 	if achievedFullDuplex {
-		log.Printf("[P2P] NatHole punch succeeded — FullDuplex achieved with target, clearing instruction")
+		log.Printf("[P2P] NatHole punch succeeded — FullDuplex achieved with %s, clearing instruction", macAddrStr(targetMAC))
 		reg.peerMu.Lock()
-		if _, ok := reg.natHoleInstrs[instrKey]; ok {
+		// Clear this target's entry and nothing else.
+		//
+		// The old code cleared EVERY entry when the key it had captured was
+		// gone, which was safe only because there could ever be one. With
+		// per-target keying that fallback would wipe the queue for every other
+		// peer the moment one round raced with a Worker re-broadcast -- silently
+		// dropping punches that had not been attempted yet.
+		//
+		// A target MAC is part of the key by construction, so clearing by MAC
+		// is equivalent to clearing instrKey and is robust to the key having
+		// been replaced underneath us.
+		if tm := targetMAC; len(tm) == 6 {
+			cleared := macAddrStr(tm)
+			delete(reg.natHoleInstrs, cleared)
+			delete(reg.natHoleRetryCounts, cleared)
+			// Also drop the legacy single-key entry if one survives.
 			delete(reg.natHoleInstrs, instrKey)
 			delete(reg.natHoleRetryCounts, instrKey)
-		} else {
-			// Instruction was already replaced or cleared — clear all
-			for k := range reg.natHoleInstrs {
-				delete(reg.natHoleInstrs, k)
-			}
 		}
 		reg.peerMu.Unlock()
 	} else {
@@ -2166,16 +2339,23 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 		// pointer comparison to fail and retryCount to reset to 0
 		// every cycle — resulting in "attempt 1/5" repeating forever).
 		reg.peerMu.Lock()
-		currentInstr, ok := reg.natHoleInstrs[instrKey]
+		// Re-resolve this round's target by MAC, not by the captured key. The
+		// key IS the target MAC, so looking it up that way is stable even if the
+		// Worker re-broadcast a newer instruction for the same peer mid-round.
+		//
+		// The old fallback ("if my key vanished, take whichever instruction the
+		// map yields") silently retargeted the round at a DIFFERENT peer, so a
+		// failure against E1 could be recorded against E2's retry count. With
+		// per-target keying there is nothing sensible to fall back to: if this
+		// target's entry is gone, the Worker withdrew it.
+		targetKey := ""
+		if len(targetMAC) == 6 {
+			targetKey = macAddrStr(targetMAC)
+		}
+		currentInstr, ok := reg.natHoleInstrs[targetKey]
+		instrKey = targetKey
 		if !ok {
-			// Instruction was cleared or replaced by the Worker.
-			// If a new instruction exists, use its key.
-			for k := range reg.natHoleInstrs {
-				instrKey = k
-				currentInstr = reg.natHoleInstrs[k]
-				ok = true
-				break
-			}
+			log.Printf("[P2P] instruction for %s was withdrawn by the relay while the round was running, not recording a result", targetKey)
 		}
 		if ok {
 			retryCount := reg.natHoleRetryCounts[instrKey]
@@ -2204,16 +2384,21 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				if currentInstr != nil {
 					if tm := currentInstr.GetTargetMac(); len(tm) > 0 {
 						tmStr := macAddrStr(tm)
-						if reg.natHolePunchResults == nil {
-							reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
-						}
-						reg.natHolePunchResults[tmStr] = &NatHolePunchResult{
-							State:         NatHolePunchState_PunchStateInProgress,
-							Attempts:      uint32(retryCount + 1),
-							Detail:        "retrying",
-							BehaviorIndex: currentInstr.GetBehaviorIndex(),
-						}
-						reg.hasPendingChanges = true
+						// Shares the writer with the exhausted path below and with
+						// RecordNatHolePunchResult. This site already read the rung off
+						// currentInstr and never deleted the instruction first, so it was
+						// not the misattribution the failure site had -- but it was the
+						// third hand-built NatHolePunchResult, and the drift between the
+						// two inline copies is exactly what produced the wrong-rung
+						// report on 2026-09-30. One writer removes the class of bug
+						// rather than this instance.
+						reg.recordNatHolePunchResultLocked(
+							tmStr,
+							NatHolePunchState_PunchStateInProgress,
+							uint32(retryCount+1),
+							"retrying",
+							currentInstr.GetBehaviorIndex(),
+						)
 					}
 				}
 			} else {
@@ -2221,8 +2406,26 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				log.Printf("[P2P] NatHole punch failed after 5 attempts, clearing instruction")
 				delete(reg.natHoleInstrs, instrKey)
 				delete(reg.natHoleRetryCounts, instrKey)
-				// Mark peer as P2PUnavailable so data uses WebSocket relay.
-				// NOTE: do NOT call reg.GetPeer() here — we already hold
+				// Drop back to Available, NOT Unavailable.
+				//
+				// A failed punch does not make the peer unreachable -- the relay
+				// path is still up and traffic keeps flowing over it, which is
+				// exactly what Available means. Unavailable reads as "cannot be
+				// reached at all", and writing it here was self-locking: the
+				// periodic liveness loop in edge/routines.go:39-48 walks only
+				// GetP2PPendingPeers and GetP2PAvailablePeers, so a peer marked
+				// Unavailable drops out of both lists and is never pinged again.
+				// Nothing can move it back to Available, because the only code
+				// that would do so is the ping loop that can no longer see it.
+				// The pair then stays on the relay until the process restarts
+				// (observed: E2 sat at Unavailable for 39 minutes while
+				// relaying normally, and never re-punched).
+				//
+				// Available keeps it inside the liveness loop, so the next
+				// round of relay pongs re-establishes the state and a later
+				// NatHoleInstruction can promote it to FullDuplex.
+				//
+				// NOTE: do NOT call reg.GetPeer() here -- we already hold
 				// peerMu.Lock() and GetPeer() takes peerMu.RLock(). Go's
 				// RWMutex is NOT reentrant, so that self-deadlocks the whole
 				// process (observed: edge froze permanently after the 5th
@@ -2234,24 +2437,34 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 					if targetMAC != nil && len(targetMAC) > 0 {
 						targetMACStr := macAddrStr(targetMAC)
 						if p, ok := reg.Peers[targetMACStr]; ok {
-							p.P2PStatus = P2PUnavailable
-							log.Printf("[P2P] Marked peer %s as P2PUnavailable after failed hole punch", targetMACStr)
+							if p.P2PStatus != P2PFullDuplex && p.P2PStatus != P2PAvailable {
+								p.P2PStatus = P2PAvailable
+								log.Printf("[P2P] Marked peer %s as P2PAvailable after failed hole punch (relay path still up)", targetMACStr)
+							}
 						}
 						// Report the failure so the relay stops waiting on
 						// this instruction and re-broadcasts a fresh one
 						// (under its own backoff) instead of assuming the
-						// pair is still in progress. Written directly
-						// because peerMu is already held here.
-						if reg.natHolePunchResults == nil {
-							reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
-						}
-						reg.natHolePunchResults[targetMACStr] = &NatHolePunchResult{
-							State:         NatHolePunchState_PunchStateFailed,
-							Attempts:      5,
-							Detail:        "exhausted 5 punch attempts",
-							BehaviorIndex: currentInstr.GetBehaviorIndex(),
-						}
-						reg.hasPendingChanges = true
+						// pair is still in progress.
+						//
+						// behaviorIndex comes from currentInstr -- the
+						// instruction this round actually ran. It must not be
+						// re-derived from the registry: the entry for this
+						// target was deleted two lines above, so any lookup
+						// that scans the cache finds nothing and falls back to
+						// 0. That is how a round of rung 4 was reported as a
+						// rung 0 failure on 2026-09-30: the relay penalised an
+						// entry that had never run, drove the score to its -10
+						// floor, and then kept re-arming the pair at the 300s
+						// cap because the blamed rung and the dispatched rung
+						// did not match.
+						reg.recordNatHolePunchResultLocked(
+							targetMACStr,
+							NatHolePunchState_PunchStateFailed,
+							5,
+							"exhausted 5 punch attempts",
+							currentInstr.GetBehaviorIndex(),
+						)
 						log.Printf("[P2P] Reported punch FAILED for %s to relay", targetMACStr)
 					}
 				}

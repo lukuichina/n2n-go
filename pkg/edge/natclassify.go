@@ -4,8 +4,14 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"sort"
 	"strconv"
 )
+
+// cgnat is RFC 6598 shared address space (100.64.0.0/10). Go's net package
+// does not classify it as private, yet it is never routable on the public
+// internet, so we rank it separately.
+var cgnat = &net.IPNet{IP: net.IPv4(100, 64, 0, 0).To4(), Mask: net.CIDRMask(10, 32)}
 
 // NAT classification constants — ported from FRP's pkg/nathole/classify.go.
 const (
@@ -137,6 +143,20 @@ func ClassifyFeatureCount(features []*NatFeature) (easyCount, hardCount, regular
 // address matches a local address (public network detection).
 //
 // Ported from FRP's ListLocalIPsForNatHole.
+//
+// Ordering matters. net.InterfaceAddrs() returns addresses in interface
+// index order, and callers such as EdgeClient.P2PEndpointString() take the
+// FIRST entry to stand in for a wildcard-bound P2P socket. On a host with
+// a tunnel interface (WireGuard/Tailscale/cloud agent) that interface is
+// often enumerated before the real uplink, so the unfiltered first entry
+// was a tunnel-internal address such as 100.101.102.21 -- unreachable
+// from the peer, which made every hole punch fail while the node looked
+// perfectly healthy.
+//
+// We therefore sort by decreasing likelihood of being reachable from a
+// remote peer: globally routable addresses first, then ordinary private
+// ranges, and finally link-local/tunnel space. Within a tier the original
+// enumeration order is preserved so the result stays deterministic.
 func ListLocalIPs(maxIPs int) []string {
 	if maxIPs <= 0 {
 		maxIPs = 10
@@ -145,17 +165,55 @@ func ListLocalIPs(maxIPs int) []string {
 	if err != nil {
 		return nil
 	}
-	var ips []string
+	type ranked struct {
+		ip   string
+		tier int
+		seq  int
+	}
+	var out []ranked
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			ipv4 := ipnet.IP.To4()
 			if ipv4 != nil && !ipv4.IsLinkLocalUnicast() {
-				ips = append(ips, ipv4.String())
-				if len(ips) >= maxIPs {
-					break
-				}
+				out = append(out, ranked{ip: ipv4.String(), tier: routabilityTier(ipv4), seq: len(out)})
 			}
 		}
 	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].tier < out[j].tier })
+
+	ips := make([]string, 0, len(out))
+	for _, r := range out {
+		if len(ips) >= maxIPs {
+			break
+		}
+		ips = append(ips, r.ip)
+	}
 	return ips
+}
+
+// routabilityTier ranks an address by how likely a remote peer is to reach
+// it directly. Lower is better.
+//
+//	tier 0 -- globally routable: a real public address, the only kind that
+//	           can be punched from the internet.
+//	tier 1 -- RFC1918 private: reachable only from inside the same network.
+//	tier 2 -- CGNAT (100.64/10) and other non-RFC1918 reserved space, which
+//	           includes most tunnel overlay addresses.
+//	tier 3 -- link-local and everything else.
+func routabilityTier(ip net.IP) int {
+	switch {
+	case ip.IsGlobalUnicast() && !ip.IsPrivate():
+		// 100.64.0.0/10 is a global-unicast range but is carrier-grade NAT
+		// space, never routable on the public internet. It is also the range
+		// overlay networks commonly draw from, so it must not outrank a real
+		// public address.
+		if cgnat.Contains(ip) {
+			return 2
+		}
+		return 0
+	case ip.IsPrivate():
+		return 1
+	default:
+		return 3
+	}
 }

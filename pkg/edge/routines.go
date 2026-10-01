@@ -446,9 +446,7 @@ func (e *EdgeClient) handleTAP() {
 		}
 
 		// Read directly into payload area to avoid a copy
-		frameStart := time.Now()
 		n, err := e.TAP.Read(frameBuf)
-		readDone := time.Now()
 		if err != nil {
 			if strings.Contains(err.Error(), "file already closed") {
 				return
@@ -513,10 +511,6 @@ func (e *EdgeClient) handleTAP() {
 						return
 					}
 					log.Printf("Error sending packet with enableVFuze from TAP: %v", err)
-				} else if d := time.Since(frameStart); d >= sendProbeSlowThreshold {
-					log.Printf("[TAP-SLOW] frame=%v read=%v process=%v bytes=%d dst=%s strat=%v path=vfuze",
-						d.Truncate(time.Microsecond), readDone.Sub(frameStart).Truncate(time.Microsecond),
-						time.Since(readDone).Truncate(time.Microsecond), n, destMAC, strategy)
 				}
 				continue
 			}
@@ -528,17 +522,6 @@ func (e *EdgeClient) handleTAP() {
 				return
 			}
 			log.Printf("Error sending packet to supernode: %v", err)
-		}
-
-		// Whole-frame probe: TAP read -> parse -> route -> write, on the one
-		// goroutine every outbound frame shares. WritePacket's own [SEND-SLOW]
-		// line names the send half; this catches a frame that was slow for some
-		// other reason (parsing, a blocking ARP path, or a long stall in the
-		// read itself) so the two probes together account for the whole loop.
-		if d := time.Since(frameStart); d >= sendProbeSlowThreshold {
-			log.Printf("[TAP-SLOW] frame=%v read=%v process=%v bytes=%d dst=%s strat=%v ptype=%v",
-				d.Truncate(time.Microsecond), readDone.Sub(frameStart).Truncate(time.Microsecond),
-				time.Since(readDone).Truncate(time.Microsecond), n, destMAC, strategy, spec.TypeData)
 		}
 	}
 }
@@ -831,6 +814,33 @@ func (e *EdgeClient) handleP2P() {
 		// Record it and let it (not a punch) promote the peer to FullDuplex.
 		if rawMsg.Header != nil {
 			if p, perr := e.Peers.GetPeerBySocket(addr); perr == nil {
+				// Learn the peer's raddr from the same observation that proves
+				// the direct path works.
+				//
+				// addr here comes from P2PConn.ReadFromUDP, so it is the real
+				// NAT-mapped source the peer punched from -- the same fact
+				// routines.go:620 records on the punch path, and the only place
+				// it can be learned at all: the WSS path's addr is the relay's
+				// own address (routines.go:1041 passes conn.RemoteAddr()
+				// through), so handleDataMessage's GetPeerBySocket there never
+				// matches a peer and never writes raddr.
+				//
+				// Without this the pair deadlocks. FullDuplex is reached here,
+				// but wire.go:69 refuses the direct path until GetP2PRaddr() is
+				// non-empty, so every packet falls back to the relay, so the
+				// peer never receives a direct frame from us, so neither side
+				// can fill the other's raddr. Observed 2026-09-30 with E1/E2:
+				// E2 sat at P2PStatus=FullDuplex with P2PRaddr empty and logged
+				// "FullDuplex but no verified raddr, falling back to WSS relay"
+				// per packet, indefinitely, while its data still arrived over
+				// the relay.
+				//
+				// This does not weaken the gate. It still requires
+				// GetPeerBySocket to succeed, and SetFullDuplex below still
+				// requires a real data frame -- raddr and FullDuplex remain two
+				// readings of one observation rather than two independent ones.
+				p.SetP2PRaddr(addr.String())
+				e.Peers.IndexPeerRaddr(p, addr.String())
 				p.NoteDataPacket()
 				if changed, _ := p.SetFullDuplex(true); changed {
 					mac := net.HardwareAddr(p.Infos.MacAddr).String()
