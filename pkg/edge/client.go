@@ -99,7 +99,13 @@ type EdgeClient struct {
 
 	// STUN
 	STUNClient *STUNClient
-	NatFeature *NatFeature
+
+	// refreshProbe is the STUN refresh currently awaiting a response, if
+	// any. Owned by handleP2P (the P2P socket's only reader): handleP2PInfos
+	// starts it and must not wait on it, and handleP2P resolves it by
+	// handing each datagram to STUNClient.Feed.
+	refreshProbe *pendingProbe
+	NatFeature   *NatFeature
 
 	// cachedPubSocket caches the STUN-discovered public socket address
 	// so that subsequent calls to pubSocketString() (e.g. during retry

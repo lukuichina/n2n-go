@@ -223,7 +223,21 @@ func DefaultConfig() *Config {
 		// The Google STUN endpoints time out here — the cloud NAT swallows
 		// their replies — which left pubSocket stale and made every hole
 		// punch target a dead address. Keep them as fallbacks only.
+		// The list is ordered by observed reachability from the edge hosts,
+		// because DiscoverWithClassification walks it serially and returns the
+		// LAST error: an unreachable server first is invisible, and three dead
+		// entries ahead of a live one cost 15s per refresh.
+		//
+		// Re-verified 2026-10-01 by sending a real BindingRequest and checking
+		// for a 0101 magic-cookie answer: nextcloud, miwifi and voipbuster all
+		// answered; the Google endpoints (and easyvoip, which used to be the
+		// only verified one) now time out from both hosts. That is what left
+		// the periodic refresh reporting "STUN discovery failed" on every tick
+		// -- the refresh ran correctly but had nothing to discover with.
 		STUNServers: []string{
+			"stun.nextcloud.com:443",
+			"stun.miwifi.com:3478",
+			"stun.voipbuster.com:3478",
 			"stun.easyvoip.com:3478",
 			"stun.l.google.com:19302",
 			"stun1.l.google.com:19302",

@@ -1846,6 +1846,54 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 	// and still not be FullDuplex yet. The two are reported differently.
 	punchExchanged := false
 
+	// Report InProgress as soon as the round has actually started.
+	//
+	// Without this the relay stays blind until the round ends. It only hears
+	// from us in two places: handlePunchDatagram, which fires when the PEER's
+	// packet finally lands (so the whole punch phase is invisible), and the
+	// exhausted-round Failed at the bottom of this function. A peer that never
+	// answers is therefore reported exactly once, as Failed, after all five
+	// attempts -- and until then it is indistinguishable from a peer that is
+	// merely slow.
+	//
+	// The relay's state machine distinguishes "instruction dispatched" from
+	// "punch is running", and only the latter lets it tell a stalled round
+	// from a dead pair.
+	//
+	// On the relay side state 1 is deliberately inert: recordPunchResult skips
+	// the failCount increment and the backoff re-arm (both are state 2 only),
+	// so this costs one P2PStateInfo and cannot escalate a pair's backoff.
+	//
+	// Declared out here, beside punchExchanged, because both the sender and the
+	// receiver branch must reach it and the branch bodies sit at a deeper
+	// indentation than their common `if role` header.
+	//
+	// Fires once per round. Every candidate gets its own dispatch and the port
+	// scan emits one datagram per port; reporting each would flood the relay
+	// for no extra information.
+	punchStarted := false
+	reportPunchStarted := func(attempt uint32, addr string) {
+		if punchStarted {
+			return
+		}
+		punchStarted = true
+		tm := instr.GetTargetMac()
+		if tm == nil || len(tm) == 0 {
+			return
+		}
+		reg.RecordNatHolePunchResult(
+			macAddrStr(tm),
+			NatHolePunchState_PunchStateInProgress,
+			attempt,
+			fmt.Sprintf("punch dispatched to %s, awaiting peer's packet", addr),
+			// The rung this round runs. Read through the accessor because
+			// currentInstr is not in scope here -- it is fetched later, under
+			// peerMu, for the failure report at the end of this round. Taking
+			// peerMu here would deadlock: Go's RWMutex is not reentrant.
+			reg.CurrentNatHoleBehaviorIndex(macAddrStr(tm)),
+		)
+	}
+
 	if role == NatHoleRole_DetectRoleSender {
 		// Sender: send UDP punch packets to the target's public socket.
 		// The receiver is listening on its P2P socket; our packets will
@@ -1861,6 +1909,28 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 			return false
 		}
 
+		// Report InProgress as soon as the round has actually started.
+		//
+		// Without this the relay stays blind until the round ends. It only
+		// hears from us in two places: handlePunchDatagram, which fires when
+		// the PEER's packet finally lands (so the whole punch phase is
+		// invisible), and the exhausted-round Failed at the bottom of this
+		// function. A peer that never answers is therefore reported exactly
+		// once, as Failed, after all five attempts -- and a peer that answers
+		// is not distinguishable from one that did not until then either.
+		//
+		// The relay's state machine distinguishes "instruction dispatched"
+		// from "punch is running"; only the latter lets it stop re-arming a
+		// pair mid-round and tell a stalled round from a dead pair.
+		//
+		// On the relay side, state 1 is deliberately inert: recordPunchResult
+		// skips the failCount increment and the backoff re-arm (both are
+		// state 2 only), so this costs one P2PStateInfo and cannot escalate
+		// a pair's backoff.
+		//
+		// Fire once per round. Every candidate gets its own dispatch, and the
+		// port scan emits one datagram per port -- reporting each would flood
+		// the relay for no extra information.
 		// Build list of candidate addresses to punch.
 		//
 		// FRP parity, and the order is the whole point --
@@ -2103,6 +2173,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				log.Printf("[P2P] Sender: punch to candidate %d (%s) failed: %v", ci, candAddr.String(), err)
 			} else {
 				log.Printf("[P2P] Sender: punched candidate %d %s once (ttl=%d)", ci, candAddr.String(), ttl)
+				reportPunchStarted(uint32(ci)+1, candAddr.String())
 			}
 
 			// Port scanning: one datagram per port. FRP likewise emits a
@@ -2253,6 +2324,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 						log.Printf("[P2P] Receiver: punch to candidate %d %s failed: %v", ci, cand.String(), err)
 					} else {
 						log.Printf("[P2P] Receiver: punched candidate %d %s once (ttl=%d)", ci, cand.String(), ttl)
+						reportPunchStarted(uint32(ci)+1, cand.String())
 					}
 				}
 

@@ -82,6 +82,7 @@ func (e *EdgeClient) PingPeer(p *p2p.Peer, n int, interval time.Duration, status
 const peerListResyncInterval = 30 * time.Second
 
 // handleHeartbeat sends heartbeat messages periodically
+// handleHeartbeat sends heartbeat messages periodically
 func (e *EdgeClient) handleP2PUpdates() {
 	e.wg.Add(1)
 	defer e.wg.Done()
@@ -206,16 +207,55 @@ func (e *EdgeClient) handleP2PInfos() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	refresh := time.NewTicker(natHoleAddrRefreshInterval)
+	defer refresh.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 			if err := e.sendP2PInfos(); err != nil {
 				log.Printf("sendP2PInfos error: %v", err)
 			}
+		case <-refresh.C:
+			// Start the probe but do NOT wait for it here: this loop is not
+			// the socket's reader, so blocking would be exactly the deadlock
+			// this design avoids. handleP2P resolves it via Feed.
+			if e.refreshProbe == nil {
+				e.refreshProbe = e.beginNatHoleAddrRefresh()
+			}
 		case <-e.ctx.Done():
 			return
 		}
 	}
+}
+
+// refreshNatHoleAdvertisedAddr re-runs STUN and, when the public mapping has
+// moved, republishes it so the relay can hand the new address to the peer.
+//
+// The comparison is against the value the relay was last told (Peers.Me), not
+// against a local cache: the relay is the consumer, so what matters is whether
+// the advertised value is stale, and a cache could disagree with it.
+//
+// pubSocketString() already writes through to Me.Infos.PubSocket and calls
+// SetPendingChanges() when it succeeds (pkg/edge/setup.go:611). So this only
+// has to decide whether to call it, and log the transition -- doing it
+// unconditionally would add a SetPendingChanges and an extra P2PStateInfo every
+// interval forever.
+func (e *EdgeClient) refreshNatHoleAdvertisedAddr() {
+	if e.STUNClient == nil || e.Peers == nil || e.Peers.Me == nil {
+		return
+	}
+
+	before := e.Peers.Me.Infos.PubSocket
+	after := e.pubSocketString()
+	if after == "" || after == before {
+		return
+	}
+
+	// pubSocketString() has already stored the new value and flagged the
+	// registry dirty, so the next sendP2PInfos() tick will deliver it.
+	log.Printf("[P2P] public mapping moved %s -> %s, re-advertising to relay",
+		before, after)
 }
 
 // handleHeartbeat sends heartbeat messages periodically
@@ -775,6 +815,17 @@ func (e *EdgeClient) handleP2P() {
 		}
 
 		e.PacketsRecv.Add(1)
+		// Offer the datagram to a pending STUN refresh before anything else
+		// looks at it. This loop is the socket's only reader, so a periodic
+		// refresh has to come through here rather than reading the socket
+		// itself -- see STUNClient in stun_probe.go for what the earlier
+		// version of this broke.
+		if e.refreshProbe != nil && e.STUNClient != nil {
+			if e.STUNClient.Feed(packetBuf[:n]) {
+				e.finishNatHoleAddrRefresh(e.refreshProbe)
+				e.refreshProbe = nil
+			}
+		}
 		// Punch traffic is logged (throttled) inside handlePunchDatagram; logging
 		// every datagram here is what buried the real events during the ACK echo loop.
 		if !p2p.IsPunch(packetBuf, n) {

@@ -609,6 +609,23 @@ func (e *EdgeClient) refreshPubSocketFromSTUN(result *STUNResult) string {
 	// it for NatHoleInstruction coordination.
 	if e.Peers.Me != nil {
 		e.Peers.Me.Infos.PubSocket = result_str
+		// NAT type has the same registration-timing trap as PubSocket, and
+		// it gates hole punching outright. Both the RegisterRequest and the
+		// first PeerP2PInfos broadcast read NatType from NatFeature, which
+		// is nil until STUN classification finishes -- so an edge registered
+		// early advertised "unknown" and never corrected it. The Worker's
+		// isCoordEligible rejects any peer that is neither HardNAT nor
+		// EasyNAT, so both edges stayed ineligible forever and
+		// coordinateNatHole reported eligible=0 with both peers online.
+		// Refresh it here, next to PubSocket, so the next broadcast carries
+		// the classified type.
+		if result.NatFeature != nil && result.NatFeature.NatType != "" &&
+			result.NatFeature.NatType != e.Peers.Me.Infos.NatType {
+			prev := e.Peers.Me.Infos.NatType
+			e.Peers.Me.Infos.NatType = result.NatFeature.NatType
+			log.Printf("[P2P] Updated Me.Infos.NatType %s -> %s after STUN refresh",
+				prev, result.NatFeature.NatType)
+		}
 		e.Peers.SetPendingChanges()
 		log.Printf("[P2P] Updated Me.Infos.PubSocket to %s after STUN refresh", result_str)
 	}
