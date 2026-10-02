@@ -51,8 +51,47 @@ type NatFeature struct {
 //
 // Ported from FRP's ClassifyNATFeature.
 func ClassifyNATFeature(addresses []string, localIPs []string) (*NatFeature, error) {
-	if len(addresses) <= 1 {
-		return nil, fmt.Errorf("not enough addresses for NAT classification")
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("no addresses for NAT classification")
+	}
+	if len(addresses) == 1 {
+		// One STUN response cannot distinguish a cone NAT from a symmetric
+		// one -- there is nothing to compare it against -- but it does settle
+		// two things, and refusing to answer threw both away.
+		//
+		// It used to return an error here, which left NatFeature nil, which
+		// made the edge advertise natType="unknown", which made the Worker's
+		// isCoordEligible reject the peer outright
+		// (handler.js:386 accepts only HardNAT/EasyNAT). A host behind a
+		// firewall that lets one of the six STUN servers through was thus
+		// silently excluded from hole-punch coordination for the life of the
+		// process. Observed 2026-10-02 on E1 (100.64.0.1) and log3
+		// (100.64.0.4), both Online and both punching fine by hand.
+		//
+		// If the mapped IP is one of ours there is no NAT at all, and that is
+		// decidable from a single sample -- report it as public. Otherwise we
+		// cannot prove cone, so say HardNAT: it still passes isCoordEligible,
+		// and being treated as the hard case only costs a longer ladder,
+		// whereas "unknown" costs the peer its place in the ladder entirely.
+		addr := &NatFeature{Behavior: BehaviorNoChange}
+		host, portStr, err := net.SplitHostPort(addresses[0])
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", addresses[0], err)
+		}
+		// The classification below only reads the host, but the port is
+		// validated anyway so this path accepts exactly what the multi-sample
+		// path does. A corrupt address is worth reporting even when the
+		// answer would not have changed.
+		if _, err := strconv.Atoi(portStr); err != nil {
+			return nil, fmt.Errorf("invalid port %q in %q: %w", portStr, addresses[0], err)
+		}
+		if slices.Contains(localIPs, host) {
+			addr.PublicNetwork = true
+			addr.NatType = EasyNAT
+		} else {
+			addr.NatType = HardNAT
+		}
+		return addr, nil
 	}
 	natFeature := &NatFeature{}
 	ipChanged := false

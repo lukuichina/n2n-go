@@ -234,34 +234,52 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		// that no longer existed. The receiver was punching the right address
 		// all along, so the pair failed in one direction only -- and every
 		// punch round burned all 5 retries against a closed port.
-		targetP2PEndpoint = senderP2PEndpoint
-		targetPubSocket = senderPubSocket
-		if targetP2PEndpoint != "" {
-			log.Printf("NatHoleInstruction: sender using relay-supplied target %s (pubSocket %s)",
-				targetP2PEndpoint, targetPubSocket)
+		// Consult the registry first and validate every candidate. The
+		// relay-supplied endpoint used to be taken verbatim; it can carry a
+		// peer's private interface address (see punch_target_guard.go), and
+		// punching that not only fails but leaves this host with no flow
+		// toward the peer, so the cloud provider's stateful ingress filter
+		// discards the receiver's punches as unsolicited. The registry holds
+		// the peer's STUN-confirmed public mapping, which is the address
+		// that is actually reachable.
+		var regPub, regEndpoint string
+		if p, err := e.Peers.GetPeer(targetMAC); err == nil {
+			regPub = p.Infos.PubSocket
+			regEndpoint = p.P2PEndpoint
 		}
-
-		// The relay may have omitted the endpoint (older relay, or a target
-		// that never reported P2P info). Fall back to the registry then. We
-		// deliberately take the freshest record rather than the first match,
-		// since several may exist for one MAC.
-		if targetP2PEndpoint == "" {
-			if p, err := e.Peers.GetPeer(targetMAC); err == nil {
-				targetP2PEndpoint = p.P2PEndpoint
-				targetPubSocket = p.Infos.PubSocket
-				log.Printf("NatHoleInstruction: relay omitted target endpoint; fell back to registry for %s (P2PStatus=%s endpoint=%s pubSocket=%s)",
-					targetMAC, p.P2PStatus.String(), targetP2PEndpoint, targetPubSocket)
-			}
-		}
-		if targetP2PEndpoint == "" {
-			log.Printf("[Edge] NatHoleInstruction: sender cannot resolve target %s endpoint (relay gave none, registry has none)", targetMAC)
+		chosen, note := resolvePunchTarget(regPub, regEndpoint, senderP2PEndpoint, targetMAC)
+		log.Printf("NatHoleInstruction: sender target resolution: %s", note)
+		if chosen == "" {
+			log.Printf("[Edge] NatHoleInstruction: sender cannot resolve a routable target for %s", targetMAC)
 			return nil
 		}
+		targetP2PEndpoint = chosen
+		if regPub != "" {
+			targetPubSocket = regPub
+		} else {
+			targetPubSocket = senderPubSocket
+		}
 	} else {
-		// We are the receiver; the target is the sender.
-		// The sender's P2P endpoint and pub socket are in the instruction.
-		targetP2PEndpoint = senderP2PEndpoint
-		targetPubSocket = senderPubSocket
+		// We are the receiver; the target is the sender. Resolve it exactly
+		// as the sender branch does -- the instruction's endpoint field can
+		// carry an off-link private address here just as easily.
+		var regPub, regEndpoint string
+		if p, err := e.Peers.GetPeer(senderMAC); err == nil {
+			regPub = p.Infos.PubSocket
+			regEndpoint = p.P2PEndpoint
+		}
+		chosen, note := resolvePunchTarget(regPub, regEndpoint, senderP2PEndpoint, senderMAC)
+		log.Printf("NatHoleInstruction: receiver target resolution: %s", note)
+		if chosen == "" {
+			log.Printf("[Edge] NatHoleInstruction: receiver cannot resolve a routable target for sender %s", senderMAC)
+			return nil
+		}
+		targetP2PEndpoint = chosen
+		if regPub != "" {
+			targetPubSocket = regPub
+		} else {
+			targetPubSocket = senderPubSocket
+		}
 	}
 
 	if targetP2PEndpoint == "" {
