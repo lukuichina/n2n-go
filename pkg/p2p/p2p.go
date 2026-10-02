@@ -5,6 +5,7 @@ import (
 	"n2n-go/pkg/log"
 	"net"
 	"net/netip"
+	"strconv"
 	"sort"
 	"sync"
 	"time"
@@ -273,25 +274,52 @@ func normalizeSocketKey(raw string) string {
 }
 
 func (p *Peer) NotePunchPacket() {
+	p.raddrMu.Lock()
 	p.punchSeenAt = time.Now()
+	p.raddrMu.Unlock()
+}
+
+// PunchSeenAt reports when a punch/ACK last arrived from this peer. Read
+// under raddrMu for the same reason as LastDataSeenAt: the P2P reader
+// goroutine writes it while the punch wait loop and
+// GetPunchedNotFullDuplexPeers read it from their own goroutines.
+func (p *Peer) PunchSeenAt() time.Time {
+	p.raddrMu.RLock()
+	defer p.raddrMu.RUnlock()
+	return p.punchSeenAt
 }
 
 // NoteDataPacket records that a real ProtoV frame arrived from this peer over
 // the P2P UDP socket. This is the only evidence that promotes FullDuplex.
+//
+// Guarded by raddrMu, the same lock P2PRaddr uses. The writer here is the
+// P2P socket reader goroutine (routines.go handleP2P) and the readers are the
+// keepalive tick plus every promotion gate, which run concurrently on their
+// own goroutines. As a bare field this was a data race, and the failure mode
+// was silent and expensive: the keepalive read a stale time.Time, computed a
+// timeout that grew without bound (37s, 47s, ... 28m -- monotonically, because
+// the stale value never moved), and demoted a peer that was in fact still
+// exchanging real frames. Observed 2026-10-02 between log3 (192.168.10.7) and
+// log4 (172.22.2.44): 166 demotions while the direct path carried traffic
+// right through to the end of the log.
 func (p *Peer) NoteDataPacket() {
+	p.raddrMu.Lock()
 	p.dataSeenAt = time.Now()
+	p.raddrMu.Unlock()
 }
 
 // LastDataSeenAt returns when a real data frame was last received from this
 // peer over P2P (zero time if never).
 func (p *Peer) LastDataSeenAt() time.Time {
+	p.raddrMu.RLock()
+	defer p.raddrMu.RUnlock()
 	return p.dataSeenAt
 }
 
 // HasVerifiedDataPath reports whether a real data frame has ever been
 // received from this peer over the P2P socket. Used as the promotion gate.
 func (p *Peer) HasVerifiedDataPath() bool {
-	return !p.dataSeenAt.IsZero()
+	return !p.LastDataSeenAt().IsZero()
 }
 
 func (p *Peer) resetPendingTTL() {
@@ -324,6 +352,10 @@ type PeerRegistry struct {
 	Peers           map[string]*Peer //keyed by MACAddr.String()
 	peerBySocket    map[string]*Peer // keyed by net.UDPAddr.String()
 	peerByP2PSocket map[string]*Peer // keyed by P2PEndpoint string
+	// graceUnlisted holds peers removed purely for being absent from a
+	// PeerInfoList, keyed by MAC, pending reappearance within
+	// graceUnlistedTTL. Guarded by peerMu. See graceUnlistedTTL for why.
+	graceUnlisted map[string]*graceTombstone
 	p2pDatasMu      sync.RWMutex
 	P2PCommunityDatas
 	IsWaitingCommunityDatas bool
@@ -452,6 +484,7 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 		Peers:               make(map[string]*Peer),
 		peerBySocket:        make(map[string]*Peer),
 		peerByP2PSocket:     make(map[string]*Peer),
+		graceUnlisted:       make(map[string]*graceTombstone),
 		natHoleInstrs:       make(map[string]*NatHoleInstruction),
 		natHoleRetryCounts:  make(map[string]int),
 		lastNatHoleInstrs:   make(map[string]*NatHoleInstruction),
@@ -460,6 +493,14 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 }
 
 func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
+	reg.peerMu.Lock()
+	// Sweep expired tombstones here because this runs on every periodic
+	// publish, which is frequent enough to keep the grace window honest
+	// without needing a timer of its own. Done under the write lock rather
+	// than the read lock below because the sweep mutates the maps.
+	reg.expireGraceTombstonesLocked(time.Now())
+	reg.peerMu.Unlock()
+
 	reg.peerMu.RLock()
 	defer reg.peerMu.RUnlock()
 	if reg.Me == nil {
@@ -577,9 +618,24 @@ func (p *Peer) lookupSockets() []string {
 	if p == nil {
 		return nil
 	}
-	raw := make([]string, 0, 1+len(p.Infos.GetAssistedSockets()))
+	raw := make([]string, 0, 2+len(p.Infos.GetAssistedSockets()))
 	if a := p.UDPAddr(); a != nil {
 		raw = append(raw, a.String())
+	}
+	// P2PEndpoint must be indexed too, not just pubSocket and the assisted
+	// set. It is the peer's own local listen address, which is the one a
+	// punch packet most often arrives from once a router has rewritten the
+	// source: behind 192.168.10.7 -> 192.168.10.1/172.22.1.17 the observed
+	// source is the router, and neither pubSocket nor the assisted list
+	// matched it. The packet then fell through to the mid-instruction
+	// fallback in handleP2P, which attributed it to whichever peer the
+	// current instruction named -- so a packet from ea:2f landing during a
+	// punch with aa:bc got recorded against aa:bc, and log4 never learned
+	// anything about log3 (observed 2026-10-02 07:37:44,
+	// "Punch packet from 172.22.1.17:52784 attributed to instruction peer
+	// aa:bc:3a:74:37:b1").
+	if p.P2PEndpoint != "" {
+		raw = append(raw, p.P2PEndpoint)
 	}
 	raw = append(raw, p.Infos.GetAssistedSockets()...)
 
@@ -753,6 +809,112 @@ func (reg *PeerRegistry) SelfTapIP() string {
 	return reg.Me.Infos.GetVirtualIp()
 }
 
+// IsOwnEndpoint reports whether addr is one of this host's own P2P sockets:
+// the P2P listen address we are bound to, or the NAT-mapped address the
+// supernode/StunServer learned for it.
+//
+// Why this must gate every punch target: a punch packet we send to ourselves
+// never leaves the host. It comes straight back through our own receive loop,
+// so handleP2P sees it, falls through to the mid-instruction fallback, gets
+// attributed to whichever peer the instruction named, and stamps that peer's
+// P2PRaddr with our own address. The result is self-sustaining: the next
+// round reads back the poisoned P2PRaddr and punches it again. Observed
+// 2026-10-02 on 192.168.10.13 (log5), which punched 192.168.10.13:43828 495
+// times in a minute and, on receiving its own traffic, promoted ea:2f to
+// FullDuplex 50 times while the real peer sat on the relay -- the peer only
+// looked connected because we were congratulating ourselves.
+//
+// Comparison is by resolved host:port so spellings cannot slip past.
+func (reg *PeerRegistry) IsOwnEndpoint(addr string) bool {
+	if reg == nil || reg.Me == nil || addr == "" {
+		return false
+	}
+	key := addr
+	if ua, err := net.ResolveUDPAddr("udp", addr); err == nil && ua != nil {
+		key = ua.String()
+	}
+	own := make([]string, 0, 2)
+	own = append(own, reg.Me.P2PEndpoint)
+	if ua := reg.Me.UDPAddr(); ua != nil {
+		own = append(own, ua.String())
+	}
+	for _, own := range own {
+		if own == "" {
+			continue
+		}
+		k := own
+		if ua, err := net.ResolveUDPAddr("udp", own); err == nil && ua != nil {
+			k = ua.String()
+		}
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// UnlistPeer removes a peer because it was absent from a PeerInfoList, but
+// keeps its learned direct-path state in a tombstone for graceUnlistedTTL.
+//
+// This is the only removal path allowed to be provisional. An explicit
+// UnregisterRequest (handlers_missing.go) stays final: there the relay is
+// telling us the peer is deliberately gone, and keeping its addresses would
+// attribute a later punch from that address to a machine no longer present.
+//
+// The address indexes are released either way, so nothing routes to the peer
+// and a punch arriving in the gap fails the lookup and takes the unknown-peer
+// path -- it just no longer destroys the state needed to resume instantly.
+func (reg *PeerRegistry) UnlistPeer(MACAddr string) error {
+	reg.peerMu.Lock()
+	defer reg.peerMu.Unlock()
+	reg.UnlistPeerLocked(MACAddr)
+	return nil
+}
+
+// UnlistPeerLocked is UnlistPeer for callers already holding peerMu (the
+// PeerInfoList removal loop).
+func (reg *PeerRegistry) UnlistPeerLocked(MACAddr string) {
+	p, exists := reg.Peers[MACAddr]
+	if !exists {
+		return
+	}
+
+	dDesc := p.Infos.Desc
+	dVip := p.Infos.VirtualIp
+	for _, k := range p.lookupSockets() {
+		delete(reg.peerBySocket, k)
+	}
+	if p.P2PEndpoint != "" {
+		delete(reg.peerByP2PSocket, p.P2PEndpoint)
+	}
+	delete(reg.Peers, MACAddr)
+	reg.graceUnlisted[MACAddr] = &graceTombstone{peer: p, expiresAt: time.Now().Add(graceUnlistedTTL)}
+	log.Printf("unlisted peer %s/%s/%s — keeping direct-path state for %v in case it returns",
+		dDesc, dVip, MACAddr, graceUnlistedTTL)
+	reg.SetPendingChanges()
+}
+
+// expireGraceTombstones drops tombstones whose peer neither came back nor was
+// re-listed. Caller must hold peerMu.
+func (reg *PeerRegistry) expireGraceTombstonesLocked(now time.Time) {
+	for mac, t := range reg.graceUnlisted {
+		if now.Before(t.expiresAt) {
+			continue
+		}
+		p := t.peer
+		for _, k := range p.lookupSockets() {
+			if reg.peerBySocket[k] == p {
+				delete(reg.peerBySocket, k)
+			}
+		}
+		if p.P2PEndpoint != "" && reg.peerByP2PSocket[p.P2PEndpoint] == p {
+			delete(reg.peerByP2PSocket, p.P2PEndpoint)
+		}
+		delete(reg.graceUnlisted, mac)
+		log.Printf("grace period expired for %s/%s/%s — forgetting it", p.Infos.Desc, p.Infos.VirtualIp, mac)
+	}
+}
+
 func (reg *PeerRegistry) GetPeerBySocket(addr *net.UDPAddr) (*Peer, error) {
 	if addr == nil {
 		return nil, fmt.Errorf("cannot GetPeerBySocket with nil net.UDPAddr")
@@ -771,6 +933,41 @@ func (reg *PeerRegistry) GetPeerBySocket(addr *net.UDPAddr) (*Peer, error) {
 // (ignoring port). This is a fallback for symmetric NAT where the
 // NAT-assigned port differs from the STUN-discovered pubSocket port,
 // so an exact socket match fails but the IP still identifies the peer.
+// PeerClaimingPort returns the peer, other than exclude, that already claims
+// this UDP port on any address known to the registry -- pubSocket, P2P
+// endpoint, assisted set or observed raddr.
+//
+// Behind a shared NAT gateway the IP cannot separate peers: log3 and log5
+// both publish 111.101.5.1 and differ only in port (62040 vs 48009). An IP
+// match there returns whichever peer the map happens to yield, so an inbound
+// packet gets charged to the wrong node and the two peers' raddrs end up
+// transposed -- each then sends to the other's address and neither answers.
+// Observed 2026-10-02 on log4: it recorded log3 at 172.22.1.17:48009 and
+// log5 at 172.22.1.17:62040, exactly swapped, so it could ping E1 and
+// nothing else.
+//
+// The port is therefore the tie-breaker, and it must be checked before any
+// address-based attribution overwrites what is already known.
+func (reg *PeerRegistry) PeerClaimingPort(port uint16, exclude *Peer) *Peer {
+	if reg == nil || port == 0 {
+		return nil
+	}
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
+
+	for key, owner := range reg.peerBySocket {
+		if owner == nil || owner == exclude {
+			continue
+		}
+		if _, ps, err := net.SplitHostPort(key); err != nil {
+			continue
+		} else if pn, err := strconv.Atoi(ps); err == nil && uint16(pn) == port {
+			return owner
+		}
+	}
+	return nil
+}
+
 func (reg *PeerRegistry) GetPeerBySocketIP(ip net.IP) (*Peer, error) {
 	if ip == nil {
 		return nil, fmt.Errorf("cannot GetPeerBySocketIP with nil IP")
@@ -972,6 +1169,63 @@ func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
 	return previousStatus != status
 }
 
+// graceUnlistedTTL is how long a peer removed because it was absent from a
+// PeerInfoList keeps its learned direct-path state while staying out of the
+// active registry.
+//
+// Why this exists: a PeerInfoList is a snapshot, and snapshots are routinely
+// incomplete for reasons that have nothing to do with the missing peer. When
+// one node drops off, the relay rebroadcasts, and every receiver rebuilds from
+// that list -- so a peer that was perfectly healthy a second earlier gets
+// removed along with the one that actually left. Observed 2026-10-02 at
+// 11:19:03 on log3: 52:eb (log5) went offline, and in the same refresh
+// 9e:6e (log4), 0a:e3 (E1) and aa:bc (E2) were removed too. log4 had been
+// FullDuplex over a verified direct path since 10:30 and lost it, because
+// RemovePeer dropped the *Peer outright and AddPeer rebuilt it at P2PUnknown
+// with an empty P2PRaddr. That is unrecoverable on its own: the direct path
+// is gated on a non-empty raddr (wire.go), the raddr can only be filled by a
+// direct data frame, and every frame falls back to the relay until the raddr
+// is set. Both sides then wait on each other indefinitely -- log3 logged "not
+// promoting 9e:6e: punch seen but no data frame verified yet" every few
+// seconds for the rest of the run, and log3->log4 fell back to the Cloudflare
+// relay, turning a 17ms path into a three-digit one.
+//
+// So removal for absence is now provisional: the peer leaves reg.Peers (so
+// nothing routes to it) but its address, raddr and verification timestamps
+// move to a tombstone. A reappearance within the TTL restores the state
+// intact; a longer absence expires the tombstone and the peer is genuinely
+// forgotten. An explicit Unregister is not provisional and never consults this.
+const graceUnlistedTTL = 90 * time.Second
+
+// peerRecentlyAliveWindow is how recently we must have observed a peer for a
+// control-plane "this peer is gone" list to be disbelieved. It is generous
+// on purpose: a peer that is genuinely gone cannot produce a data frame, so
+// the window only has to outlast a couple of missed keepalives. Erring wide
+// means we occasionally keep a dead peer for one extra interval, which costs
+// a stale entry; erring narrow means we tear down live tunnels, which costs
+// the mesh.
+const peerRecentlyAliveWindow = 45 * time.Second
+
+// recentlyAliveLocked reports whether we have positive evidence that peer is
+// still reachable: either a confirmed direct path, or a direct data frame
+// recent enough to rule out a relay-side claim that it went away.
+//
+// Caller must hold peerMu (RLock is enough).
+func (reg *PeerRegistry) recentlyAliveLocked(p *Peer) bool {
+	if p.IsFullDuplex {
+		return true
+	}
+	last := p.LastDataSeenAt()
+	return !last.IsZero() && time.Since(last) < peerRecentlyAliveWindow
+}
+
+type graceTombstone struct {
+	peer       *Peer
+	expiresAt  time.Time
+}
+
+// SetP2PRaddr for a tombstoned peer still works, so a punch arriving while
+// the peer is unlisted can refresh it; the registry just will not route to it.
 func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) {
 	reg.peerMu.Lock()
 	defer reg.peerMu.Unlock()
@@ -1026,8 +1280,41 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 	// cannot call it.
 	peer.SetP2PEndpoint(infos.P2PEndpoint)
 	reg.Peers[macAddr] = peer
+	// A tombstone means this peer was unlisted, not that it is new. Restore
+	// the direct-path state it had learned before, so a peer that merely
+	// went missing from one snapshot resumes on the path it already had
+	// instead of re-proving it from P2PUnknown with an empty raddr.
+	//
+	// Only the observation carries over. P2PStatus stays Unknown on
+	// purpose: while it was gone we could not hear from it, so claiming the
+	// tunnel is still up would be exactly the "control-plane state lies"
+	// failure this tombstone exists to avoid. What the raddr buys us is the
+	// ability to finish one punch round and be back, rather than negotiating
+	// a fresh raddr against a dead end.
+	if t, ok := reg.graceUnlisted[macAddr]; ok {
+		if r := t.peer.GetP2PRaddr(); r != "" {
+			peer.SetP2PRaddr(r)
+			log.Printf("peer %s/%s/%s returned within grace — restored raddr %s from before it was unlisted",
+				peer.Infos.Desc, peer.Infos.VirtualIp, macAddr, r)
+		}
+		delete(reg.graceUnlisted, macAddr)
+	}
 	for _, k := range peer.lookupSockets() {
 		reg.peerBySocket[k] = peer
+	}
+	// The tombstone above restored an raddr, but lookupSockets deliberately
+	// excludes it -- it is not an advertised address. Without this line the
+	// restored raddr is set on the peer and absent from the index, so the
+	// first inbound packet from it resolves to nobody and the restored state
+	// is worse than useless: it looks recovered and is not reachable.
+	//
+	// Inlined rather than routed through IndexPeerRaddr because AddPeer
+	// already holds reg.peerMu and that method takes it again.
+	if r := peer.GetP2PRaddr(); r != "" {
+		if k := normalizeSocketKey(r); k != "" {
+			reg.peerBySocket[k] = peer
+			peer.indexedRaddr = k
+		}
 	}
 	if peer.P2PEndpoint != "" {
 		reg.peerByP2PSocket[peer.P2PEndpoint] = peer
@@ -1183,7 +1470,7 @@ func (reg *PeerRegistry) GetPunchedNotFullDuplexPeers() []*Peer {
 		}
 		// Either side counts: we received their punch, or we already ran
 		// (and possibly failed) a punch against them.
-		if !p.punchSeenAt.IsZero() || p.NatHoleExecuted {
+		if !p.PunchSeenAt().IsZero() || p.NatHoleExecuted {
 			peerlist = append(peerlist, p)
 		}
 	}
@@ -1614,10 +1901,10 @@ func waitForPunchSuccess(reg *PeerRegistry, targetMACStr string, label string) b
 	// attempt rather than an earlier one.
 	var baseline time.Time
 	if p, err := reg.GetPeer(targetMACStr); err == nil {
-		baseline = p.punchSeenAt
+		baseline = p.PunchSeenAt()
 	}
 	for {
-		if p, err := reg.GetPeer(targetMACStr); err == nil && p.punchSeenAt.After(baseline) {
+		if p, err := reg.GetPeer(targetMACStr); err == nil && p.PunchSeenAt().After(baseline) {
 			log.Printf("[P2P] %s: peer punched back within the read timeout", label)
 			return true
 		}
@@ -1825,11 +2112,45 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 			punchTarget = senderPubSocket
 		}
 	}
+	// Highest priority for both roles: the address the peer's packets
+	// demonstrably arrive from. Everything considered above is derived from
+	// what the peer believes about itself, and behind a NAT none of it can be
+	// dialled from here -- the peer's private interface, and its STUN
+	// reflection, which needs the router to hairpin. Only an observed source
+	// address survives that, because a packet has already been proven to
+	// arrive from it.
+	//
+	// Placed here rather than in the Sender candidate builder below so the
+	// Receiver gets it too: the Receiver is the side that has usually heard
+	// the peer already, since a rewritten punch source is precisely what the
+	// mid-instruction fallback in handleP2P cannot attribute. Observed
+	// 2026-10-02 on 192.168.10.7 -> 192.168.10.1/172.22.1.17 -> 172.22.2.44,
+	// where log4 held 172.22.1.17:52784 and still spent five rounds per rung
+	// punching 111.101.5.1:52784.
+	if obsMAC := macAddrStr(instr.GetTargetMac()); obsMAC != "" {
+		if tp, terr := reg.GetPeer(obsMAC); terr == nil && tp != nil {
+			if raddr := tp.GetP2PRaddr(); raddr != "" && !reg.IsOwnEndpoint(raddr) {
+				punchTarget = raddr
+				log.Printf("[P2P] Receiver: using observed raddr %s as punch target for %s (ahead of self-reported addresses)", raddr, obsMAC)
+			}
+		}
+	}
 	if punchTarget == "" {
 		punchTarget = targetP2PEndpoint
 	}
 	if punchTarget == "" {
 		log.Printf("[P2P] executeNatHolePunch: no target address")
+		return false
+	}
+
+	// Last line of defence, covering every branch above plus any future one:
+	// never punch ourselves. See PeerRegistry.IsOwnEndpoint for why a
+	// self-addressed punch is worse than no punch at all -- it manufactures
+	// a FullDuplex promotion out of our own echo. Bail and let the next rung
+	// re-dispatch with a sane target rather than poisoning the peer's raddr.
+	if reg.IsOwnEndpoint(punchTarget) {
+		log.Printf("[P2P] executeNatHolePunch: refusing to punch our own endpoint %s (role=%v target=%s); skipping round",
+			punchTarget, role, macAddrStr(instr.GetTargetMac()))
 		return false
 	}
 
@@ -2148,6 +2469,53 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 						if !alreadyAdded {
 							candidates = append(candidates, ep)
 						}
+					}
+				}
+
+				// The peer's observed raddr, when we have one. This is the
+				// address its packets demonstrably arrive from, which
+				// self-reported addresses cannot establish behind NAT: the
+				// registry entry holds 192.168.10.7 while the only thing
+				// reachable from here is the router's 172.22.1.17. Preferring
+				// it here means a side that has already heard the peer --
+				// even just once, even before the relay reports anything --
+				// punches an address that works, instead of re-deriving the
+				// same unreachable set every round.
+				// Prepended, not appended, and deliberately ahead of both
+				// the same-subnet promotion above and every self-reported
+				// address. It is the only entry backed by observation: the
+				// peer's own endpoint and assisted list describe addresses
+				// the peer believes it has, while this one is where its
+				// packets demonstrably arrive. Behind a NAT only the latter
+				// is reachable -- 192.168.10.7's packets leave its router as
+				// 172.22.1.17, and neither 192.168.10.7 nor its STUN
+				// reflection 111.101.5.1 can be dialled from the far side.
+				//
+				// Ordering matters as much as membership: the first
+				// candidate is what punchTarget defaults to, so an appended
+				// raddr would still lose to a hairpin address that silently
+				// drops every packet.
+				if raddr := p.GetP2PRaddr(); raddr != "" {
+					if ra, err3 := net.ResolveUDPAddr("udp", raddr); err3 == nil && ra != nil {
+						alreadyPresent := false
+						for _, c := range candidates {
+							if c.String() == ra.String() {
+								alreadyPresent = true
+								break
+							}
+						}
+						if !alreadyPresent {
+							candidates = append([]*net.UDPAddr{ra}, candidates...)
+							log.Printf("[P2P] Sender: promoted observed raddr %s for %s to the front of %d candidate(s)",
+								raddr, macAddrStr(targetMAC), len(candidates))
+						}
+						// Also make it the primary, not just a candidate.
+						// punchTarget is what the ladder logs as "primary"
+						// and what the port scan ranges around; leaving it
+						// pointing at an unreachable self-reported address
+						// keeps the round failing even though a working
+						// address is now in the list.
+						punchTarget = ra.String()
 					}
 				}
 			}
@@ -2614,8 +2982,10 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 					continue
 				}
 				if _, exists := newPeers[macAddr]; !exists {
-					reg.RemovePeer(macAddr)
-					log.Printf("removed peer with MAC address %s not in new list", macAddr)
+					// UnlistPeer, not RemovePeer: absence from one snapshot is
+					// not proof of departure. See graceUnlistedTL.
+					reg.UnlistPeerLocked(macAddr)
+					log.Printf("peer with MAC address %s absent from new list — unlisted, state kept for grace", macAddr)
 				}
 			}
 		}
@@ -2646,13 +3016,46 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 		// our own entry (it is building the list from the full peer table,
 		// and we are one of its peers). Deleting our own registry entry
 		// silently breaks GetPeer/AddPeer for every later message.
+		//
+		// A peer we have positive, recent evidence for stays. This event is
+		// the relay's *claim* that these peers are gone; it is not proof. A
+		// peer we heard a direct frame from seconds ago is demonstrably
+		// here, and destroying it costs a proven P2P path -- its raddr and
+		// FullDuplex marker -- for nothing.
+		//
+		// Why this matters concretely: the relay used to build this payload
+		// from getOnlinePeers(), i.e. the nodes that were *staying*, so one
+		// node going offline named every other node as departed. Observed
+		// 2026-10-02 at 13:32:27 with log5 leaving: log3 removed E1 and
+		// log4, log4 removed E1 and log3, each losing a working direct path
+		// that had been up since 12:56. Both then spent the rest of the run
+		// stuck at Available/Pending with "punch seen but no data frame
+		// verified yet", because a rebuilt peer has no raddr and the direct
+		// path is gated on one -- a wait on each other that never closes.
+		//
+		// The relay side is fixed too (relay_room.js must pass peerOverride,
+		// as handler.js already did). This guard is the second line: it makes
+		// one missed argument non-fatal instead of a full-mesh outage.
 		for _, info := range peerInfoList.GetPeerInfos() {
 			macAddr := net.HardwareAddr(info.MacAddr).String()
 			if ourMAC != "" && macAddr == ourMAC {
 				continue
 			}
-			err := reg.RemovePeer(macAddr)
-			if err != nil {
+			// Read under the lock, then release before RemovePeer, which
+			// takes the write lock itself. This loop runs unlocked: it is
+			// inside a switch, not a critical section, and holding peerMu
+			// across RemovePeer would deadlock on the non-reentrant RWMutex.
+			reg.peerMu.RLock()
+			p, known := reg.Peers[macAddr]
+			alive := known && reg.recentlyAliveLocked(p)
+			reg.peerMu.RUnlock()
+
+			if alive {
+				log.Printf("[P2P] unregister list names %s but we have seen it within %v -- keeping it (list is stale or over-broad)",
+					macAddr, peerRecentlyAliveWindow)
+				continue
+			}
+			if err := reg.RemovePeer(macAddr); err != nil {
 				return fmt.Errorf("failed to remove peer: %v", err)
 			}
 		}

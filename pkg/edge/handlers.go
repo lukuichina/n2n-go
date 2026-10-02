@@ -107,10 +107,30 @@ func (e *EdgeClient) handleVFuzePacket(packetBuf []byte, n int, addr *net.UDPAdd
 	// is still valid and must be delivered — only the raddr bookkeeping needs
 	// a real source, and a relayed packet simply has none to learn.
 	if addr != nil {
+		// Every SetP2PRaddr must be paired with IndexPeerRaddr. The registry
+		// resolves inbound packets by socket address, and the raddr is
+		// precisely the address a NAT rewrote the source to -- so an raddr
+		// that is set but not indexed is one this peer will never be found
+		// by again.
+		//
+		// Observed 2026-10-02 on log4 (172.22.2.44 behind a router at
+		// 172.22.1.17): its raddr for log3 settled on 172.22.1.17:49653
+		// through this very block, and the index never learned that address.
+		// 451 well-formed direct frames then arrived from exactly that source
+		// and not one promoted the peer, because handleP2P's GetPeerBySocket
+		// missed and the IP fallback could not match a NAT device to any
+		// peer either. The pair sat at Available and the punch path kept
+		// logging "punch seen but no data frame verified yet" forever.
+		//
+		// log3, with no NAT in front of it, was unaffected -- its peers'
+		// advertised addresses already resolve -- which is why the symptom
+		// looked selective rather than universal.
 		if peer, err := e.Peers.GetPeerBySocket(addr); err == nil {
 			peer.SetP2PRaddr(addr.String())
+			e.Peers.IndexPeerRaddr(peer, addr.String())
 		} else if peer, err := e.Peers.GetPeerBySocketIP(addr.IP); err == nil {
 			peer.SetP2PRaddr(addr.String())
+			e.Peers.IndexPeerRaddr(peer, addr.String())
 		}
 	}
 
@@ -170,8 +190,11 @@ func (e *EdgeClient) handleDataMessage(r *protocol.RawMessage) error {
 	// This continuously updates the best-known reachable address under
 	// Symmetric NAT where the port changes per destination.
 	if udpAddr, ok := r.FromAddr.(*net.UDPAddr); ok && udpAddr != nil {
+		// Same invariant as above: set and index together, or the new raddr
+		// is unreachable by lookup.
 		if peer, err := e.Peers.GetPeerBySocket(udpAddr); err == nil {
 			peer.SetP2PRaddr(udpAddr.String())
+			e.Peers.IndexPeerRaddr(peer, udpAddr.String())
 		}
 	}
 

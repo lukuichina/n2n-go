@@ -599,6 +599,21 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 		// Fallback: match by IP only (Symmetric NAT may hand the peer a
 		// different port per destination, so the socket match can miss).
 		p, err = e.Peers.GetPeerBySocketIP(addr.IP)
+		// An IP match is not an identity when peers share a NAT gateway.
+		// log3 and log5 both publish 111.101.5.1 and differ only in port, so
+		// this lookup can hand back either one. If the inbound port is
+		// already claimed by a different peer, that port is the better
+		// evidence and this attribution must not be made -- recording it
+		// transposes the two peers' raddrs and each ends up sending to the
+		// other's address.
+		if err == nil && p != nil {
+			if other := e.Peers.PeerClaimingPort(uint16(addr.Port), p); other != nil {
+				log.Printf("[P2P] Refusing IP-only attribution of %v to peer %s: port %d is already claimed by %s",
+					addr, net.HardwareAddr(p.Infos.MacAddr).String(), addr.Port,
+					net.HardwareAddr(other.Infos.MacAddr).String())
+				p, err = nil, fmt.Errorf("ambiguous IP-only attribution: port %d belongs to another peer", addr.Port)
+			}
+		}
 	}
 	if err != nil {
 		// Unknown peer: still answer a genuine punch — it is how a peer that
@@ -618,8 +633,28 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 		// the instruction already names records a fact about a peer known to
 		// exist; it is not the fabrication the branch above is guarding
 		// against, and the window closes with the instruction.
-		if mac := e.loadExpectedPunchPeerMAC(); mac != "" {
+		if mac := e.loadExpectedPunchPeerMAC(); mac != "" && !e.isOwnP2PEndpoint(addr) {
 			if named, nerr := e.Peers.GetPeer(mac); nerr == nil && named != nil {
+				// Same ambiguity as above, and worse here: this branch names
+				// the peer from the instruction rather than from the packet,
+				// so a punch relayed by the shared gateway is charged to
+				// whichever peer happened to be running a round. Observed
+				// 2026-10-02 on log4, all three of:
+				//   17:50:25 from 172.22.1.17:62040 -> log3   (log3's port, ok)
+				//   17:50:26 from 172.22.1.17:48009 -> log3   (log5's port!)
+				//   17:50:58 from 172.22.1.17:62040 -> log5   (log3's port!)
+				// leaving log4 reachable only to E1.
+				//
+				// Answering is still fine -- the packet is genuinely from a
+				// peer -- but recording it against the wrong peer is not.
+				if other := e.Peers.PeerClaimingPort(uint16(addr.Port), named); other != nil {
+					log.Printf("[P2P] Refusing to attribute punch from %v to instruction peer %s: port %d is already claimed by %s (answering without recording)",
+						addr, mac, addr.Port, net.HardwareAddr(other.Infos.MacAddr).String())
+					if named.AllowPunchAck(now) {
+						e.sendPunchAck(addr)
+					}
+					return
+				}
 				log.Printf("[P2P] Punch packet from %v attributed to instruction peer %s (source address was rewritten in transit)", addr, mac)
 				if named.AllowPunchAck(now) {
 					e.sendPunchAck(addr)
@@ -696,6 +731,8 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 			p2p.NatHolePunchState_PunchStateSucceeded, 1,
 			fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
 			e.Peers.CurrentNatHoleBehaviorIndex(mac))
+		log.Printf("[P2P] Reported punch SUCCEEDED for %s to relay (from %s %s)", mac,
+			map[bool]string{true: "ACK", false: "packet"}[isAck], addr)
 	} else {
 		e.Peers.RecordNatHolePunchResult(
 			mac,
@@ -716,6 +753,62 @@ func (e *EdgeClient) setExpectedPunchPeerMAC(mac string) {
 	e.expectedPunchPeerMACMu.Lock()
 	e.expectedPunchPeerMAC = mac
 	e.expectedPunchPeerMACMu.Unlock()
+}
+
+// isOwnP2PEndpoint reports whether addr is one of this edge's own local
+// addresses or its own P2P listen endpoint. Packets we sent to ourselves come
+// back on the same socket -- the punch loop targets every local interface
+// address, so sending to our own port reflects straight back -- and must
+// never be credited to a peer.
+//
+// Without this the rewritten-source fallback above credits our own looped
+// punch to whatever peer the current instruction names, and that fabricated
+// fact is worse than no attribution at all: it is recorded as an observed
+// P2PRaddr and then verified as a real data frame, so the pair promotes to
+// FullDuplex against itself. Observed 2026-10-02 on log5
+// (192.168.10.13, P2PEndpoint 192.168.10.13:43828) punching ea:2f: 50
+// promotions and 49 demotions in ten minutes, each cycle logging
+// "FullDuplex established with ea:2f:de:90:a5:72 (verified by real data frame
+// from 192.168.10.13:43828)" -- log5's own address.
+func (e *EdgeClient) isOwnP2PEndpoint(addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	if e.P2PConn != nil {
+		if la := e.P2PConn.LocalAddr(); la != nil {
+			if addr.String() == la.String() {
+				return true
+			}
+		}
+	}
+	if me := e.Peers.Me; me != nil {
+		if me.UDPAddr() != nil && addr.String() == me.UDPAddr().String() {
+			return true
+		}
+		if me.P2PEndpoint != "" && addr.String() == me.P2PEndpoint {
+			return true
+		}
+	}
+	// Compare against every local interface address, uncapped.
+	//
+	// ListLocalIPs returns bare IPs, not host:port. The previous form here
+	// compared one against addr.String() -- "192.168.10.13" against
+	// "192.168.10.13:43484", which can never be equal -- and then tried
+	// net.SplitHostPort on that bare IP, which always errors and skips the
+	// branch. Both arms were dead: this guard never once fired, which is how
+	// log5 talked itself into a full-duplex conversation with itself.
+	// Observed 2026-10-02T09:09:22Z, log5 (192.168.10.13) recording log3's
+	// raddr as 192.168.10.13:43484 -- its own address -- and then logging
+	// "FullDuplex established with ea:2f:de:90:a5:72 (verified by real data
+	// frame from 192.168.10.13:43484)".
+	//
+	// The cap is dropped on purpose: a host with more than eight interfaces
+	// could have its own address ranked out of the list, and the address we
+	// most need to recognise is always our own.
+	if isLocalInterfaceIP(addr.IP) {
+		return true
+	}
+	return addr.IP.IsLoopback() || addr.IP.Equal(net.IPv4zero)
 }
 
 func (e *EdgeClient) loadExpectedPunchPeerMAC() string {
@@ -864,7 +957,35 @@ func (e *EdgeClient) handleP2P() {
 		// proof we accept that the direct data path actually carries traffic.
 		// Record it and let it (not a punch) promote the peer to FullDuplex.
 		if rawMsg.Header != nil {
-			if p, perr := e.Peers.GetPeerBySocket(addr); perr == nil {
+			p, perr := e.Peers.GetPeerBySocket(addr)
+			if perr != nil {
+				// The socket index is populated by the punch path and by
+				// IndexPeerRaddr, so it can legitimately miss a source we
+				// have never seen punch from -- notably right after a peer is
+				// re-added from a PeerInfoList, when the registry entry is
+				// fresh but the peer has been sending real frames the whole
+				// time. Observed 2026-10-02 on log3 -> log4 after the
+				// 11:19:03 refresh: 598 well-formed frames arrived from
+				// 172.22.2.44:53814 and not one promoted the peer, because
+				// every lookup by socket missed and the block below was
+				// skipped entirely. The punch path had meanwhile succeeded
+				// and the peer sat at Available, retrying forever.
+				//
+				// Fall back to the IP, matching what the punch path above
+				// already does. Symmetric NAT can hand a peer a different
+				// port per destination, so this is weaker than an exact
+				// socket match -- but it is not weaker than the alternative,
+				// which is dropping the only evidence that the direct path
+				// carries data.
+				p, perr = e.Peers.GetPeerBySocketIP(addr.IP)
+				if perr == nil && p != nil && !e.isOwnP2PEndpoint(addr) {
+					p.SetP2PRaddr(addr.String())
+					e.Peers.IndexPeerRaddr(p, addr.String())
+					log.Printf("[P2P] direct frame from %v attributed to peer %s by IP (socket index had no entry)",
+						addr, net.HardwareAddr(p.Infos.MacAddr).String())
+				}
+			}
+			if perr == nil && p != nil {
 				// Learn the peer's raddr from the same observation that proves
 				// the direct path works.
 				//
@@ -919,6 +1040,18 @@ func (e *EdgeClient) handleP2P() {
 						p2p.NatHolePunchState_PunchStateSucceeded, 1,
 						fmt.Sprintf("verified by real data frame from %s", addr),
 						e.Peers.CurrentNatHoleBehaviorIndex(mac))
+					// Mirror the failure branch (p2p.go), which logs
+					// "Reported punch FAILED ... to relay". Without the
+					// matching success line an edge log cannot show on its
+					// own that the relay was told the round succeeded, and
+					// the gap reads as a broken feedback loop: on
+					// 2026-10-02 five nodes were all FullDuplex while
+					// three edge logs contained zero "succeeded" lines,
+					// which took cross-reading the Worker log to refute.
+					// Silence here is indistinguishable from the failure to
+					// report, so the two outcomes must be asymmetric in
+					// neither direction.
+					log.Printf("[P2P] Reported punch SUCCEEDED for %s to relay", mac)
 				}
 			}
 		}
@@ -1136,4 +1269,35 @@ func (e *EdgeClient) handleWSS() {
 			log.Printf("Error from WSS messageHandler: %v", err)
 		}
 	}
+}
+
+// isLocalInterfaceIP reports whether ip is bound to one of this host's own
+// interfaces -- the question "did this packet come from me?".
+//
+// It walks net.InterfaceAddrs directly and uncapped. The obvious shortcuts
+// both fail: ListLocalIPs returns bare IPs rather than host:port, so
+// comparing one against addr.String() is always false, and splitting a bare
+// IP with SplitHostPort always errors. Both were shipped, and the guard they
+// belonged to therefore never fired.
+func isLocalInterfaceIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP == nil {
+			continue
+		}
+		if ipnet.IP.Equal(ip) {
+			return true
+		}
+		if v4 := ipnet.IP.To4(); v4 != nil && v4.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
