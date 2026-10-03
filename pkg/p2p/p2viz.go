@@ -10,11 +10,9 @@ import (
 	"github.com/goccy/go-graphviz"
 )
 
-
 func add_offline(s string, desc string, ip string) string {
 	return fmt.Sprintf("%s\n\"%s\" [color=grey label=<<table BORDER=\"0\" CELLBORDER=\"0\"><tr><TD ROWSPAN=\"3\"><img src=\"/static/cloud.png\"/></TD><td align=\"left\">%s</td></tr><tr><TD align=\"left\">%s</TD></tr></table>>]", s, desc, desc, ip)
 }
-
 
 func genHeader(community string) string {
 	return fmt.Sprintf(header, strings.ToTitle(community))

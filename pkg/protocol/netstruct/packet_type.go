@@ -11,7 +11,7 @@ type PacketTyped interface {
 
 // LeasesInfos messages
 func (*LeasesInfos) PacketType() spec.PacketType { return spec.TypeLeasesInfos }
-func (*OnlineCheck) PacketType() spec.PacketType   { return spec.TypeOnlineCheck }
+func (*OnlineCheck) PacketType() spec.PacketType { return spec.TypeOnlineCheck }
 
 // Register messages
 func (*SnPublicSecret) PacketType() spec.PacketType       { return spec.TypeSNPublicSecret }
@@ -26,5 +26,5 @@ func (*PeerListRequest) PacketType() spec.PacketType { return spec.TypePeerListR
 func (*PeerToPing) PacketType() spec.PacketType      { return spec.TypePing }
 
 // ice_turn messages
-func (*ICECandidate) PacketType() spec.PacketType   { return spec.TypeICECandidate }
+func (*ICECandidate) PacketType() spec.PacketType    { return spec.TypeICECandidate }
 func (*TURNCredentials) PacketType() spec.PacketType { return spec.TypeTURNCredentials }

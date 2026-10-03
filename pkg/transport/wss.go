@@ -29,13 +29,21 @@ type WSSTransport struct {
 
 // WSSTransportConfig WSS transport configuration
 type WSSTransportConfig struct {
-	URL         string
-	CertFile    string
-	KeyFile     string
-	SkipVerify  bool
-	ReadTimeout time.Duration
+	URL          string
+	CertFile     string
+	KeyFile      string
+	SkipVerify   bool
+	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
-	ProxyURL    string // http://, https://, socks5://, or socks5s://
+	ProxyURL     string // http://, https://, socks5://, or socks5s://
+
+	// PreferIPv6 selects the address family to dial first. The default is
+	// false, meaning IPv4 first with IPv6 used only when IPv4 is unusable;
+	// see NewFamilyDialContext for why this is not the net.Dialer default.
+	//
+	// Ignored when ProxyURL names an http:// or https:// proxy: gorilla
+	// dials the proxy itself in that case and offers no hook to change how.
+	PreferIPv6 bool
 }
 
 // NewWSSTransport creates a WS/WSS client transport (for edge)
@@ -73,9 +81,19 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 
 	// Configure proxy if specified
 	if config.ProxyURL != "" {
-		if err := configureProxy(dialer, config.ProxyURL); err != nil {
+		if err := configureProxy(dialer, config.ProxyURL, config.PreferIPv6); err != nil {
 			return nil, fmt.Errorf("failed to configure proxy: %w", err)
 		}
+	} else {
+		// Unconditional, not just when PreferIPv6 is set: the default is
+		// already a change of behaviour from net.Dialer's race, and the whole
+		// point is to stop the family being decided by whichever answer arrives
+		// first. See NewFamilyDialContext.
+		//
+		// Only correct without a proxy, because here this dial is the one that
+		// reaches the supernode. With a proxy it is not -- configureProxy owns
+		// NetDialContext, and what needs the ordering is the hop to the proxy.
+		dialer.NetDialContext = NewFamilyDialContext(config.PreferIPv6)
 	}
 
 	conn, resp, err := dialer.Dial(config.URL, nil)
@@ -104,15 +122,24 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 	return transport, nil
 }
 
-// configureProxy configures the websocket dialer to use the specified proxy
-func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
+// configureProxy configures the websocket dialer to use the specified proxy.
+//
+// preferIPv6 selects the address family for the hop *to the proxy*. That is the
+// only hop whose family this code chooses: past a SOCKS5 or CONNECT proxy the
+// tunnel is established by the proxy and there is nothing left to order. The
+// one exception is an http:// proxy, where gorilla dials the proxy itself
+// through dialer.Proxy and exposes no hook to change how, so the preference
+// cannot be honoured there and is silently inert.
+func configureProxy(dialer *websocket.Dialer, proxyURL string, preferIPv6 bool) error {
+	familyDial := NewFamilyDialContext(preferIPv6)
 	if strings.HasPrefix(proxyURL, "socks5://") {
 		// SOCKS5 proxy (plain text)
 		addr := strings.TrimPrefix(proxyURL, "socks5://")
-		socksDialer, err := proxy.SOCKS5("tcp", addr, nil, &net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		})
+		// The forward dialer is what proxy.SOCKS5 uses to reach the proxy
+		// itself, so the family ordering applies to exactly the hop that makes
+		// the choice.
+		socksDialer, err := proxy.SOCKS5("tcp", addr, nil,
+			&familyForwardDialer{ctx: context.Background(), dial: familyDial})
 		if err != nil {
 			return fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
 		}
@@ -124,7 +151,7 @@ func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
 		proxyHost := strings.TrimPrefix(proxyURL, "socks5s://")
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Connect to proxy via TLS
-			tlsConn, err := tls.Dial("tcp", proxyHost, &tls.Config{
+			tlsConn, err := familyTLSDial(ctx, familyDial, proxyHost, &tls.Config{
 				InsecureSkipVerify: true,
 			})
 			if err != nil {
@@ -152,20 +179,20 @@ func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
 		proxyHost := strings.TrimPrefix(proxyURL, "https://")
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Connect to proxy via TLS
-			conn, err := tls.Dial("tcp", proxyHost, &tls.Config{
+			conn, err := familyTLSDial(ctx, familyDial, proxyHost, &tls.Config{
 				InsecureSkipVerify: true,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to connect to HTTPS proxy %s: %w", proxyHost, err)
 			}
-			
+
 			// Send CONNECT request
 			connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", addr, addr)
 			if _, err := conn.Write([]byte(connectReq)); err != nil {
 				conn.Close()
 				return nil, fmt.Errorf("failed to send CONNECT request to proxy: %w", err)
 			}
-			
+
 			// Read proxy response
 			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 			scanner := bufio.NewScanner(conn)
@@ -181,18 +208,18 @@ func configureProxy(dialer *websocket.Dialer, proxyURL string) error {
 					firstLine = false
 				}
 			}
-			
+
 			if err := scanner.Err(); err != nil {
 				conn.Close()
 				return nil, fmt.Errorf("failed to read proxy response: %w", err)
 			}
-			
+
 			// Check if response is 2xx
 			if !strings.HasPrefix(statusLine, "HTTP/1.1 2") {
 				conn.Close()
 				return nil, fmt.Errorf("proxy returned non-200 status: %s", statusLine)
 			}
-			
+
 			return conn, nil
 		}
 	} else if proxyURL != "" {

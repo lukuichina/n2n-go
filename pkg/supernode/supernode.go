@@ -50,8 +50,8 @@ type Supernode struct {
 	SNSecrets *crypto.SNSecrets
 
 	// WSS support
-	wssConnections    map[string]*transport.WSSTransport
-	wssConnectionsMu  sync.RWMutex
+	wssConnections   map[string]*transport.WSSTransport
+	wssConnectionsMu sync.RWMutex
 }
 
 func (s *Supernode) MacADDR() net.HardwareAddr {
@@ -154,10 +154,10 @@ func (s *Supernode) ProcessPacket(packet []byte, addr net.Addr) {
 		if errors.Is(err, ErrCommunityUnknownEdge) || errors.Is(err, ErrCommunityNotFound) {
 			log.Printf("Supernode: sending RetryRegisterRequest to addr:%s", addr.String())
 			if udpAddr, ok := addr.(*net.UDPAddr); ok {
-		s.WritePacket(spec.TypeRetryRegisterRequest, "", nil, nil, udpAddr)
-	} else {
-		log.Printf("Supernode: cannot send packet to non-UDP address: %T", addr)
-	}
+				s.WritePacket(spec.TypeRetryRegisterRequest, "", nil, nil, udpAddr)
+			} else {
+				log.Printf("Supernode: cannot send packet to non-UDP address: %T", addr)
+			}
 		}
 	}
 }
@@ -310,7 +310,7 @@ func (s *Supernode) handleWSSUpgrade(w http.ResponseWriter, r *http.Request) {
 		r.Header.Get("Upgrade"),
 		r.Header.Get("Sec-WebSocket-Version"),
 		r.Header.Get("Sec-WebSocket-Key"))
-	
+
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true // Allow all origins

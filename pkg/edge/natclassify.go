@@ -2,10 +2,12 @@ package edge
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // cgnat is RFC 6598 shared address space (100.64.0.0/10). Go's net package
@@ -196,10 +198,220 @@ func ClassifyFeatureCount(features []*NatFeature) (easyCount, hardCount, regular
 // remote peer: globally routable addresses first, then ordinary private
 // ranges, and finally link-local/tunnel space. Within a tier the original
 // enumeration order is preserved so the result stays deterministic.
+// A down interface's address is actively misleading, not merely useless: a
+// peer spends a punch budget on it and can never get an answer, because
+// nothing can be delivered to an interface that is not up.
+//
+// CollectAssistedIPs already filters on net.FlagUp, but this function did
+// not, and it feeds two places that matter:
+//
+//   - setup.go's ListLocalIPs(1), whose single entry stands in for a
+//     wildcard-bound P2P socket and is broadcast to peers as the endpoint.
+//   - ClassifyNATFeature, which decides whether a STUN-reflexive address is
+//     one of our own -- a wrong entry there makes a genuinely open NAT look
+//     like a symmetric one, or the reverse.
+//
+// Observed on a Windows host whose WiFi had been associated to a
+// 192.168.1.0/24 network and then disconnected: ipconfig listed the adapter
+// as "media disconnected" and showed no address, yet 192.168.1.11 kept
+// appearing in the address list and was advertised to peers as
+// 192.168.1.11:<live P2P port> -- a port the host was genuinely listening on,
+// which is what made the entry look plausible enough to survive review.
+//
+// net.InterfaceAddrs cannot be used for this: it returns no interface
+// metadata, so there is no way to tell an address that is configured on a
+// down link from one on a live link.
 func ListLocalIPs(maxIPs int) []string {
+	return ListLocalIPsExcluding(maxIPs, 0)
+}
+
+// ListLocalIPsExcluding is ListLocalIPs with the interface n2n itself is
+// running on additionally excluded by index.
+//
+// The overlay address space already covers the tap when --net is left at its
+// default, but the subnet is configurable, and a tap carrying a routable
+// address on a non-default --net is exactly the kind of address a peer must
+// never be sent to. Passing the index removes the dependence on the subnet.
+//
+// ownIfIndex may be 0 when the tap has not been opened yet or its index is
+// unknown, in which case this behaves exactly as ListLocalIPs.
+func ListLocalIPsExcluding(maxIPs int, ownIfIndex uint32) []string {
 	if maxIPs <= 0 {
 		maxIPs = 10
 	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		// Fall back to the unfiltered list rather than reporting nothing:
+		// a stale address is a lesser evil than an empty one, and the
+		// ordering below still puts a real uplink first in the common case.
+		log.Printf("[P2P] cannot enumerate interfaces for local IPs: %v", err)
+		return listLocalIPsUnfiltered(maxIPs)
+	}
+	excluded := tapAdapterIfIndexes()
+	if ownIfIndex != 0 {
+		if excluded == nil {
+			excluded = make(map[uint32]bool, 1)
+		}
+		excluded[ownIfIndex] = true
+	}
+	return sortAndTrimLocalIPs(ifaces, maxIPs, excluded)
+}
+
+// sortAndTrimLocalIPs applies the up-interface filter, the TAP filter, the
+// address sanity checks and the reachability ordering. Split out from
+// ListLocalIPs so the selection logic can be tested against a synthetic
+// interface table -- a normal build host has no down interface with a stale
+// address, so a test against the real one would skip and miss the regression.
+//
+// excludedIfIndexes carries interface identity that no other signal can
+// supply: the indexes the OS attributes to a TAP driver, plus the index of the
+// interface n2n itself opened.
+func sortAndTrimLocalIPs(ifaces []net.Interface, maxIPs int, excludedIfIndexes map[uint32]bool) []string {
+	type ranked struct {
+		ip   string
+		tier int
+		seq  int
+	}
+	var out []ranked
+	seq := 0
+	for i := range ifaces {
+		if ifaces[i].Flags&net.FlagUp == 0 {
+			continue
+		}
+		if IsTapInterface(&ifaces[i], excludedIfIndexes) {
+			continue
+		}
+		addrs, aerr := ifaces[i].Addrs()
+		if aerr != nil {
+			continue
+		}
+		for _, address := range addrs {
+			ipnet, ok := address.(*net.IPNet)
+			if !ok || ipnet.IP == nil || ipnet.IP.IsLoopback() {
+				continue
+			}
+			ipv4 := ipnet.IP.To4()
+			if ipv4 == nil || ipv4.IsLinkLocalUnicast() {
+				continue
+			}
+			out = append(out, ranked{ip: ipv4.String(), tier: RoutabilityTier(ipv4), seq: seq})
+			seq++
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].tier < out[j].tier })
+
+	ips := make([]string, 0, len(out))
+	for _, r := range out {
+		if len(ips) >= maxIPs {
+			break
+		}
+		ips = append(ips, r.ip)
+	}
+	return ips
+}
+
+// tapInterfaceMarkers are the substrings Windows uses to name a TAP-Windows
+// virtual adapter. There is no portable way to ask the OS "is this a tap";
+// matching the name is what CollectAssistedIPs's callers already do via
+// excludeIface, and it is the only signal available before the tap has been
+// opened (and thus before its MAC is known).
+var tapInterfaceMarkers = []string{
+	"tap-windows",
+	"tap-windows adapter",
+	"tap-windows v9",
+	"openvpn",
+}
+
+// TapAddressSpace is the CGNAT range (100.64.0.0/10) that n2n-go's own
+// overlay draws from, and which NetBird and Tailscale also use. An address in
+// this space is never reachable by a peer over the public internet, so it is
+// not a punch target regardless of which interface carries it.
+var TapAddressSpace = cgnat
+
+// IsTapInterface reports whether ifc is a TAP or VPN/tunnel virtual adapter,
+// judged by name where the name says so and by address space otherwise.
+//
+// A TAP must never be advertised as a P2P endpoint, and FlagUp cannot keep it
+// out: the TAP-Windows driver reports the adapter as up once it has been
+// opened, regardless of whether any n2n instance is using it. On a host that
+// has run several n2n instances -- or has one leftover TAP from an earlier run
+// with a different subnet -- the stale adapter is both up and carrying an
+// RFC1918 address, which puts it in the same reachability tier as a real
+// uplink. Since ListLocalIPs(1)'s single entry becomes the advertised
+// endpoint, an enumerated-first stale TAP wins the slot and the peer is sent
+// to an address that belongs to an unrelated virtual network.
+//
+// Observed on log4: 10.0.10.40 on a leftover tap, while the real uplink was
+// 172.22.2.44 and the live tap was 100.64.0.5. The two are the same tier, so
+// only interface identity can tell them apart -- and the name and address
+// space below do not: "本地连接 3" carries no marker, and 10.0.10.40 is
+// ordinary RFC1918. That address was measured arriving at a peer's edge as
+// the advertised P2P endpoint, so the gap was not theoretical. The index set
+// passed in is what closes it; the name and address-space rules stay as the
+// fallback for hosts where the driver identity cannot be read.
+//
+// Name matching alone is not sufficient. On a Chinese-locale Windows the tap
+// appears as "本地连接" with no marker in the name at all -- the ipconfig of
+// the host shows the live n2n overlay there as 100.64.0.5. So the address
+// space is checked as well, which covers every overlay adapter regardless of
+// how it is named or which locale is installed.
+//
+// The rule is deliberately conservative: it can only exclude additional
+// interfaces, never admit a bad one.
+func IsTapInterface(ifc *net.Interface, excludedIfIndexes map[uint32]bool) bool {
+	// Driver identity first, where it is available. This is the only check
+	// that survives a localized adapter name and an adapter the driver
+	// insists is up: on the lab hosts the leftover tap is called "本地连接 3"
+	// and holds 10.0.10.40/24, so no name marker matches it and no address
+	// space does either, while the registry records its driver as the same
+	// tap0901 as the tap n2n is actually using.
+	if excludedIfIndexes != nil && excludedIfIndexes[uint32(ifc.Index)] {
+		return true
+	}
+	name := strings.ToLower(ifc.Name)
+	for _, marker := range tapInterfaceMarkers {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	for _, marker := range tunnelInterfaceMarkers {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	// No usable marker in the name: fall back to the address space. This is
+	// what catches the localized "本地连接" naming.
+	addrs, err := ifc.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP == nil {
+			continue
+		}
+		if v4 := ipnet.IP.To4(); v4 != nil && TapAddressSpace.Contains(v4) {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnelInterfaceMarkers name the userland VPN/VCS tunnel adapters that show
+// up on the sample hosts alongside the TAP.
+//
+// "vethernet" covers the Hyper-V and WSL virtual switch adapters that carry a
+// private address -- log3's default switch holds 172.20.80.1/20 and is up, so
+// it is offered to peers as a punch target despite being reachable only from
+// the host itself. Like the tunnel markers these are interfaces whose address
+// belongs to an overlay, not to the network peers are on.
+var tunnelInterfaceMarkers = []string{
+	"wt0", "tailscale", "zerotier", "vethernet",
+}
+
+// listLocalIPsUnfiltered is the previous implementation, kept only as the
+// fallback for the case where the interface table cannot be read at all.
+func listLocalIPsUnfiltered(maxIPs int) []string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil
@@ -214,7 +426,7 @@ func ListLocalIPs(maxIPs int) []string {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			ipv4 := ipnet.IP.To4()
 			if ipv4 != nil && !ipv4.IsLinkLocalUnicast() {
-				out = append(out, ranked{ip: ipv4.String(), tier: routabilityTier(ipv4), seq: len(out)})
+				out = append(out, ranked{ip: ipv4.String(), tier: RoutabilityTier(ipv4), seq: len(out)})
 			}
 		}
 	}
@@ -230,7 +442,7 @@ func ListLocalIPs(maxIPs int) []string {
 	return ips
 }
 
-// routabilityTier ranks an address by how likely a remote peer is to reach
+// RoutabilityTier ranks an address by how likely a remote peer is to reach
 // it directly. Lower is better.
 //
 //	tier 0 -- globally routable: a real public address, the only kind that
@@ -239,7 +451,7 @@ func ListLocalIPs(maxIPs int) []string {
 //	tier 2 -- CGNAT (100.64/10) and other non-RFC1918 reserved space, which
 //	           includes most tunnel overlay addresses.
 //	tier 3 -- link-local and everything else.
-func routabilityTier(ip net.IP) int {
+func RoutabilityTier(ip net.IP) int {
 	switch {
 	case ip.IsGlobalUnicast() && !ip.IsPrivate():
 		// 100.64.0.0/10 is a global-unicast range but is carrier-grade NAT

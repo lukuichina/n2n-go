@@ -117,7 +117,33 @@ api_listen_address: "127.0.0.1:7778"  # Optional API endpoint
 encryption_passphrase: "YourSecretPassphrase"  # Optional encryption
 compress_payload: false # Optional zstd compression
 proxy_url: "" # Optional proxy URL (http://, https://, socks5://, or socks5s://)
+prefer_ipv6: false # Dial IPv6 first (equivalent to --ipv6-prefer / -6)
+
+# P2P keepalive. A UDP NAT mapping expires when nothing is sent through it,
+# typically after 30s-2min depending on the gateway. Once ours expired the
+# peer's ARP replies were dropped, our ARP entry went INCOMPLETE, and the
+# tunnel died while still reporting FullDuplex. KeepAliveInterval must stay
+# well under the shortest NAT idle timeout in the path; KeepAliveTimeout must
+# exceed it so one lost keepalive does not tear the state down. 0 disables.
+p2p_keepalive_interval: "10s"
+p2p_keepalive_timeout: "30s"
+
+# Stop advertising this host's LAN addresses to the relay (FRP parity:
+# natHole.disableAssistedAddrs). These addresses let two peers on the same LAN
+# find each other directly instead of hairpinning through the local router.
+# Leave on unless the extra sendto per address is measurably harmful -- the
+# peer simply skips them, so the worst case is a slower punch, not a failure.
+disable_assisted_addrs: false
+
+stun_servers: # Optional; a built-in default list is used when unset
+  - "stun.l.google.com:19302"
+  - "stun.cloudflare.com:3478"
 ```
+
+Several keys can also be set through the environment, which takes the form
+`N2N_` + the uppercased key: `N2N_SUPERNODE_URL`, `N2N_PROXY_URL`,
+`N2N_WSS_CERT`, `N2N_WSS_KEY`, `N2N_PREFER_IPV6`, and
+`N2N_DISABLE_ASSISTED_ADDRS`.
 
 #### Edge Command-line Options
 
@@ -137,7 +163,53 @@ proxy_url: "" # Optional proxy URL (http://, https://, socks5://, or socks5s://)
 | `--proxy-url` | `-x` | Proxy URL for WSS transport: `http://`, `https://`, `socks5://`, or `socks5s://` | - |
 | `--supernode` | `-s` | Supernode URL for WS/WSS (`ws://` or `wss://`) | - |
 | `--api-listen` | `-A` | Management API listen endpoint, `addr:port` (both parts optional) | `127.0.0.1:7778` |
+| `--nat-hole-probe-ttl` | — | IP TTL for the receiver's pre-mapping probe | `7` |
+| `--ipv6-prefer` | `-6` | Dial IPv6 first instead of IPv4 first | `false` |
+| `--ws` | — | Enable a plain-WS connection to the supernode | `false` |
+| `--wss` | — | Enable a WSS connection to the supernode | `false` |
+| `--wss-cert` | — | WSS client certificate file | - |
+| `--wss-key` | — | WSS client key file | - |
 | `--stdout-log` | `-l` | Log to stdout instead of SQLite | `false` |
+| `--db-log` | — | Log into SQLite (`~/.n2n-go/edge.db`) instead of the console | `false` |
+
+##### Address family preference: `--ipv6-prefer`
+
+When the supernode URL resolves to both an IPv4 and an IPv6 address, the edge
+dials **IPv4 first by default**. `--ipv6-prefer` / `-6` reverses that.
+
+The two families are tried **in order, not as a fast fallback**: each address
+gets its own 10-second dial timeout, and the next is attempted only after the
+previous one has genuinely failed to connect. A fast fallback would hide a
+broken IPv6 path behind a working IPv4 one, which is exactly the failure you
+want to see on a host you believe is IPv6-capable. Sequential, bounded attempts
+mean `-6` costs at most one extra timeout when IPv6 is unreachable, and nothing
+at all when it answers.
+
+Leave the flag off for dual-stack hosts whose IPv6 route is unreliable — that is
+the default because an edge that cannot reach its supernode is worse than one
+that took the long way round. Turn it on when IPv6 is the family you intend to
+use and you want a broken IPv4 path to surface rather than be masked.
+
+The preference also applies to the proxy hop, so a SOCKS5 or HTTP proxy is
+reached the same way as a direct supernode. It is read from
+`prefer_ipv6` in the config file and the `N2N_PREFER_IPV6` environment variable,
+both equivalent to the flag.
+
+##### NAT-hole probe TTL: `--nat-hole-probe-ttl`
+
+Before punching, the **receiver** sends a low-TTL probe to make its local NAT
+allocate a mapping towards the sender. The datagram is meant to open the mapping
+and die — default TTL `7`, FRP's value.
+
+A consumer router does the NAT lookup at hop 1, so 7 is ample. On a cloud
+network the EIP translation can sit further out, and a probe that dies before
+reaching it opens no mapping at all — the sender then punches a closed port. If
+hole punching stalls between two peers on a cloud network, raise this to at
+least the measured hop count to the peer. `0` disables the probe entirely and
+sends with the socket's normal TTL.
+
+This one is **CLI-only**: unlike the other tunables there is no `edge.yaml` key
+for it, so it has to be passed on the command line.
 
 ##### Listen endpoints: `--p2p-listen` and `--api-listen`
 

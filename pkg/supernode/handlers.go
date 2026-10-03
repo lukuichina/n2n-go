@@ -37,18 +37,18 @@ func (s *Supernode) handlePeerRequestMessage(r *protocol.RawMessage) error {
 		return err
 	}
 	pil := cm.GetPeerInfoList(peerReqMsg.EdgeMACAddr(), true)
-	
+
 	// Check if target edge is using WSS
 	s.edgeMu.RLock()
 	targetEdge, exists := cm.edges[peerReqMsg.EdgeMACAddr()]
 	s.edgeMu.RUnlock()
-	
+
 	if exists && targetEdge.WSSConnID != "" {
 		// Use WSS address
 		waddr := &wssAddr{connID: targetEdge.WSSConnID}
 		return s.SendStruct(pil, peerReqMsg.Msg.CommunityName, s.MacADDR(), nil, waddr)
 	}
-	
+
 	target, err := cm.GetEdgeUDPAddr(peerReqMsg.EdgeMACAddr())
 	if err != nil {
 		return err
@@ -74,18 +74,18 @@ func (s *Supernode) handleLeasesInfosMessage(r *protocol.RawMessage) error {
 		CommunityName:        cm.Name(),
 		LeasesWithEdgesInfos: leases,
 	}
-	
+
 	// Check if target edge is using WSS
 	s.edgeMu.RLock()
 	targetEdge, exists := cm.edges[leaseMsg.EdgeMACAddr()]
 	s.edgeMu.RUnlock()
-	
+
 	if exists && targetEdge.WSSConnID != "" {
 		// Use WSS address
 		waddr := &wssAddr{connID: targetEdge.WSSConnID}
 		return s.SendStruct(infos, cm.Name(), s.MacADDR(), nil, waddr)
 	}
-	
+
 	target, err := cm.GetEdgeUDPAddr(leaseMsg.EdgeMACAddr())
 	if err != nil {
 		return err
@@ -190,18 +190,18 @@ func (s *Supernode) handleP2PFullStateMessage(r *protocol.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Check if target edge is using WSS
 	s.edgeMu.RLock()
 	targetEdge, exists := cm.edges[fsMsg.EdgeMACAddr()]
 	s.edgeMu.RUnlock()
-	
+
 	if exists && targetEdge.WSSConnID != "" {
 		// Use WSS address
 		waddr := &wssAddr{connID: targetEdge.WSSConnID}
 		return s.SendStruct(P2PFullState, cm.Name(), s.MacADDR(), nil, waddr)
 	}
-	
+
 	target, err := cm.GetEdgeUDPAddr(fsMsg.EdgeMACAddr())
 	if err != nil {
 		return err

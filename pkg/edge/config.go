@@ -138,6 +138,7 @@ type Config struct {
 	WSSKey       string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
 	WSSEnabled   bool   `mapstructure:"wss_enabled"`
 	ProxyURL     string `mapstructure:"proxy_url" env:"N2N_PROXY_URL"`
+	PreferIPv6   bool   `mapstructure:"prefer_ipv6" env:"N2N_PREFER_IPV6"`
 
 	// P2P configuration
 	P2PListenAddr string `mapstructure:"p2p_listen_addr"`

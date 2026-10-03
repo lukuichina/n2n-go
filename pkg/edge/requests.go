@@ -2,10 +2,10 @@ package edge
 
 import (
 	"fmt"
-	"net"
 	"n2n-go/pkg/log"
 	"n2n-go/pkg/p2p"
 	"n2n-go/pkg/protocol/netstruct"
+	"net"
 )
 
 // Unregister sends an unregister packet to the supernode.

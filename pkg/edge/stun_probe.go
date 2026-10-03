@@ -46,6 +46,12 @@ type STUNClient struct {
 	servers []string
 	conn    *net.UDPConn
 
+	// ownTapIfIndex is the interface index of the tap n2n opened, or 0.
+	// The STUN classification compares each discovered address against the
+	// host's own addresses, so a tap showing up in that list can turn an
+	// open NAT into a symmetric one. See ListLocalIPsExcluding.
+	ownTapIfIndex uint32
+
 	mu sync.Mutex
 	// serverIdx is where the next refresh starts its scan, so successive
 	// refreshes do not all go to the same server.
@@ -55,11 +61,11 @@ type STUNClient struct {
 	// in flight. Only one is tracked at a time: the servers are walked in
 	// order and a refresh that has not answered within its window is
 	// abandoned rather than overlapped.
-	pending *pendingProbe
+	pending *PendingProbe
 }
 
-// pendingProbe is one in-flight BindingRequest.
-type pendingProbe struct {
+// PendingProbe is one in-flight BindingRequest.
+type PendingProbe struct {
 	// done is closed once the probe is finished with, so a caller waiting on
 	// a refresh can wake up. Closing it is what makes BeginRefresh followed
 	// by a bounded wait safe -- the wait never depends on the probe landing.
@@ -100,7 +106,7 @@ const RefreshTimeout = 2 * time.Second
 // server observes is the one the P2P socket actually uses -- that is the
 // whole point of sharing the socket, and why this cannot simply be moved to
 // a private socket of its own.
-func (s *STUNClient) BeginRefresh() (*pendingProbe, error) {
+func (s *STUNClient) BeginRefresh() (*PendingProbe, error) {
 	if s == nil || s.conn == nil {
 		return nil, fmt.Errorf("STUN: nil connection")
 	}
@@ -135,7 +141,7 @@ func (s *STUNClient) BeginRefresh() (*pendingProbe, error) {
 		return nil, fmt.Errorf("STUN: write to %s: %w", server, err)
 	}
 
-	p := &pendingProbe{
+	p := &PendingProbe{
 		done:        make(chan struct{}),
 		transaction: msg.TransactionID,
 		server:      server,
@@ -244,7 +250,7 @@ func classifySTUNResponse(respMsg *stun.Message, result *STUNResult) error {
 
 // Wait blocks until the probe resolves or the refresh window expires,
 // whichever comes first, and returns whatever Feed produced.
-func (p *pendingProbe) Wait() (*STUNResult, error) {
+func (p *PendingProbe) Wait() (*STUNResult, error) {
 	if p == nil {
 		return nil, fmt.Errorf("STUN: no probe")
 	}
@@ -256,7 +262,7 @@ func (p *pendingProbe) Wait() (*STUNResult, error) {
 	}
 }
 
-func (p *pendingProbe) String() string {
+func (p *PendingProbe) String() string {
 	if p == nil {
 		return "<nil probe>"
 	}
@@ -341,7 +347,7 @@ func (s *STUNClient) DiscoverWithClassification() (*STUNResult, error) {
 	}
 
 	result := &STUNResult{Addr: firstAddr, AllAddrs: allAddrs}
-	if nf, err := ClassifyNATFeature(allAddrs, ListLocalIPs(5)); err == nil {
+	if nf, err := ClassifyNATFeature(allAddrs, ListLocalIPsExcluding(5, s.ownTapIfIndex)); err == nil {
 		result.NatFeature = nf
 		log.Printf("STUN discovery succeeded: addr=%s NAT=%s Behavior=%s Public=%v",
 			result.Addr.String(), nf.NatType, nf.Behavior, nf.PublicNetwork)
@@ -373,4 +379,20 @@ func (s *STUNClient) readUntilMatched(buf []byte, transaction [stun.TransactionI
 		}
 		return result.Addr, true
 	}
+}
+
+// PendingTransactionForTest returns the transaction ID of the in-flight probe,
+// or the zero ID when nothing is pending.
+//
+// It reads under the client's own lock, which is what the hand-built STUN
+// response test needs: the alternative was reaching for the mutex and the
+// pending field from outside. Exported for test/edge; not part of the
+// supported API.
+func (sc *STUNClient) PendingTransactionForTest() [stun.TransactionIDSize]byte {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.pending == nil {
+		return [stun.TransactionIDSize]byte{}
+	}
+	return sc.pending.transaction
 }

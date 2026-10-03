@@ -32,12 +32,12 @@ type STUNResult struct {
 // itself -- see STUNClient in stun_probe.go. An earlier version called
 // pubSocketString() from this loop and deadlocked the whole goroutine for 75
 // minutes on 2026-10-01, taking PeerP2PInfos reporting down with it.
-const natHoleAddrRefreshInterval = 15 * time.Second
+const NatHoleAddrRefreshInterval = 15 * time.Second
 
 // beginNatHoleAddrRefresh starts a probe and returns it. The caller (the
 // handleP2P loop, which owns the socket) feeds the response in via
 // e.STUNClient.Feed and then calls finishNatHoleAddrRefresh.
-func (e *EdgeClient) beginNatHoleAddrRefresh() *pendingProbe {
+func (e *EdgeClient) beginNatHoleAddrRefresh() *PendingProbe {
 	if e.STUNClient == nil || e.Peers == nil || e.Peers.Me == nil {
 		return nil
 	}
@@ -52,7 +52,7 @@ func (e *EdgeClient) beginNatHoleAddrRefresh() *pendingProbe {
 // the mapping actually moved: pubSocketString's caller used to do this, and
 // an unconditional write would add a registry bump plus an extra
 // P2PStateInfo on every tick forever.
-func (e *EdgeClient) finishNatHoleAddrRefresh(probe *pendingProbe) {
+func (e *EdgeClient) finishNatHoleAddrRefresh(probe *PendingProbe) {
 	if probe == nil {
 		return
 	}

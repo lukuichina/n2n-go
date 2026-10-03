@@ -8,5 +8,5 @@ type PacketTyped interface {
 }
 
 func (*PeerInfoList) PacketType() spec.PacketType { return spec.TypePeerInfo }
-func (*PeerP2PInfos) PacketType() spec.PacketType   { return spec.TypeP2PStateInfo }
-func (*P2PFullState) PacketType() spec.PacketType   { return spec.TypeP2PFullState }
+func (*PeerP2PInfos) PacketType() spec.PacketType { return spec.TypeP2PStateInfo }
+func (*P2PFullState) PacketType() spec.PacketType { return spec.TypeP2PFullState }

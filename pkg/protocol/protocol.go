@@ -35,6 +35,7 @@ const (
 	FlagUserDefined3       PacketFlag = 0x40
 	FlagUserDefined4       PacketFlag = 0x80
 )
+
 /*
 // PacketType defines the type of packet.
 type PacketType uint8

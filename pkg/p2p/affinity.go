@@ -23,7 +23,7 @@ import (
 // that is both cheap and decisive, and it is decided entirely locally: no
 // new information has to cross the control plane for it.
 
-// localNATPunchPrefixes returns this host's own IPv4 subnets, most specific
+// LocalNATPunchPrefixes returns this host's own IPv4 subnets, most specific
 // first. The real interface masks are used, so a /8 on some wide virtual
 // interface cannot out-rank a genuine /24 LAN.
 //
@@ -33,7 +33,7 @@ import (
 // score as highly as the real LAN and lets the sort pick it first. The
 // resulting "connection" would be delivered *through the overlay*, which is
 // the relay by another name, while every log line claimed a direct path.
-func localNATPunchPrefixes(selfTapName, selfTapIP, selfTapMAC string) []netip.Prefix {
+func LocalNATPunchPrefixes(selfTapName, selfTapIP, selfTapMAC string) []netip.Prefix {
 	// The overlay prefix to drop, identified by the address we were assigned
 	// on the tap. Deriving it from the address rather than from the interface
 	// name is deliberate: the name is config-only on Windows (the tap is an
@@ -51,7 +51,7 @@ func localNATPunchPrefixes(selfTapName, selfTapIP, selfTapMAC string) []netip.Pr
 	if err != nil {
 		return nil
 	}
-	return collectLocalPrefixes(ifaces, selfTapName, wantMACOf(selfTapMAC), dropOverlay, haveOverlay)
+	return CollectLocalPrefixes(ifaces, selfTapName, wantMACOf(selfTapMAC), dropOverlay, haveOverlay)
 }
 
 func wantMACOf(s string) net.HardwareAddr {
@@ -62,7 +62,7 @@ func wantMACOf(s string) net.HardwareAddr {
 	return hw
 }
 
-func collectLocalPrefixes(ifaces []net.Interface, selfTapName string, wantMAC net.HardwareAddr, dropOverlay netip.Prefix, haveOverlay bool) []netip.Prefix {
+func CollectLocalPrefixes(ifaces []net.Interface, selfTapName string, wantMAC net.HardwareAddr, dropOverlay netip.Prefix, haveOverlay bool) []netip.Prefix {
 	var out []netip.Prefix
 	seen := make(map[netip.Prefix]bool)
 	for i := range ifaces {
@@ -116,7 +116,7 @@ func collectLocalPrefixes(ifaces []net.Interface, selfTapName string, wantMAC ne
 			// work if that overlay is up -- and even then the traffic is
 			// delivered by the overlay, not by a hole we punched. The public
 			// candidate is the one that satisfies "public works, use public".
-			if isCGNATOverlay(ip) {
+			if IsCGNATOverlay(ip) {
 				continue
 			}
 			ones, bits := n.Mask.Size()
@@ -141,11 +141,11 @@ func collectLocalPrefixes(ifaces []net.Interface, selfTapName string, wantMAC ne
 	return out
 }
 
-// affinityScore is the length in bits of the longest of our subnets that
+// AffinityScore is the length in bits of the longest of our subnets that
 // contains addr, or 0 when addr is on no subnet we are on. Longer wins, so
 // 192.168.10.7 beats 172.20.160.1 on a host that happens to own both a real
 // /24 LAN and a docker /16.
-func affinityScore(addr netip.Addr, local []netip.Prefix) int {
+func AffinityScore(addr netip.Addr, local []netip.Prefix) int {
 	if !addr.IsValid() {
 		return 0
 	}
@@ -155,10 +155,10 @@ func affinityScore(addr netip.Addr, local []netip.Prefix) int {
 	// from 100.64.0.0/10, so two hosts behind the same overlay look like
 	// neighbours on a /10 -- far more specific than any public candidate --
 	// and the sort would then punch the overlay instead of the internet.
-	// Scoring it 0 here as well as dropping it in collectLocalPrefixes keeps
+	// Scoring it 0 here as well as dropping it in CollectLocalPrefixes keeps
 	// the rule true for every caller, including the tests and any future one
 	// that assembles `local` some other way.
-	if isCGNATOverlay(addr) {
+	if IsCGNATOverlay(addr) {
 		return 0
 	}
 	best := 0
@@ -173,7 +173,7 @@ func affinityScore(addr netip.Addr, local []netip.Prefix) int {
 	return best
 }
 
-// sortAssistedByLocalAffinity orders the peer's reported LAN addresses so
+// SortAssistedByLocalAffinity orders the peer's reported LAN addresses so
 // that those sharing a subnet with this host come first, leaving the rest in
 // the order the peer reported them (a stable sort, so a multi-homed peer
 // still keeps its own preference among equally-good candidates).
@@ -181,7 +181,7 @@ func affinityScore(addr netip.Addr, local []netip.Prefix) int {
 // Only the order changes. No address is added or dropped: an unresolvable or
 // unrankable entry keeps its place rather than disappearing, because silently
 // discarding a peer's claim is how a working candidate goes missing.
-func sortAssistedByLocalAffinity(assisted []string, local []netip.Prefix) []string {
+func SortAssistedByLocalAffinity(assisted []string, local []netip.Prefix) []string {
 	if len(assisted) < 2 || len(local) == 0 {
 		return assisted
 	}
@@ -196,7 +196,7 @@ func sortAssistedByLocalAffinity(assisted []string, local []netip.Prefix) []stri
 		if err != nil {
 			addr = netip.Addr{} // invalid -> score 0
 		}
-		scores[i] = affinityScore(addr, local)
+		scores[i] = AffinityScore(addr, local)
 		if i > 0 && scores[i] > scores[i-1] {
 			reordered = true
 		}
@@ -216,8 +216,8 @@ func sortAssistedByLocalAffinity(assisted []string, local []netip.Prefix) []stri
 	return out
 }
 
-// sameOrder reports whether two candidate lists are element-wise identical.
-func sameOrder(a, b []string) bool {
+// SameOrder reports whether two candidate lists are element-wise identical.
+func SameOrder(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -240,7 +240,7 @@ const overlayPrefixBits = 10
 // those tunnels therefore owns an address here that a remote peer cannot reach
 // over the public internet, yet which looks perfectly "same-subnet" to the
 // affinity sort: the /10 the overlay assigns is far more specific than the
-// single-address prefix of a genuine public candidate, so affinityScore rates
+// single-address prefix of a genuine public candidate, so AffinityScore rates
 // it higher and promotes it to the front of the punch candidate list.
 //
 // The result is a hole punch that appears to succeed while actually being
@@ -250,14 +250,14 @@ const overlayPrefixBits = 10
 // two values. Observed on 2026-09-30 with NetBird on both ends.
 var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
-// isCGNATOverlay reports whether addr belongs to the shared CGNAT pool that
+// IsCGNATOverlay reports whether addr belongs to the shared CGNAT pool that
 // overlay tunnels are carved from, i.e. an address that is not reachable from
 // the public internet and must not be treated as evidence of a shared LAN.
-func isCGNATOverlay(addr netip.Addr) bool {
+func IsCGNATOverlay(addr netip.Addr) bool {
 	return addr.Is4() && cgnatPrefix.Contains(addr)
 }
 
-// IsCGNATOverlayAddr is the net.IP form of isCGNATOverlay, for callers holding a
+// IsCGNATOverlayAddr is the net.IP form of IsCGNATOverlay, for callers holding a
 // net.IP straight out of net.Interface.Addrs -- the assisted-address collector
 // in pkg/edge, which is the entry point that actually put a NetBird address
 // into senderAssisted on 2026-09-30. Keeping the single definition of "overlay
@@ -271,5 +271,5 @@ func IsCGNATOverlayAddr(ip net.IP) bool {
 	if v4 == nil {
 		return false
 	}
-	return isCGNATOverlay(netip.AddrFrom4([4]byte(v4)))
+	return IsCGNATOverlay(netip.AddrFrom4([4]byte(v4)))
 }

@@ -14,9 +14,9 @@ type Ack struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *Ack) Reset()                        { *x = Ack{} }
-func (x *Ack) String() string                { return protoimpl.X.MessageStringOf(x) }
-func (*Ack) ProtoMessage()                   {}
+func (x *Ack) Reset()         { *x = Ack{} }
+func (x *Ack) String() string { return protoimpl.X.MessageStringOf(x) }
+func (*Ack) ProtoMessage()    {}
 func (x *Ack) ProtoReflect() protoreflect.Message {
 	return protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 }

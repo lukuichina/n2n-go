@@ -242,12 +242,15 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		// discards the receiver's punches as unsolicited. The registry holds
 		// the peer's STUN-confirmed public mapping, which is the address
 		// that is actually reachable.
-		var regPub, regEndpoint string
+		var regRaddr, regPub, regEndpoint string
+		raddrFresh := false
 		if p, err := e.Peers.GetPeer(targetMAC); err == nil {
+			regRaddr = p.GetP2PRaddr()
 			regPub = p.Infos.PubSocket
 			regEndpoint = p.P2PEndpoint
+			raddrFresh = p.RaddrCoversCurrentMapping()
 		}
-		chosen, note := resolvePunchTarget(regPub, regEndpoint, senderP2PEndpoint, targetMAC)
+		chosen, note := ResolvePunchTarget(regRaddr, regPub, regEndpoint, senderP2PEndpoint, targetMAC, raddrFresh)
 		log.Printf("NatHoleInstruction: sender target resolution: %s", note)
 		if chosen == "" {
 			log.Printf("[Edge] NatHoleInstruction: sender cannot resolve a routable target for %s", targetMAC)
@@ -263,12 +266,15 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		// We are the receiver; the target is the sender. Resolve it exactly
 		// as the sender branch does -- the instruction's endpoint field can
 		// carry an off-link private address here just as easily.
-		var regPub, regEndpoint string
+		var regRaddr, regPub, regEndpoint string
+		raddrFresh := false
 		if p, err := e.Peers.GetPeer(senderMAC); err == nil {
+			regRaddr = p.GetP2PRaddr()
 			regPub = p.Infos.PubSocket
 			regEndpoint = p.P2PEndpoint
+			raddrFresh = p.RaddrCoversCurrentMapping()
 		}
-		chosen, note := resolvePunchTarget(regPub, regEndpoint, senderP2PEndpoint, senderMAC)
+		chosen, note := ResolvePunchTarget(regRaddr, regPub, regEndpoint, senderP2PEndpoint, senderMAC, raddrFresh)
 		log.Printf("NatHoleInstruction: receiver target resolution: %s", note)
 		if chosen == "" {
 			log.Printf("[Edge] NatHoleInstruction: receiver cannot resolve a routable target for sender %s", senderMAC)
@@ -307,7 +313,7 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		BehaviorIndex:      behaviorIndex,
 		SendDelayMs:        sendDelayMs,
 		// The sender's LAN addresses. Without this the receiver's
-		// rankReceiverCandidates sees an empty list and falls back to
+		// RankReceiverCandidates sees an empty list and falls back to
 		// punching the STUN-reflexive pubSocket only -- which is exactly
 		// the address a carrier NAT cannot hairpin. The field was logged
 		// two lines above (from the protobuf) but silently dropped here,

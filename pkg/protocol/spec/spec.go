@@ -21,7 +21,7 @@ const (
 	TypeRetryRegisterRequest PacketType = 253
 
 	// Custom P2P / ICE / TURN types (matching JS constants)
-	TypeICECandidate  PacketType = 14
+	TypeICECandidate    PacketType = 14
 	TypeTURNCredentials PacketType = 15
 )
 

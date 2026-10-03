@@ -104,7 +104,7 @@ type EdgeClient struct {
 	// any. Owned by handleP2P (the P2P socket's only reader): handleP2PInfos
 	// starts it and must not wait on it, and handleP2P resolves it by
 	// handing each datagram to STUNClient.Feed.
-	refreshProbe *pendingProbe
+	refreshProbe *PendingProbe
 	NatFeature   *NatFeature
 
 	// cachedPubSocket caches the STUN-discovered public socket address

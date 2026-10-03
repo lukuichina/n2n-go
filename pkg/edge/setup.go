@@ -32,6 +32,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 
 		wsConfig := &transport.WSSTransportConfig{
 			ProxyURL:     cfg.ProxyURL,
+			PreferIPv6:   cfg.PreferIPv6,
 			URL:          cfg.SupernodeURL,
 			SkipVerify:   true, // TODO: Make this configurable
 			ReadTimeout:  30 * time.Second,
@@ -94,6 +95,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 
 		wssConfig := &transport.WSSTransportConfig{
 			ProxyURL:     cfg.ProxyURL,
+			PreferIPv6:   cfg.PreferIPv6,
 			URL:          cfg.SupernodeURL,
 			SkipVerify:   true, // TODO: Make this configurable
 			ReadTimeout:  30 * time.Second,
@@ -500,7 +502,9 @@ func (e *EdgeClient) P2PEndpointString() string {
 	}
 	if e.P2PAddr.IP != nil && e.P2PAddr.IP.IsUnspecified() {
 		// Use the first non-loopback local IP as the routable address.
-		localIPs := ListLocalIPs(1)
+		// The tap is excluded by index so a non-default --net cannot make it
+		// win this single slot.
+		localIPs := ListLocalIPsExcluding(1, e.ownTapIfIndex())
 		if len(localIPs) > 0 {
 			if ip := net.ParseIP(localIPs[0]); ip != nil {
 				return fmt.Sprintf("%s:%d", ip.String(), e.P2PAddr.Port)
@@ -508,6 +512,16 @@ func (e *EdgeClient) P2PEndpointString() string {
 		}
 	}
 	return e.P2PAddr.String()
+}
+
+// ownTapIfIndex returns the interface index of the tap n2n opened, or 0 when
+// it is not open yet. Used to keep the overlay adapter out of the address list
+// that is advertised to peers, independently of what --net happens to be.
+func (e *EdgeClient) ownTapIfIndex() uint32 {
+	if e.TAP == nil || e.TAP.Iface == nil {
+		return 0
+	}
+	return e.TAP.Iface.GetIfIndex()
 }
 
 // pubSocketString returns the public-facing socket address (IP:port) for this Edge.
@@ -524,6 +538,10 @@ func (e *EdgeClient) pubSocketString() string {
 	// Try STUN discovery first — this gives us the real external address
 	// as seen by a public STUN server, which is what P2P hole-punching needs.
 	if e.STUNClient != nil {
+		// The classification below compares discovered addresses against the
+		// host's own, so keep the overlay adapter out of that list by index
+		// rather than relying on its address being in overlay space.
+		e.STUNClient.ownTapIfIndex = e.ownTapIfIndex()
 		result, err := e.STUNClient.DiscoverWithClassification()
 		if err == nil && result != nil && result.Addr != nil && result.Addr.IP != nil && !result.Addr.IP.IsLoopback() {
 			e.NatFeature = result.NatFeature

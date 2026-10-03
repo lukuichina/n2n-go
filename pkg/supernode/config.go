@@ -21,14 +21,14 @@ type Config struct {
 	ListenAddr          string        `mapstructure:"listen_address"` // Listen address
 
 	// WS configuration
-	WSEnabled      bool   `mapstructure:"ws_enabled" env:"N2N_WS_ENABLED"`
-	WSListenAddr   string `mapstructure:"ws_listen_addr" env:"N2N_WS_LISTEN_ADDR" default:":8080"`
+	WSEnabled    bool   `mapstructure:"ws_enabled" env:"N2N_WS_ENABLED"`
+	WSListenAddr string `mapstructure:"ws_listen_addr" env:"N2N_WS_LISTEN_ADDR" default:":8080"`
 
 	// WSS configuration
-	WSSEnabled     bool   `mapstructure:"wss_enabled" env:"N2N_WSS_ENABLED"`
-	WSSCert        string `mapstructure:"wss_cert" env:"N2N_WSS_CERT"`
-	WSSKey         string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
-	WSSListenAddr  string `mapstructure:"wss_listen_addr" env:"N2N_WSS_LISTEN_ADDR" default:":443"`
+	WSSEnabled    bool   `mapstructure:"wss_enabled" env:"N2N_WSS_ENABLED"`
+	WSSCert       string `mapstructure:"wss_cert" env:"N2N_WSS_CERT"`
+	WSSKey        string `mapstructure:"wss_key" env:"N2N_WSS_KEY"`
+	WSSListenAddr string `mapstructure:"wss_listen_addr" env:"N2N_WSS_LISTEN_ADDR" default:":443"`
 
 	ConfigFile string `mapstructure:"config_file"` //Path to config
 }
@@ -47,8 +47,8 @@ func DefaultConfig() *Config {
 		ConfigFile:          "supernode.yaml",
 
 		// WS defaults
-		WSEnabled:     false,
-		WSListenAddr:  ":8080",
+		WSEnabled:    false,
+		WSListenAddr: ":8080",
 
 		// WSS defaults
 		WSSEnabled:    false,

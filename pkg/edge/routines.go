@@ -207,7 +207,7 @@ func (e *EdgeClient) handleP2PInfos() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	refresh := time.NewTicker(natHoleAddrRefreshInterval)
+	refresh := time.NewTicker(NatHoleAddrRefreshInterval)
 	defer refresh.Stop()
 
 	for {
@@ -805,7 +805,7 @@ func (e *EdgeClient) isOwnP2PEndpoint(addr *net.UDPAddr) bool {
 	// The cap is dropped on purpose: a host with more than eight interfaces
 	// could have its own address ranked out of the list, and the address we
 	// most need to recognise is always our own.
-	if isLocalInterfaceIP(addr.IP) {
+	if IsLocalInterfaceIP(addr.IP) {
 		return true
 	}
 	return addr.IP.IsLoopback() || addr.IP.Equal(net.IPv4zero)
@@ -921,8 +921,12 @@ func (e *EdgeClient) handleP2P() {
 		}
 		// Punch traffic is logged (throttled) inside handlePunchDatagram; logging
 		// every datagram here is what buried the real events during the ACK echo loop.
+		//
+		// Change-only rather than per packet: this sits on the single receive
+		// loop, and one log write per datagram measurably delayed the loop and
+		// cost packets. See RawRecvLogger for the numbers.
 		if !p2p.IsPunch(packetBuf, n) {
-			log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, packetBuf[0])
+			LogRawRecv(addr, n, packetBuf[0])
 		}
 		if p2p.IsPunch(packetBuf, n) {
 			// Punch/ACK traffic is handled in one shared place so handleP2P and
@@ -1102,8 +1106,12 @@ func (e *EdgeClient) handleUDP() {
 		e.PacketsRecv.Add(1)
 		// Punch traffic is logged (throttled) inside handlePunchDatagram; logging
 		// every datagram here is what buried the real events during the ACK echo loop.
+		//
+		// Change-only rather than per packet: this sits on the single receive
+		// loop, and one log write per datagram measurably delayed the loop and
+		// cost packets. See RawRecvLogger for the numbers.
 		if !p2p.IsPunch(packetBuf, n) {
-			log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, packetBuf[0])
+			LogRawRecv(addr, n, packetBuf[0])
 		}
 		if p2p.IsPunch(packetBuf, n) {
 			// Punch/ACK traffic is handled in one shared place so handleP2P and
@@ -1221,7 +1229,7 @@ func (e *EdgeClient) handleWSS() {
 		}
 
 		e.PacketsRecv.Add(1)
-		log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, packetBuf[0])
+		LogRawRecv(addr, n, packetBuf[0])
 
 		// FRP-style fix: ONLY process punch packets that arrive via direct P2P UDP
 		// (handleP2P), because WSSTransport.Read returns the Worker's address
@@ -1271,7 +1279,7 @@ func (e *EdgeClient) handleWSS() {
 	}
 }
 
-// isLocalInterfaceIP reports whether ip is bound to one of this host's own
+// IsLocalInterfaceIP reports whether ip is bound to one of this host's own
 // interfaces -- the question "did this packet come from me?".
 //
 // It walks net.InterfaceAddrs directly and uncapped. The obvious shortcuts
@@ -1279,7 +1287,7 @@ func (e *EdgeClient) handleWSS() {
 // comparing one against addr.String() is always false, and splitting a bare
 // IP with SplitHostPort always errors. Both were shipped, and the guard they
 // belonged to therefore never fired.
-func isLocalInterfaceIP(ip net.IP) bool {
+func IsLocalInterfaceIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}

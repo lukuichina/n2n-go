@@ -5,8 +5,8 @@ import (
 	"n2n-go/pkg/log"
 	"net"
 	"net/netip"
-	"strconv"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -93,6 +93,25 @@ type Peer struct {
 	// raddrMu. Use GetP2PRaddr/SetP2PRaddr rather than touching the field.
 	P2PRaddr string
 	raddrMu  sync.RWMutex
+	// raddrAt is when P2PRaddr last took a new value, i.e. when we last heard
+	// from this peer on the socket that raddr describes. Guarded by raddrMu,
+	// stamped by SetP2PRaddr.
+	//
+	// Its only purpose is to date the raddr against pubSocketChangedAt: an
+	// observed source address is evidence about one socket generation, and a
+	// peer that re-announces a different public mapping has provably moved to
+	// another one. See RaddrAt and PubSocketChangedAt.
+	raddrAt time.Time
+	// pubSocketChangedAt is when this peer's advertised public mapping last
+	// took a different value -- not when it was last re-announced. An
+	// unchanged re-announcement must not bump it: peers re-broadcast their
+	// PeerP2PInfos every few seconds, and dating the freshness test on those
+	// would expire every raddr within seconds and throw away the one address
+	// that survives a symmetric NAT.
+	//
+	// Guarded by the registry's peerMu, like the rest of the P2P address
+	// state; stamped by AddPeer.
+	pubSocketChangedAt time.Time
 	// indexedRaddr is the key currently held in PeerRegistry.peerBySocket on
 	// this peer's behalf as an observed raddr. Guarded by the registry's
 	// peerMu, not by P2PRaddr: P2PRaddr is assigned before the index is
@@ -213,8 +232,53 @@ func (p *Peer) GetP2PRaddr() string {
 // Symmetric NAT (where the STUN-discovered port may differ).
 func (p *Peer) SetP2PRaddr(addr string) {
 	p.raddrMu.Lock()
+	if p.P2PRaddr != addr {
+		// Only a genuinely new value proves the peer is still on the socket
+		// this address describes. Re-stamping on an identical address would
+		// make the freshness test in ResolvePunchTarget pass forever.
+		p.raddrAt = time.Now()
+	}
 	p.P2PRaddr = addr
 	p.raddrMu.Unlock()
+}
+
+// RaddrAt reports when this peer's observed source address last changed.
+// A zero time means the peer has never been heard from on any socket.
+func (p *Peer) RaddrAt() time.Time {
+	p.raddrMu.RLock()
+	defer p.raddrMu.RUnlock()
+	return p.raddrAt
+}
+
+// PubSocketChangedAt reports when this peer last announced a *different*
+// public mapping than before.
+func (p *Peer) PubSocketChangedAt() time.Time {
+	return p.pubSocketChangedAt
+}
+
+// RaddrCoversCurrentMapping reports whether P2PRaddr can still describe the
+// socket this peer is using now.
+//
+// It can, as long as the peer has not announced a different public mapping
+// since we last heard from it. A peer that re-registers behind a new mapping
+// has either restarted or had its NAT mapping rotated, and in both cases the
+// previous mapping's port belongs to a socket that no longer exists -- so an
+// raddr observed before that moment is stale, however much we trusted it when
+// we first saw it.
+//
+// Observed 2026-10-03: E1 and E2 punched 111.101.5.1:63654 and
+// 111.101.5.1:60735 101 and 84 times respectively -- log3's and log4's ports
+// from the previous processes -- while the live peers announced
+// 111.101.5.1:53781 and :49570. Both receivers were punching the correct
+// address, so the pair failed in one direction only, and every round burned
+// all five retries against a closed port. The peers share one MAC across
+// restarts, so the registry keeps the record; the raddr in it is what outlived
+// the socket.
+func (p *Peer) RaddrCoversCurrentMapping() bool {
+	if p.GetP2PRaddr() == "" {
+		return false
+	}
+	return !p.pubSocketChangedAt.After(p.RaddrAt())
 }
 
 // NotePunchPacket records that a punch/ACK arrived from this peer.
@@ -354,9 +418,9 @@ type PeerRegistry struct {
 	peerByP2PSocket map[string]*Peer // keyed by P2PEndpoint string
 	// graceUnlisted holds peers removed purely for being absent from a
 	// PeerInfoList, keyed by MAC, pending reappearance within
-	// graceUnlistedTTL. Guarded by peerMu. See graceUnlistedTTL for why.
+	// GraceUnlistedTTL. Guarded by peerMu. See GraceUnlistedTTL for why.
 	graceUnlisted map[string]*graceTombstone
-	p2pDatasMu      sync.RWMutex
+	p2pDatasMu    sync.RWMutex
 	P2PCommunityDatas
 	IsWaitingCommunityDatas bool
 	hasPendingChanges       bool
@@ -502,11 +566,14 @@ func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
 	reg.peerMu.Unlock()
 
 	reg.peerMu.RLock()
-	defer reg.peerMu.RUnlock()
 	if reg.Me == nil {
+		reg.peerMu.RUnlock()
 		return &PeerP2PInfos{}
 	}
 	var to []*PeerInfo
+	// Punch outcomes handed to this message, cleared once the RLock is
+	// released. See the pickup site below for why they are consumed.
+	delivered := make([]string, 0, len(reg.natHolePunchResults))
 	for _, v := range reg.Peers {
 		// Publish the OBSERVED source address for each peer. This is the
 		// address the peer's packets actually arrive from — the only one
@@ -515,34 +582,97 @@ func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
 		// instead of the STUN snapshot (which may be stale or bound to a
 		// different NAT mapping).
 		infos := v.Infos
-		if vrd := v.GetP2PRaddr(); vrd != "" {
+		// Only while the observation still covers the socket the peer is on
+		// now. Reporting it regardless is how a stale address travels: the
+		// Worker takes each entry as that peer's observedRaddr, so one host
+		// still holding another's pre-restart raddr republishes it as current,
+		// and the divergence then shows up in the relay's own record.
+		//
+		// Observed 2026-10-03 in the relay log for log3:
+		//
+		//	eligible mac=ea:2f:de:90:a5:72 pubSocket=111.101.5.1:53781
+		//	                  observedRaddr=111.101.5.1:63654
+		//
+		// where :63654 was log3's port in its previous process, republished by
+		// log4, which still held it in its registry. The relay does not
+		// dispatch from observedRaddr, so the pairing was unaffected -- but the
+		// field is read as "where packets from this peer actually arrive", and
+		// on a symmetric NAT it is the field an operator would trust.
+		if vrd := v.GetP2PRaddr(); vrd != "" && v.RaddrCoversCurrentMapping() {
 			infos.ObservedRaddr = vrd
 		}
-		// Attach our latest punch outcome for this peer so the relay learns
+		// Report the current status toward this peer so the relay can tell
+		// whether a success it recorded still describes a live tunnel.
+		// Without this the relay only learns that a punch once worked, never
+		// that it stopped, and has to either suppress the pair forever or
+		// re-punch a healthy one -- both seen in the field.
+		//
+		// This is published for every peer, not only those with a punch
+		// outcome pending. It used to sit inside the `res != nil` branch
+		// below, so a peer reported no status at all unless it had just been
+		// punched -- which is exactly the peer whose status the relay most
+		// needs. The relay reads it back off `to[].p2pStatus` (see
+		// shouldRetireSuccess in the Worker), and reads it as undefined for
+		// such a peer, so a live FullDuplex tunnel looked indistinguishable
+		// from an unobservable one and the relay kept driving it.
+		infos.P2PStatus = uint32(v.P2PStatus)
+
+		// Hand over our latest punch outcome for this peer so the relay learns
 		// whether to keep pushing instructions (in-progress/failed) or stop
 		// entirely (succeeded). Reports are per-peer and carry the MAC they
 		// refer to, so the relay never has to guess whose round this was.
 		// Already holding peerMu.RLock for the whole traversal above; taking
 		// it again here would risk a recursive-read deadlock against a waiting
 		// writer.
-		res := reg.natHolePunchResults[macAddrStr(v.Infos.MacAddr)]
-		if res != nil {
+		//
+		// The outcome is consumed here rather than left in the map to be
+		// re-sent. A punch result is an event -- "a round ended, this is how" --
+		// not a level, so the relay only ever needs to hear it once; the relay
+		// keeps the verdict in its own natHolePunchState. Leaving it resident
+		// replayed the same event on every 2s publish instead:
+		//
+		//   [recordPunchResult] pair ... succeeded on ladder index 1 -> score 10
+		//   [recordPunchResult] pair ... in-progress ... punch dispatched to ...
+		//   [coordinateNatHole]  pair ... scheduled (...@1), backoff=15000ms
+		//
+		// The `score 10` is the damage: every repeat fed the analyzer again,
+		// pushing the rung's score to its ceiling and erasing the signal the
+		// ladder is meant to read. Observed 2026-10-03, where one pair logged
+		// 1332 + 619 + 74 + 45 identical "succeeded" records.
+		mac := macAddrStr(v.Infos.MacAddr)
+		if res := reg.natHolePunchResults[mac]; res != nil {
 			infos.PunchResult = res
-			infos.PunchResultPeerMac = macAddrStr(v.Infos.MacAddr)
-			// Report the current status toward that same peer alongside the
-			// outcome, so the relay can tell whether a success it recorded
-			// still describes a live tunnel. Without this the relay only
-			// learns that a punch once worked, never that it stopped, and
-			// has to either suppress the pair forever or re-punch a healthy
-			// one -- both seen in the field.
-			infos.P2PStatus = uint32(v.P2PStatus)
+			infos.PunchResultPeerMac = mac
+			delivered = append(delivered, mac)
 		}
 		to = append(to, &infos)
 	}
-	return &PeerP2PInfos{
+	infos := &PeerP2PInfos{
 		From: &reg.Me.Infos,
 		To:   to,
 	}
+	reg.peerMu.RUnlock()
+
+	// Drop the outcomes this message just carried. Written under the write
+	// lock, so it has to happen after the RLock above is released; the keys
+	// were collected while it was held. A result recorded in the meantime
+	// replaces the map entry outright, so deleting by key can only ever
+	// discard the one that was actually reported, never a fresher verdict.
+	//
+	// If the publish fails after this point the outcome is lost, and the relay
+	// drives one more round before hearing the verdict again. That costs a
+	// round, not correctness: P2PStatus above still tells the relay the
+	// tunnel is up, and the next round re-reports. This matches how
+	// sendP2PInfos already treats pending changes -- ClearPendingChanges runs
+	// before SendStruct for the same reason.
+	if len(delivered) > 0 {
+		reg.peerMu.Lock()
+		for _, mac := range delivered {
+			delete(reg.natHolePunchResults, mac)
+		}
+		reg.peerMu.Unlock()
+	}
+	return infos
 }
 
 func (reg *PeerRegistry) HasPendingChanges() bool {
@@ -671,11 +801,11 @@ func (p *Peer) lookupSockets() []string {
 // back through the tunnel -- the self-referential path that made one node log
 // 16779 packets from a peer's tap address.
 func receiverPunchCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSocket *net.UDPAddr) []*net.UDPAddr {
-	return rankReceiverCandidates(instr, reg, pubSocket,
-		localNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC()))
+	return RankReceiverCandidates(instr, reg, pubSocket,
+		LocalNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC()))
 }
 
-func rankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSocket *net.UDPAddr, localPrefixes []netip.Prefix) []*net.UDPAddr {
+func RankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSocket *net.UDPAddr, localPrefixes []netip.Prefix) []*net.UDPAddr {
 	var out []*net.UDPAddr
 	seen := make(map[string]bool)
 	add := func(a *net.UDPAddr) {
@@ -714,7 +844,7 @@ func rankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSoc
 		if ep.IP.IsLoopback() || ep.IP.IsLinkLocalUnicast() {
 			continue
 		}
-		if addrInLocalPrefix(ep.IP, localPrefixes) {
+		if AddrInLocalPrefix(ep.IP, localPrefixes) {
 			sameSubnet = append(sameSubnet, ep)
 		} else {
 			rest = append(rest, ep)
@@ -731,7 +861,7 @@ func rankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSoc
 	return out
 }
 
-func addrStrings(list []*net.UDPAddr) []string {
+func AddrStrings(list []*net.UDPAddr) []string {
 	out := make([]string, 0, len(list))
 	for _, a := range list {
 		if a != nil {
@@ -741,10 +871,10 @@ func addrStrings(list []*net.UDPAddr) []string {
 	return out
 }
 
-// addrInLocalPrefix reports whether ip sits inside one of the subnets this
+// AddrInLocalPrefix reports whether ip sits inside one of the subnets this
 // host is also attached to. A peer address that does is reachable by direct
 // routing, so it beats any predicted public address.
-func addrInLocalPrefix(ip net.IP, prefixes []netip.Prefix) bool {
+func AddrInLocalPrefix(ip net.IP, prefixes []netip.Prefix) bool {
 	if ip == nil {
 		return false
 	}
@@ -762,7 +892,7 @@ func addrInLocalPrefix(ip net.IP, prefixes []netip.Prefix) bool {
 	// bytes go over the overlay (the relay by another name), and the peer's
 	// P2PRaddr flaps between the overlay and the public address. Observed on
 	// 2026-09-30 with NetBird on both ends.
-	if isCGNATOverlay(a) {
+	if IsCGNATOverlay(a) {
 		return false
 	}
 	for _, p := range prefixes {
@@ -773,7 +903,7 @@ func addrInLocalPrefix(ip net.IP, prefixes []netip.Prefix) bool {
 	return false
 }
 
-func containsAddr(list []*net.UDPAddr, a *net.UDPAddr) bool {
+func ContainsAddr(list []*net.UDPAddr, a *net.UDPAddr) bool {
 	if a == nil {
 		return false
 	}
@@ -854,7 +984,7 @@ func (reg *PeerRegistry) IsOwnEndpoint(addr string) bool {
 }
 
 // UnlistPeer removes a peer because it was absent from a PeerInfoList, but
-// keeps its learned direct-path state in a tombstone for graceUnlistedTTL.
+// keeps its learned direct-path state in a tombstone for GraceUnlistedTTL.
 //
 // This is the only removal path allowed to be provisional. An explicit
 // UnregisterRequest (handlers_missing.go) stays final: there the relay is
@@ -888,9 +1018,9 @@ func (reg *PeerRegistry) UnlistPeerLocked(MACAddr string) {
 		delete(reg.peerByP2PSocket, p.P2PEndpoint)
 	}
 	delete(reg.Peers, MACAddr)
-	reg.graceUnlisted[MACAddr] = &graceTombstone{peer: p, expiresAt: time.Now().Add(graceUnlistedTTL)}
+	reg.graceUnlisted[MACAddr] = &graceTombstone{peer: p, expiresAt: time.Now().Add(GraceUnlistedTTL)}
 	log.Printf("unlisted peer %s/%s/%s — keeping direct-path state for %v in case it returns",
-		dDesc, dVip, MACAddr, graceUnlistedTTL)
+		dDesc, dVip, MACAddr, GraceUnlistedTTL)
 	reg.SetPendingChanges()
 }
 
@@ -1169,7 +1299,7 @@ func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
 	return previousStatus != status
 }
 
-// graceUnlistedTTL is how long a peer removed because it was absent from a
+// GraceUnlistedTTL is how long a peer removed because it was absent from a
 // PeerInfoList keeps its learned direct-path state while staying out of the
 // active registry.
 //
@@ -1195,7 +1325,7 @@ func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
 // move to a tombstone. A reappearance within the TTL restores the state
 // intact; a longer absence expires the tombstone and the peer is genuinely
 // forgotten. An explicit Unregister is not provisional and never consults this.
-const graceUnlistedTTL = 90 * time.Second
+const GraceUnlistedTTL = 90 * time.Second
 
 // peerRecentlyAliveWindow is how recently we must have observed a peer for a
 // control-plane "this peer is gone" list to be disbelieved. It is generous
@@ -1220,8 +1350,8 @@ func (reg *PeerRegistry) recentlyAliveLocked(p *Peer) bool {
 }
 
 type graceTombstone struct {
-	peer       *Peer
-	expiresAt  time.Time
+	peer      *Peer
+	expiresAt time.Time
 }
 
 // SetP2PRaddr for a tombstoned peer still works, so a punch arriving while
@@ -1241,6 +1371,19 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 			log.Printf("peer with MAC %s updated with network difference: resetting P2PStatus", macAddr)
 			existingPeer.P2PStatus = P2PUnknown
 			existingPeer.P2PCheckID = ""
+		}
+		if existingPeer.Infos.PubSocket != infos.PubSocket {
+			// The peer's public mapping moved. Whatever we observed about the
+			// old one is now evidence about a closed socket, so date the move
+			// -- RaddrCoversCurrentMapping compares against it to stop the
+			// stale raddr outranking this fresh pubSocket. The raddr itself is
+			// left in place: it is still the best record of the peer's address
+			// for inbound matching until a packet arrives on the new socket,
+			// and clearing it would also lose the index key that resolves
+			// those packets.
+			existingPeer.pubSocketChangedAt = time.Now()
+			log.Printf("peer %s changed public mapping %s -> %s; an observed raddr older than this no longer describes its socket",
+				macAddr, existingPeer.Infos.PubSocket, infos.PubSocket)
 		}
 
 		existingPeer.Infos = infos
@@ -1735,10 +1878,10 @@ func ReceiverProbeIPTTL() int { return receiverProbeIPTTL }
 // (pkg/nathole/analysis.go). Only the ones the relay actually emits are
 // named here; an unknown value falls through to the ttl field.
 const (
-	// natHoleModeEasyNATPair is FRP Mode 0: both peers are behind a
+	// NatHoleModeEasyNATPair is FRP Mode 0: both peers are behind a
 	// port-preserving cone NAT, so the STUN-discovered pub_socket is exact
 	// and no port scan is performed.
-	natHoleModeEasyNATPair = 0
+	NatHoleModeEasyNATPair = 0
 
 	// Mode 0 ladder entries 4 and 5 -- the "no TTL" pair, where both roles
 	// emit with the socket's normal TTL.
@@ -1780,7 +1923,7 @@ func natHoleProbeTTL(instr *NatHoleInstruction, fallback int) int {
 	// index that explicitly says 0 (e.g. the sender's own instruction, which
 	// always has ttl 0) is not a receiver probe, and entries outside the
 	// ladder predate the feature.
-	if instr.GetMode() == natHoleModeEasyNATPair && (instr.GetBehaviorIndex() == natHoleBehaviorNoTTLSenderFirst ||
+	if instr.GetMode() == NatHoleModeEasyNATPair && (instr.GetBehaviorIndex() == natHoleBehaviorNoTTLSenderFirst ||
 		instr.GetBehaviorIndex() == natHoleBehaviorNoTTLReceiverFirst) {
 		return 0
 	}
@@ -1962,7 +2105,7 @@ func (reg *PeerRegistry) ExpectedPunchPeerMAC() string {
 	return ""
 }
 
-// nextNatHoleInstruction picks the peer to punch in the next round and advances
+// NextNatHoleInstruction picks the peer to punch in the next round and advances
 // the rotation.
 //
 // Round-robin over a sorted key list, not map iteration order. Go randomises map
@@ -1976,7 +2119,7 @@ func (reg *PeerRegistry) ExpectedPunchPeerMAC() string {
 // Peers that are already FullDuplex are skipped: the Worker keeps an entry
 // until the round that promoted it completes, and re-punching a working tunnel
 // is pure overhead that would delay the peers that still need it.
-func (reg *PeerRegistry) nextNatHoleInstruction() (*NatHoleInstruction, string) {
+func (reg *PeerRegistry) NextNatHoleInstruction() (*NatHoleInstruction, string) {
 	reg.peerMu.Lock()
 	defer reg.peerMu.Unlock()
 
@@ -2033,7 +2176,7 @@ func (reg *PeerRegistry) nextNatHoleInstruction() (*NatHoleInstruction, string) 
 // what edge/routines.go does, via GetPunchedNotFullDuplexPeers and the
 // peer registry's own FullDuplex flags.
 func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
-	instr, instrKey := reg.nextNatHoleInstruction()
+	instr, instrKey := reg.NextNatHoleInstruction()
 
 	if instr == nil {
 		return false
@@ -2127,9 +2270,25 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 	// 2026-10-02 on 192.168.10.7 -> 192.168.10.1/172.22.1.17 -> 172.22.2.44,
 	// where log4 held 172.22.1.17:52784 and still spent five rounds per rung
 	// punching 111.101.5.1:52784.
+	//
+	// Gated on the observation still covering the peer's current mapping.
+	// This block overwrites whatever ResolvePunchTarget chose, so the gate
+	// there does not protect it. Observed 2026-10-03: log4 restarted on
+	// 111.101.5.1:49570 while log3 still held 172.22.2.44:60735 from the
+	// previous process, and every round from 14:38 to 14:48 opened with this
+	// line naming the dead port as the primary target. Ten minutes of failed
+	// rounds, rescued only when the live port happened to be punched as the
+	// secondary candidate.
 	if obsMAC := macAddrStr(instr.GetTargetMac()); obsMAC != "" {
 		if tp, terr := reg.GetPeer(obsMAC); terr == nil && tp != nil {
-			if raddr := tp.GetP2PRaddr(); raddr != "" && !reg.IsOwnEndpoint(raddr) {
+			raddr := tp.GetP2PRaddr()
+			switch {
+			case raddr == "" || reg.IsOwnEndpoint(raddr):
+				// nothing to prefer, or it is us
+			case !tp.RaddrCoversCurrentMapping():
+				log.Printf("[P2P] Receiver: ignoring stale observed raddr %s for %s (it predates the peer's current public mapping, so that socket is closed); using the address resolved from what it advertises",
+					raddr, obsMAC)
+			default:
 				punchTarget = raddr
 				log.Printf("[P2P] Receiver: using observed raddr %s as punch target for %s (ahead of self-reported addresses)", raddr, obsMAC)
 			}
@@ -2367,7 +2526,10 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// it by always replying to the observed raddr; here we go one
 				// step further and punch straight at the observed address.
 				if pRaddr := p.GetP2PRaddr(); pRaddr != "" {
-					if ra, err2 := net.ResolveUDPAddr("udp", pRaddr); err2 == nil && ra != nil {
+					if !p.RaddrCoversCurrentMapping() {
+						log.Printf("[P2P] Sender: skipping stale OBSERVED raddr %s for target %s (it predates the peer's current public mapping, so that socket is closed)",
+							pRaddr, macAddrStr(targetMAC))
+					} else if ra, err2 := net.ResolveUDPAddr("udp", pRaddr); err2 == nil && ra != nil {
 						// Put the observed address FIRST so it is tried
 						// before any predicted/published candidates.
 						candidates = append([]*net.UDPAddr{ra}, candidates...)
@@ -2394,9 +2556,9 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// instead of after every guaranteed-to-fail virtual
 				// interface the peer happens to own. Reported order is kept
 				// among equally-ranked entries (stable sort).
-				localPrefixes := localNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC())
-				assisted := sortAssistedByLocalAffinity(assistedRaw, localPrefixes)
-				if !sameOrder(assistedRaw, assisted) {
+				localPrefixes := LocalNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC())
+				assisted := SortAssistedByLocalAffinity(assistedRaw, localPrefixes)
+				if !SameOrder(assistedRaw, assisted) {
 					log.Printf("[P2P] Sender: target %s reported LAN addresses %v, reordered to %v "+
 						"(same-subnet-first against our %d local subnet(s))",
 						macAddrStr(targetMAC), assistedRaw, assisted, len(localPrefixes))
@@ -2440,14 +2602,14 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 					if err2 != nil || ep == nil {
 						continue
 					}
-					if addrInLocalPrefix(ep.IP, localPrefixes) {
+					if AddrInLocalPrefix(ep.IP, localPrefixes) {
 						lanFirst = append(lanFirst, ep)
 					}
 				}
 				if len(lanFirst) > 0 {
 					rest := candidates[:0]
 					for _, c := range candidates {
-						if !containsAddr(lanFirst, c) {
+						if !ContainsAddr(lanFirst, c) {
 							rest = append(rest, c)
 						}
 					}
@@ -2496,7 +2658,13 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// raddr would still lose to a hairpin address that silently
 				// drops every packet.
 				if raddr := p.GetP2PRaddr(); raddr != "" {
-					if ra, err3 := net.ResolveUDPAddr("udp", raddr); err3 == nil && ra != nil {
+					if !p.RaddrCoversCurrentMapping() {
+						// Same gate as above. This one also owns punchTarget,
+						// so leaving it ungated puts a closed port at the
+						// front of the round and as its primary.
+						log.Printf("[P2P] Sender: not promoting stale observed raddr %s for %s to primary (it predates the peer's current public mapping)",
+							raddr, macAddrStr(targetMAC))
+					} else if ra, err3 := net.ResolveUDPAddr("udp", raddr); err3 == nil && ra != nil {
 						alreadyPresent := false
 						for _, c := range candidates {
 							if c.String() == ra.String() {
@@ -2662,7 +2830,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				receiverCands := receiverPunchCandidates(instr, reg, senderAddr)
 				if len(receiverCands) > 1 {
 					log.Printf("[P2P] Receiver: sender has %d reachable candidate(s) %v, ranked ahead of the pubSocket %s",
-						len(receiverCands)-1, addrStrings(receiverCands), punchTarget)
+						len(receiverCands)-1, AddrStrings(receiverCands), punchTarget)
 				}
 
 				probeTargets := receiverCands
@@ -3063,4 +3231,100 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 		return fmt.Errorf("unknown event type: %v", peerInfoList.GetEventType())
 	}
 	return nil
+}
+
+// The hooks below exist only because test/p2p is an external package and cannot
+// reach unexported identifiers or fields.
+//
+// They are deliberately methods rather than exported fields. The alternative --
+// exporting NatHoleInstructions, GraceUnlisted and the peerMu lock itself --
+// would let any caller reach inside the registry without going through the
+// locking that every other access has to take, and would turn an implementation
+// detail into something the compiler now treats as API. A caller can still
+// misuse these, but misuse is visible at the call site instead of silent.
+
+// LockForTest takes the registry lock. Exported for test/p2p; not part of the
+// supported API.
+func (reg *PeerRegistry) LockForTest() { reg.peerMu.Lock() }
+
+// UnlockForTest releases the registry lock. Exported for test/p2p; not part of
+// the supported API.
+func (reg *PeerRegistry) UnlockForTest() { reg.peerMu.Unlock() }
+
+// NatHoleInstructionsForTest returns the live instruction map, not a copy, so a
+// test can seed and clear entries directly.
+//
+// The map is not safe to touch without LockForTest, exactly as the registry's
+// own accessors require. Exported for test/p2p; not part of the supported API.
+func (reg *PeerRegistry) NatHoleInstructionsForTest() map[string]*NatHoleInstruction {
+	return reg.natHoleInstrs
+}
+
+// GraceUnlistedCountForTest reports how many grace tombstones are held.
+// Exported for test/p2p; not part of the supported API.
+func (reg *PeerRegistry) GraceUnlistedCountForTest() int {
+	return len(reg.graceUnlisted)
+}
+
+// ExpireGraceTombstonesForTest runs tombstone expiry as of now. The caller must
+// hold the registry lock, as the internal caller does. Exported for test/p2p;
+// not part of the supported API.
+func (reg *PeerRegistry) ExpireGraceTombstonesForTest(now time.Time) {
+	reg.expireGraceTombstonesLocked(now)
+}
+
+// RecordNatHolePunchResultForTest records a punch result. The caller must hold
+// the registry lock, as the internal caller does. Exported for test/p2p; not
+// part of the supported API.
+func (reg *PeerRegistry) RecordNatHolePunchResultForTest(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32) {
+	reg.recordNatHolePunchResultLocked(peerMAC, state, attempts, detail, behaviorIndex)
+}
+
+// NatHolePunchResultsForTest returns the live punch-result map, not a copy, so a
+// test can seed and clear entries directly. Not safe to touch without
+// LockForTest. Exported for test/p2p; not part of the supported API.
+func (reg *PeerRegistry) NatHolePunchResultsForTest() map[string]*NatHolePunchResult {
+	return reg.natHolePunchResults
+}
+
+// NatHoleRetryCountsForTest returns the live retry-count map, not a copy. Not
+// safe to touch without LockForTest. Exported for test/p2p; not part of the
+// supported API.
+func (reg *PeerRegistry) NatHoleRetryCountsForTest() map[string]int {
+	return reg.natHoleRetryCounts
+}
+
+// SetNatHoleInstructionsForTest replaces the instruction map wholesale, so a
+// test can seed several entries in one assignment. The caller must hold the
+// registry lock. Exported for test/p2p; not part of the supported API.
+func (reg *PeerRegistry) SetNatHoleInstructionsForTest(m map[string]*NatHoleInstruction) {
+	reg.natHoleInstrs = m
+}
+
+// SetNatHoleRetryCountsForTest replaces the retry-count map wholesale. The
+// caller must hold the registry lock. Exported for test/p2p; not part of the
+// supported API.
+func (reg *PeerRegistry) SetNatHoleRetryCountsForTest(m map[string]int) {
+	reg.natHoleRetryCounts = m
+}
+
+// LookupSockets returns the socket keys this peer is indexed under, without the
+// caller having to re-derive the rule that IndexPeerRaddr follows. Exported for
+// test/p2p; not part of the supported API.
+func (p *Peer) LookupSockets() []string { return p.lookupSockets() }
+
+// SetPeerBySocketForTest installs one socket->peer entry. The caller must hold
+// the registry lock. Exported for test/p2p; not part of the supported API.
+func (reg *PeerRegistry) SetPeerBySocketForTest(key string, p *Peer) {
+	if reg.peerBySocket == nil {
+		reg.peerBySocket = map[string]*Peer{}
+	}
+	reg.peerBySocket[key] = p
+}
+
+// LastNatHoleInstrs returns the live last-instruction map, not a copy, so a
+// test can seed entries directly. Not safe to touch without LockForTest.
+// Exported for test/p2p; not part of the supported API.
+func (reg *PeerRegistry) LastNatHoleInstrs() map[string]*NatHoleInstruction {
+	return reg.lastNatHoleInstrs
 }

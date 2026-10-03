@@ -45,7 +45,7 @@ func SetupNAT(conn *net.UDPConn, edgeID string, dialAddr string) NATClient {
 		return nil
 	}
 	ipv4 := net.ParseIP(localIP)
-	if isPublicRoutable(ipv4) {
+	if IsPublicRoutable(ipv4) {
 		log.Printf("NAT Setup: found public/routable local ip: %s no further nat setup is required", localIP)
 		return nil
 	}
@@ -172,7 +172,7 @@ func getLocalIP(dialAddr string) (string, error) {
 			switch {
 			case ipv4 == nil, ipv4.IsLoopback(), ipv4.IsLinkLocalUnicast():
 				continue
-			case isPublicRoutable(ipv4):
+			case IsPublicRoutable(ipv4):
 				if public == "" {
 					public = ipv4.String()
 				}
@@ -229,8 +229,7 @@ func standardizeProtocol(protocol string) string {
 	return "TCP" // Default to TCP if not UDP
 }
 
-
-// isPublicRoutable reports whether ip is reachable from the public internet, and
+// IsPublicRoutable reports whether ip is reachable from the public internet, and
 // is the single test this package should use for that question.
 //
 // It replaces `!ip.IsPrivate()`, which is wrong in the direction that matters
@@ -241,7 +240,7 @@ func standardizeProtocol(protocol string) string {
 // setup. This is the third copy of the CGNAT test in the tree, after
 // pkg/edge/natclassify.go and pkg/p2p/affinity.go; all three agree because they
 // share pkg/p2p's definition.
-func isPublicRoutable(ip net.IP) bool {
+func IsPublicRoutable(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}

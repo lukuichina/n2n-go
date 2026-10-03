@@ -125,6 +125,15 @@ var (
 				Aliases: []string{"C"},
 				Usage:   "Enable Zstd compression for data payloads (default: false)",
 			},
+			&cli.BoolFlag{
+				Name:    "ipv6-prefer",
+				Aliases: []string{"6"},
+				Usage:   "Dial IPv6 first instead of IPv4 first; the other family is only used if this one cannot be reached",
+			},
+			&cli.BoolFlag{
+				Name:  "db-log",
+				Usage: "Log into the SQLite database at /root/.n2n-go/edge.db instead of the console",
+			},
 		},
 		// Positional arg: supernode URL shortcut
 		// Usage: ./edge up wss://host/n2n -l
@@ -138,14 +147,35 @@ func upCmd(c *cli.Context) error {
 	return nil
 }
 func up(c *cli.Context) {
-	noSqlLogger := false
-	if c.IsSet("stdout-log") {
-		if c.Bool("stdout-log") {
-			log.SetStd()
-			noSqlLogger = true
-		}
+	// The console is the default sink, and --stdout-log/-l still selects it
+	// explicitly for scripts that used to pass it.
+	//
+	// SQLite became the unconditional default at some point, and that moved
+	// every log line off the terminal: the log file kept receiving the banner
+	// and nothing else, and the only way to see what the edge was doing became
+	// the edge logs subcommand. That is the opposite of what the flag's name
+	// implies, and it is what a remote deployment actually wants -- an edge
+	// that says nothing to stdout looks dead. So the sink is opt-in now:
+	//
+	//	./edge up -c myc -s wss://...          -> console
+	//	./edge up -c myc -s wss://... -l       -> console (explicit)
+	//	./edge up -c myc -s wss://... --db-log -> /root/.n2n-go/edge.db
+	//
+	// The `edge logs` command initialises the database itself (see
+	// edge_logs.go), so a console-logging edge can still read an existing
+	// edge.db -- it just does not write one.
+	toStdout := true
+	if c.Bool("db-log") {
+		toStdout = false
 	}
-	if !noSqlLogger {
+	if c.IsSet("stdout-log") && !c.Bool("stdout-log") {
+		// --stdout-log=false used to mean "not stdout", i.e. the database.
+		// Keep that spelling working now that it takes an explicit opt-in.
+		toStdout = false
+	}
+	if toStdout {
+		log.SetStd()
+	} else {
 		edge.EnsureEdgeLogger()
 	}
 	log.Printf("starting edge...")
@@ -189,6 +219,10 @@ func up(c *cli.Context) {
 	if c.IsSet("proxy-url") {
 		cfg.ProxyURL = c.String("proxy-url")
 	}
+
+	// Not gated on IsSet: this one has a non-zero default in the other
+	// direction, and -6 is a plain switch, not a value.
+	cfg.PreferIPv6 = c.Bool("ipv6-prefer")
 
 	if c.IsSet("supernode") {
 		cfg.SupernodeURL = c.String("supernode")

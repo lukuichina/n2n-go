@@ -8,8 +8,8 @@ import (
 	"net"
 	"syscall"
 
-	"n2n-go/pkg/log" // Assuming this logging package exists
 	"github.com/vishvananda/netlink" // Import the netlink library
+	"n2n-go/pkg/log"                 // Assuming this logging package exists
 )
 
 const DefaultMTU = 1420 // Or your desired default MTU

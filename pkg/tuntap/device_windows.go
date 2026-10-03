@@ -104,6 +104,73 @@ func formatMACForRegistry(macStr string) (string, error) {
 }
 
 // findInterfaceIndexAndInfoByGUID (unchanged)
+// TapWindowsIfIndexes returns the interface index of every TAP-Windows adapter
+// installed on this host -- not just the one n2n happens to open.
+//
+// A host that has run n2n more than once accumulates TAP adapters, one per
+// run that used a different --net or simply left the previous instance
+// behind, and Windows names them "本地连接", "本地连接 2", "本地连接 3" -- by
+// locale, with nothing in the name that distinguishes them from a real NIC.
+// The TAP-Windows driver also reports each of them as up once it has been
+// opened, whether or not anything is using it. So neither the name nor
+// net.FlagUp can keep them out of a list of addresses meant for punching, and
+// a leftover adapter holding an RFC1918 address from an earlier subnet lands
+// in the same reachability tier as the real uplink.
+//
+// The registry does hold the authoritative answer: every network adapter
+// records its driver identity in ComponentId, and this package already reads
+// it to find the one tap it should open. Reading the whole list costs no new
+// process and, unlike name matching, cannot be defeated by the locale.
+//
+// A nil error with an empty slice means no TAP is installed. An error means the
+// registry could not be read and callers should fall back to name and
+// address-space matching.
+func TapWindowsIfIndexes() ([]uint32, error) {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, networkAdaptersRegKey, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
+	if err != nil {
+		return nil, fmt.Errorf("failed open adapters key: %w", err)
+	}
+	defer key.Close()
+	subkeys, err := key.ReadSubKeyNames(-1)
+	if err != nil {
+		return nil, fmt.Errorf("failed read subkeys: %w", err)
+	}
+
+	var indexes []uint32
+	for _, subkeyName := range subkeys {
+		subkey, errOpen := registry.OpenKey(key, subkeyName, registry.QUERY_VALUE)
+		if errOpen != nil {
+			if !errors.Is(errOpen, windows.ERROR_ACCESS_DENIED) {
+				log.Printf("Debug: Skipping key %s: %v", subkeyName, errOpen)
+			}
+			continue
+		}
+		compID, _, errComp := subkey.GetStringValue(componentIDRegValue)
+		var guid string
+		if errComp == nil && (compID == tapWindows11ComponentID || compID == tapWindows10ComponentID) {
+			instanceGUID, _, errGuid := subkey.GetStringValue(netCfgInstanceIDValue)
+			if errGuid != nil {
+				log.Printf("Warning: TAP key '%s' failed get GUID: %v", subkeyName, errGuid)
+			} else {
+				guid = instanceGUID
+			}
+		}
+		subkey.Close()
+		if guid == "" {
+			continue
+		}
+		ifIdx, _, errIdx := findInterfaceIndexAndInfoByGUID(guid)
+		if errIdx != nil {
+			// The registry entry outlives the adapter itself, which is the
+			// normal state of a tap that has been uninstalled.
+			log.Printf("Debug: TAP adapter GUID %s is not in the adapter list: %v", guid, errIdx)
+			continue
+		}
+		indexes = append(indexes, ifIdx)
+	}
+	return indexes, nil
+}
+
 func findInterfaceIndexAndInfoByGUID(guid string) (ifIndex uint32, macAddr net.HardwareAddr, err error) {
 	var bufferSize uint32 = 15000
 	var adapters *windows.IpAdapterAddresses
