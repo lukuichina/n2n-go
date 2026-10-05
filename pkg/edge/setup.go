@@ -490,20 +490,38 @@ func (e *EdgeClient) RequestRegister() error {
 	return e.SendStruct(regReq, nil, p2p.UDPEnforceSupernode)
 }
 
+// KernelSourceIPForTest exposes kernelSourceIP so the advertised-endpoint
+// selection can be asserted against the host the test actually runs on, rather
+// than against a synthetic interface table that would not exercise the route
+// lookup at all.
+func KernelSourceIPForTest(excludeIfIndex uint32) net.IP {
+	return kernelSourceIP(excludeIfIndex)
+}
+
 // P2PEndpointString returns the P2P endpoint (IP:port) that this Edge advertises
 // to the supernode for peer-to-peer hole-punching. Returns an empty string when
 // no P2P listener is configured.
 //
 // When the P2P socket is bound to 0.0.0.0 (wildcard), the local address is
 // replaced with the actual local IP so the remote peer can route packets.
+//
+// With a wildcard bind the kernel -- not this function -- chooses the source
+// address at send time, so the endpoint advertised here has to be the one the
+// kernel will pick, or peers punch an address nothing answers on. See
+// kernelSourceIP for why enumerating local IPs is the wrong way to find it.
 func (e *EdgeClient) P2PEndpointString() string {
 	if e.P2PAddr == nil {
 		return ""
 	}
 	if e.P2PAddr.IP != nil && e.P2PAddr.IP.IsUnspecified() {
-		// Use the first non-loopback local IP as the routable address.
-		// The tap is excluded by index so a non-default --net cannot make it
-		// win this single slot.
+		// Ask the routing table first: this is the address a remote peer
+		// will actually see arrive from.
+		if ip := kernelSourceIP(e.ownTapIfIndex()); ip != nil {
+			return fmt.Sprintf("%s:%d", ip.String(), e.P2PAddr.Port)
+		}
+		// Fall back to the first non-loopback local IP. The tap is excluded
+		// by index so a non-default --net cannot make it win this single
+		// slot.
 		localIPs := ListLocalIPsExcluding(1, e.ownTapIfIndex())
 		if len(localIPs) > 0 {
 			if ip := net.ParseIP(localIPs[0]); ip != nil {
@@ -512,6 +530,95 @@ func (e *EdgeClient) P2PEndpointString() string {
 		}
 	}
 	return e.P2PAddr.String()
+}
+
+// kernelSourceIP returns the local IPv4 address the kernel would use as the
+// source address for traffic leaving this host toward the public internet, or
+// nil when that cannot be established.
+//
+// This exists because P2PEndpointString has to name one concrete address for a
+// socket bound to 0.0.0.0, and the only address that is genuinely correct is
+// the one the routing table selects. Taking the first entry of
+// ListLocalIPsExcluding instead answers a different question -- "which address
+// did the OS enumerate first" -- and those two disagree on any host with more
+// than one address in the same reachability tier. ListLocalIPsExcluding ranks
+// globally routable above private above link-local, but explicitly preserves
+// enumeration order *within* a tier, so a machine with a physical NIC and a
+// virtual one on the same LAN gets whichever the OS listed first. That
+// advertised a dead address for the whole punch.
+//
+// Scope, stated precisely because it is narrow. This fixes the address *this*
+// host picks for itself. It does not address a peer whose packets arrive from
+// an address neither side advertised because a NAT in the path rewrote the
+// source. That rewriting happens in a router, outside the sending host's
+// protocol stack: on 2026-10-03, log5 (52:eb:72:ed:64:1f) advertised
+// 192.168.10.13:33377, which `ip a` confirms was its real eth0 address, and
+// an OpenWrt in the path still delivered every packet to log3 with source
+// 192.168.10.2:33377. No self-address choice can predict or prevent that, and
+// kernelSourceIP returns 192.168.10.13 on that host just as the old code did.
+//
+// A peer advertised at an address it cannot be reached at is a receiving-side
+// problem, fixed where the observed address is learned: ExpectedPunchPeerMAC
+// and the attribution path in handleP2P. Do not expect a change here to make
+// such a punch work.
+//
+// What this does cover is the case the old code got wrong on its own terms: a
+// host with two addresses in the same reachability tier, where enumeration
+// order decided which one got advertised. The advertised address then names
+// an interface the kernel will not source from, and punches go to an address
+// this host never sends from in the first place.
+//
+// The probe connects a throwaway UDP socket to an off-subnet address. Connect
+// on a datagram socket performs the route lookup and sends nothing, so this
+// costs no packets on the wire and cannot be mistaken for traffic.
+//
+// excludeIfIndex is the tap's interface index, so a result that routes back
+// into our own overlay is rejected rather than advertised.
+func kernelSourceIP(excludeIfIndex uint32) net.IP {
+	// Public resolvers: off-subnet for every deployment, and parsed as IP
+	// literals so this never blocks on DNS.
+	probes := []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"}
+
+	// Only ever advertise an address this host already offers as a normal
+	// local IP. That keeps the tap adapter out, and keeps the answer
+	// consistent with the ranking that ClassifyNATFeature and the assisted
+	// candidate list also rely on.
+	allowed := make(map[string]bool)
+	for _, ip := range ListLocalIPsExcluding(16, excludeIfIndex) {
+		allowed[ip] = true
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+
+	for _, p := range probes {
+		dst, err := net.ResolveUDPAddr("udp4", p)
+		if err != nil {
+			continue
+		}
+		c, err := net.DialUDP("udp4", nil, dst)
+		if err != nil {
+			continue
+		}
+		local, ok := c.LocalAddr().(*net.UDPAddr)
+		var ip net.IP
+		if ok && local != nil && local.IP != nil {
+			ip = local.IP.To4()
+		}
+		c.Close()
+		if ip == nil {
+			continue
+		}
+		// A tunnel address can legitimately be the kernel's choice when the
+		// VPN owns the default route, but it is never the answer to "what
+		// will a remote peer see", so leave those hosts to the existing
+		// ranking rather than advertising them from a route lookup.
+		if !allowed[ip.String()] || p2p.IsCGNATOverlayAddr(ip) {
+			continue
+		}
+		return ip
+	}
+	return nil
 }
 
 // ownTapIfIndex returns the interface index of the tap n2n opened, or 0 when

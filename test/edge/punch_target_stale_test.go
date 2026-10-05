@@ -66,7 +66,7 @@ func TestStaleObservedRaddrLosesToFreshPubSocket(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, note := ResolvePunchTarget(
 				tc.staleRaddr, tc.freshPub, "192.168.10.7:53781", "192.168.10.7:53781",
-				tc.peerMAC, false)
+				tc.peerMAC, false, false)
 			if got != tc.wantAddr {
 				t.Errorf("chose %s, want the current mapping %s (note: %s)", got, tc.wantAddr, note)
 			}
@@ -83,7 +83,7 @@ func TestStaleObservedRaddrLosesToFreshPubSocket(t *testing.T) {
 func TestStaleRaddrFallsBackToPubSocketNotPrivateEndpoint(t *testing.T) {
 	got, note := ResolvePunchTarget(
 		"111.101.5.1:63654", "111.101.5.1:53781", "192.168.10.7:53781", "192.168.10.7:53781",
-		"ea:2f:de:90:a5:72", false)
+		"ea:2f:de:90:a5:72", false, false)
 	if got != "111.101.5.1:53781" {
 		t.Fatalf("chose %s, want the public mapping; note: %s", got, note)
 	}
@@ -100,7 +100,7 @@ func TestFreshObservedRaddrStillWins(t *testing.T) {
 		{"111.101.5.1:53781", "111.101.5.1:53781"}, // observed from the peer itself
 	} {
 		got, note := ResolvePunchTarget(
-			tc.raddr, "111.101.5.1:53781", "192.168.10.7:53781", "", "9e:6e:2d:8c:f5:db", true)
+			tc.raddr, "111.101.5.1:53781", "192.168.10.7:53781", "", "9e:6e:2d:8c:f5:db", true, false)
 		if got != tc.want {
 			t.Errorf("chose %s, want the observed %s (note: %s)", got, tc.want, note)
 		}
@@ -115,7 +115,7 @@ func TestFreshObservedRaddrStillWins(t *testing.T) {
 // reads like a network problem rather than a bookkeeping one.
 func TestStaleRaddrAloneIsReportedNotPunched(t *testing.T) {
 	got, note := ResolvePunchTarget(
-		"111.101.5.1:63654", "", "", "", "ea:2f:de:90:a5:72", false)
+		"111.101.5.1:63654", "", "", "", "ea:2f:de:90:a5:72", false, false)
 	if got != "" {
 		t.Fatalf("chose %s, want no target", got)
 	}

@@ -72,6 +72,28 @@ func (e *EdgeClient) handleP2PStateInfoMessage(r *protocol.RawMessage) error {
 			if info.P2PEndpoint != "" {
 				p.SetP2PEndpoint(info.P2PEndpoint)
 			}
+			// An entry carrying a punch outcome is that peer's report on the
+			// round it just ran, not a statement about reachability. The two
+			// were conflated, and the consequence was that the receiver of
+			// an in-progress report was recorded as reachable anyway --
+			// promoting a pair the sender had not actually reached.
+			//
+			// The conflation was invisible because PunchStateInProgress is 1
+			// while the reachability capability P2PStatus is published as
+			// the same message field, and the sender writes the latter
+			// unconditionally. So an in-progress entry arrived looking like a
+			// reachability claim and was honoured as one.
+			//
+			// Only entries with no punch outcome attached carry the
+			// capability, and those are the ones the relay reads
+			// shouldRetireSuccess from. An entry that does carry one has
+			// already had its reachability reflected by the punch packets
+			// themselves, which promote through NotePunchPacket.
+			if info.PunchResult != nil {
+				log.Printf("[P2P] peer %s published a punch outcome (%s) toward us; taking it as a round report, not a reachability claim",
+					mac, info.PunchResult.GetState().String())
+				continue
+			}
 			// Peer reported as reachable
 			if p.UpdateP2PStatus(p2p.P2PAvailable, "") {
 				e.Peers.SetPendingChanges()
@@ -152,6 +174,7 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 	behaviorIndex := instr.GetBehaviorIndex()
 	sendDelayMs := instr.GetSendDelayMs()
 	senderMAC := macBytesToStr(instr.GetSenderMac())
+	logTargetMAC := macBytesToStr(instr.GetTargetMac())
 	senderP2PEndpoint := instr.GetSenderP2PEndpoint()
 	senderPubSocket := instr.GetSenderPubSocket()
 
@@ -165,8 +188,20 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 		assistedStr = strings.Join(senderAssisted, ",")
 	}
 
-	log.Printf("[Edge] NatHoleInstruction: role=%d senderNatType=%s senderBehavior=%s portsDiff=%d regularChange=%v portsRange=%d-%d ttl=%d senderMAC=%s senderP2P=%s senderPubSocket=%s senderAssisted=[%s] ladder=mode%d/index%d sendDelay=%dms",
-		role, senderNatType, senderBehavior, portsDiff, regularChange, portsFrom, portsTo, ttl, senderMAC, senderP2PEndpoint, senderPubSocket, assistedStr, mode, behaviorIndex, sendDelayMs)
+	// targetMac is the field that tells two otherwise identical instructions
+	// apart, and it was missing here. The Worker builds one PeerInfoList from
+	// the whole instructions map and sends the same payload to every peer that
+	// has any instruction, so an edge logs instructions belonging to pairs it
+	// is not part of and then drops them at the "entry belongs to X, not us"
+	// check below. Without targetMac in the line, every sender-side
+	// instruction an edge sees carries the same senderMAC and the same
+	// ladder, and byte-comparing log lines reports them as duplicates: in the
+	// 2026-10-04 log3/log4 capture this made two instructions for two
+	// different pairs (log4->E1 and log4->log3) look like one repeated
+	// instruction, which sent the investigation after a duplicate that did not
+	// exist.
+	log.Printf("[Edge] NatHoleInstruction: role=%d targetMAC=%s senderNatType=%s senderBehavior=%s portsDiff=%d regularChange=%v portsRange=%d-%d ttl=%d senderMAC=%s senderP2P=%s senderPubSocket=%s senderAssisted=[%s] ladder=mode%d/index%d sendDelay=%dms",
+		role, logTargetMAC, senderNatType, senderBehavior, portsDiff, regularChange, portsFrom, portsTo, ttl, senderMAC, senderP2PEndpoint, senderPubSocket, assistedStr, mode, behaviorIndex, sendDelayMs)
 
 	// Determine whether we are the sender or receiver.
 	// Use the instruction's role field directly, not a MAC comparison,
@@ -250,7 +285,7 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 			regEndpoint = p.P2PEndpoint
 			raddrFresh = p.RaddrCoversCurrentMapping()
 		}
-		chosen, note := ResolvePunchTarget(regRaddr, regPub, regEndpoint, senderP2PEndpoint, targetMAC, raddrFresh)
+		chosen, note := ResolvePunchTarget(regRaddr, regPub, regEndpoint, senderP2PEndpoint, targetMAC, raddrFresh, false)
 		log.Printf("NatHoleInstruction: sender target resolution: %s", note)
 		if chosen == "" {
 			log.Printf("[Edge] NatHoleInstruction: sender cannot resolve a routable target for %s", targetMAC)
@@ -263,9 +298,12 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 			targetPubSocket = senderPubSocket
 		}
 	} else {
-		// We are the receiver; the target is the sender. Resolve it exactly
-		// as the sender branch does -- the instruction's endpoint field can
-		// carry an off-link private address here just as easily.
+		// We are the receiver; the target is the sender. The sender's
+		// endpoint field can carry an off-link private address just as
+		// easily, so the receiver resolves through the same guard -- but
+		// with the receiver role, which forbids promoting an off-link
+		// private observed raddr. See ResolvePunchTarget for why
+		// reciprocity is not symmetric here.
 		var regRaddr, regPub, regEndpoint string
 		raddrFresh := false
 		if p, err := e.Peers.GetPeer(senderMAC); err == nil {
@@ -274,7 +312,7 @@ func (e *EdgeClient) handleNatHoleInstruction(entryMAC string, instr *p2p.NatHol
 			regEndpoint = p.P2PEndpoint
 			raddrFresh = p.RaddrCoversCurrentMapping()
 		}
-		chosen, note := ResolvePunchTarget(regRaddr, regPub, regEndpoint, senderP2PEndpoint, senderMAC, raddrFresh)
+		chosen, note := ResolvePunchTarget(regRaddr, regPub, regEndpoint, senderP2PEndpoint, senderMAC, raddrFresh, true)
 		log.Printf("NatHoleInstruction: receiver target resolution: %s", note)
 		if chosen == "" {
 			log.Printf("[Edge] NatHoleInstruction: receiver cannot resolve a routable target for sender %s", senderMAC)

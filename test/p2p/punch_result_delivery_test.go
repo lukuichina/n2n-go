@@ -109,7 +109,7 @@ func TestConsumedPunchResultLeavesTheMap(t *testing.T) {
 	reg.GetPeerP2PInfos()
 
 	reg.LockForTest()
-	remaining := reg.NatHolePunchResultsForTest()[targetStr]
+	remaining := reg.NatHolePunchResultsSnapshotLocked()[targetStr]
 	reg.UnlockForTest()
 	if remaining != nil {
 		t.Fatalf("consumed result still resident: %+v", remaining)

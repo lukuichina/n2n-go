@@ -304,6 +304,19 @@ func (e *EdgeClient) handleHeartbeat() {
 // open (pkg/util/net/kcp.go:96, NewConn3(1, udpAddr, nil, 10, 3, pConn)).
 // We have no lower layer, so the probe interval is the only thing keeping the
 // mapping alive and must stay well under the gateway's idle timeout.
+// Backoff bounds for re-arming a pair that never reached a verified data
+// path. FRP uses a flat MinRetryInterval=90s in keepTunnelOpenWorker; the
+// first wait here is shorter because a missed punch window is cheap to retry
+// and expensive to miss. See PeerRegistry.ReArmStalledNatHolePeers.
+const (
+	natHoleStallBaseBackoff = 30 * time.Second
+	natHoleStallMaxBackoff  = 300 * time.Second
+	// How recently a pair must have carried real traffic to count as healthy
+	// rather than stalled. FRP's MinRetryInterval=90s is the closest analogue,
+	// so match it rather than inventing a second number.
+	natHoleStallHealthyWindow = 90 * time.Second
+)
+
 func (e *EdgeClient) handleP2PKeepAlive() {
 	e.wg.Add(1)
 	defer e.wg.Done()
@@ -383,6 +396,18 @@ func (e *EdgeClient) p2pKeepAliveTick(timeout time.Duration) {
 		e.sendPathVerificationProbe(p)
 	}
 
+	// Pairs that never made it. The FullDuplex demote below covers a tunnel
+	// that died; nothing covered a tunnel that never opened, so a pair that
+	// burned its five attempts fell to the relay and stayed there for good.
+	// E1<->E2 did exactly this: both sides punched, the windows missed each
+	// other by 20s, and the pair then sat on the relay for the rest of the
+	// run. Base backoff is under FRP's flat 90s (see the method's note) — the
+	// failure here is window misalignment, and a prompt retry lands in the
+	// peer's next window instead of past it.
+	if n := e.Peers.ReArmStalledNatHolePeers(now, natHoleStallBaseBackoff, natHoleStallMaxBackoff, natHoleStallHealthyWindow); n > 0 {
+		e.Peers.SetPendingChanges()
+	}
+
 	for _, p := range e.Peers.GetFullDuplexPeers() {
 		macStr := net.HardwareAddr(p.Infos.MacAddr).String()
 		if macStr == self {
@@ -395,10 +420,29 @@ func (e *EdgeClient) p2pKeepAliveTick(timeout time.Duration) {
 		log.Printf("[P2P] keepalive timeout: no frame from %s for %v, demoting FullDuplex -> relay",
 			macStr, now.Sub(last).Truncate(time.Second))
 		if changed, _ := p.SetFullDuplex(false); changed {
+			// The data plane has concluded, on a real timeout, that this path
+			// is dead, so it withdraws the punch-path capability as well.
+			// SetFullDuplex no longer does this itself, because it is also
+			// called when a relay pong merely shows that the liveness probe
+			// took the supernode -- which says nothing about the hole.
+			//
+			// Withdrawing here is what keeps the guard in UpdateP2PStatus
+			// from pinning a dead path: without it the capability would
+			// survive a genuine timeout and every later control-plane
+			// Unknown would be refused, leaving the peer routed over a path
+			// the data plane has already written off.
+			if p.PunchPathOpen() {
+				log.Printf("[P2P] withdrawing open punch path for peer %s: data path timed out",
+					macStr)
+				p.ClearPunchPath()
+			}
 			// Re-arm the punch so the next tick retries instead of leaving
 			// the peer stuck on the relay forever.
 			e.Peers.ReArmNatHoleInstruction(p.Infos.MacAddr)
 			e.Peers.SetPendingChanges()
+			// And forget how long this pair had been failing: once it comes
+			// back it should not inherit the grown backoff if it drops again.
+			e.Peers.ResetNatHoleStallCount(p.Infos.MacAddr)
 		}
 	}
 }
@@ -647,12 +691,45 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 				//
 				// Answering is still fine -- the packet is genuinely from a
 				// peer -- but recording it against the wrong peer is not.
-				if other := e.Peers.PeerClaimingPort(uint16(addr.Port), named); other != nil {
-					log.Printf("[P2P] Refusing to attribute punch from %v to instruction peer %s: port %d is already claimed by %s (answering without recording)",
-						addr, mac, addr.Port, net.HardwareAddr(other.Infos.MacAddr).String())
-					if named.AllowPunchAck(now) {
+				if other := e.Peers.PeerClaimingPortExclusive(uint16(addr.Port)); other != nil {
+					// The port says which peer this is, and the address says
+					// where it really comes from. Recording that pairing is
+					// the whole point of the punch: it is how a peer behind a
+					// masquerading router becomes dialable, because the
+					// address it advertises is on the far side of an
+					// unreachable segment while the source its frames carry
+					// is not.
+					//
+					// Refusing to record here cost the log3/log5 pair the
+					// whole run on 2026-10-05. A wireless repeater
+					// masquerades 192.168.10.13 (log5's advertised address)
+					// to 192.168.10.2, so log5's punches arrived from an
+					// address in nobody's registry entry. Each one hit this
+					// branch, was answered, and was dropped -- 11 times in
+					// log3 over 3 minutes. The port was recognised as
+					// log5's throughout, so the peer was known; only the
+					// pairing was thrown away. log3 kept a P2PRaddr of
+					// 192.168.10.13:48681, an address on the segment the
+					// repeater has split, and FullDuplex never arrived even
+					// though log3 received log5's real frames from
+					// 192.168.10.2:48681.
+					//
+					// Recording against the port's owner rather than the
+					// instruction peer is deliberate: the instruction names
+					// whoever the relay paired us with, and here that is not
+					// who is speaking -- the same shared-gateway hazard the
+					// comment above documents, which is why this branch
+					// exists at all. The port is the discriminator that
+					// survives, and PeerClaimingPortExclusive declines when
+					// two peers claim the same port rather than guessing.
+					log.Printf("[P2P] Punch from %v attributed to peer %s by its exclusive P2P port %d; recording that as its raddr (the advertised address is unreachable behind the masquerade)",
+						addr, net.HardwareAddr(other.Infos.MacAddr).String(), addr.Port)
+					if other.AllowPunchAck(now) {
 						e.sendPunchAck(addr)
 					}
+					other.NotePunchPacket()
+					other.SetP2PRaddr(addr.String())
+					e.Peers.IndexPeerRaddr(other, addr.String())
 					return
 				}
 				log.Printf("[P2P] Punch packet from %v attributed to instruction peer %s (source address was rewritten in transit)", addr, mac)

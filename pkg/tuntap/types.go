@@ -1,6 +1,7 @@
 package tuntap
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"time"
@@ -15,6 +16,28 @@ const (
 	TUN DeviceType = iota
 	TAP
 )
+
+// String makes DeviceType printable with %s and %v.
+//
+// It exists because the error path in CreateTunTapDevice formats DevType
+// with %s, and DeviceType was a bare `int` with no String method — so the one
+// error that tells you the TAP device could not be created came out as
+// "failed to create %!s(tuntap.DeviceType=1) interface" with the argument
+// swallowed. It fired on exactly the case you most want to read: a
+// TUNSETIFF EPERM, where the useful fact is that it was a TAP you were after
+// and not a TUN. An out-of-range value renders as DeviceType(N) rather than a
+// bare number, so a bad cast is still visible instead of silently aliasing
+// TUN.
+func (d DeviceType) String() string {
+	switch d {
+	case TUN:
+		return "TUN"
+	case TAP:
+		return "TAP"
+	default:
+		return fmt.Sprintf("DeviceType(%d)", int(d))
+	}
+}
 
 type Config struct {
 	Name        string

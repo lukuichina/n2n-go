@@ -5,6 +5,7 @@ import (
 	"n2n-go/pkg/log"
 	"n2n-go/pkg/p2p"
 	"net"
+	"sort"
 	"strings"
 	"time"
 )
@@ -150,53 +151,20 @@ func Cleanup(client NATClient) {
 // This is shared by both UPnP and NAT-PMP implementations.
 func getLocalIP(dialAddr string) (string, error) {
 	if dialAddr == "" {
-		addrs, err := net.InterfaceAddrs()
+		ifaces, err := net.Interfaces()
 		if err != nil {
 			return "", fmt.Errorf("failed to get interface addresses: %w", err)
 		}
-		// Rank the candidates and take the best one. Returning whichever
-		// address happened to come first was the bug: on a host running an
-		// overlay tunnel -- NetBird, WireGuard, all drawing from 100.64.0.0/10
-		// -- the tunnel's address won and was then reported as "found
-		// public/routable local ip" (observed 2026-09-30: 100.101.102.21 and
-		// 100.76.83.147). A public address outranks every private and overlay
-		// one, so a host that has both now keeps the right answer.
-		var fallbackIP string
-		var public, private, overlay string
-		for _, address := range addrs {
-			ipnet, ok := address.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			ipv4 := ipnet.IP.To4()
-			switch {
-			case ipv4 == nil, ipv4.IsLoopback(), ipv4.IsLinkLocalUnicast():
-				continue
-			case IsPublicRoutable(ipv4):
-				if public == "" {
-					public = ipv4.String()
-				}
-			case p2p.IsCGNATOverlayAddr(ipv4):
-				if overlay == "" {
-					overlay = ipv4.String()
-				}
-			default:
-				if private == "" {
-					private = ipv4.String()
-				}
-			}
+		// Knowing the gateway turns "pick an address" into "pick the
+		// address that faces the gateway", which is the only question UPnP and
+		// NAT-PMP actually care about. Best-effort: a failure here just means
+		// we rank without it, which is no worse than the old behaviour.
+		var gw net.IP
+		if g, gerr := discoverGatewayIP(); gerr == nil {
+			gw = g
 		}
-		if public != "" {
-			return public, nil
-		}
-		if private != "" {
-			fallbackIP = private
-		} else {
-			fallbackIP = overlay
-		}
-		// If we only found private IPs, return the first one
-		if fallbackIP != "" {
-			return fallbackIP, nil
+		if ranked := RankLocalIPv4(ifaces, gw); len(ranked) > 0 {
+			return ranked[0], nil
 		}
 	}
 	dialto := "8.8.8.8:53"
@@ -252,4 +220,118 @@ func IsPublicRoutable(ip net.IP) bool {
 		return false
 	}
 	return v4.IsGlobalUnicast() && !v4.IsLinkLocalUnicast() && !v4.IsLoopback()
+}
+
+// RankLocalIPv4 returns this host's usable IPv4 addresses, best first.
+//
+// It replaces the enumeration getLocalIP() used to do, which had two defects.
+//
+// The first was already known: net.InterfaceAddrs() returns addresses from
+// every interface regardless of state, so an overlay tunnel's 100.64.0.0/10
+// address could be reported as the host's "public/routable local ip" (observed
+// 2026-09-30: 100.101.102.21, 100.76.83.147). Ranking public above private
+// above overlay fixed that ordering but did nothing for the second defect.
+//
+// The second is that "first RFC1918 address wins" is not a preference at all,
+// it is whatever the OS enumerated first. On log3 (Windows, 2026-10-05) that
+// picked 192.168.1.11 on WLAN -- an adapter in AddressState Tentative, i.e. not
+// actually connected -- over 192.168.10.7 on 以太网 3, which was the adapter
+// carrying all of the host's real traffic. Both are private, so the existing
+// ranking could not tell them apart and the caller got the wrong one. It is
+// visible in the log as UPnP and NAT-PMP both reporting "Local IP:
+// 192.168.1.11" on a machine whose working address was 192.168.10.7.
+//
+// Two things are therefore checked per address, and both are facts rather than
+// guesses:
+//
+//   - the interface has to be up. A down interface cannot reach the gateway,
+//     and Windows leaves a disabled adapter's addresses enumerable;
+//   - the gateway decides. An address on the same subnet as the gateway is the
+//     one that can actually talk to it, so it outranks an equally-private
+//     address on some other subnet. This is the signal that actually
+//     distinguishes 192.168.10.7 from 192.168.1.11, since both are RFC1918
+//     and both are on interfaces that may report as up.
+//
+// gateway may be nil, in which case only the interface-up and
+// public/private/overlay ordering applies.
+//
+// Ties keep enumeration order, so a host with one interface per class is
+// unaffected.
+func RankLocalIPv4(ifaces []net.Interface, gateway net.IP) []string {
+	return rankLocalIPv4(ifaces, gateway, func(i *net.Interface) ([]net.Addr, error) {
+		return i.Addrs()
+	})
+}
+
+// ifaceAddrs is the seam that makes RankLocalIPv4 testable. net.Interface.Addrs
+// reads the OS, so a ranking function that took interfaces directly could only
+// ever be exercised against whatever machine the test happened to run on -- and
+// the bug it fixes is precisely that this machine's adapter order is not the
+// one that matters.
+func rankLocalIPv4(
+	ifaces []net.Interface,
+	gateway net.IP,
+	addrsOf func(*net.Interface) ([]net.Addr, error),
+) []string {
+	type candidate struct {
+		ip    string
+		score int
+	}
+	var cands []candidate
+	for idx := range ifaces {
+		ifc := &ifaces[idx]
+		// FlagUp is the only portable statement available about interface
+		// readiness. Go's net package does not surface Windows'
+		// AddressState, so a Tentative adapter cannot be named directly --
+		// but a disabled one is not FlagUp, and the gateway test covers the
+		// rest.
+		if ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := addrsOf(ifc)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ipv4 := ipnet.IP.To4()
+			if ipv4 == nil || ipv4.IsLoopback() || ipv4.IsLinkLocalUnicast() {
+				continue
+			}
+			// Class dominates, and the gateway only breaks ties inside a
+			// class. A public address outranking every private one is the
+			// older guarantee (a host with a real public IP must report that
+			// IP), so the gateway bonus must not be able to lift a private
+			// address past it -- hence the class weight of 1000 against a
+			// bonus of 1, not the other way round.
+			score := 0
+			switch {
+			case IsPublicRoutable(ipv4):
+				score = 3000
+			case p2p.IsCGNATOverlayAddr(ipv4):
+				score = 1000
+			default:
+				score = 2000
+			}
+			// On the gateway's subnet: this is the address the rest of the
+			// NAT conversation happens over.
+			if gateway != nil && gateway.To4() != nil {
+				if _, prefix, err := net.ParseCIDR(ipnet.String()); err == nil {
+					if prefix.Contains(gateway) {
+						score += 1
+					}
+				}
+			}
+			cands = append(cands, candidate{ip: ipv4.String(), score: score})
+		}
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.ip)
+	}
+	return out
 }

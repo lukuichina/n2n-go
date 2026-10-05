@@ -156,7 +156,7 @@ func endpointHost(endpoint string) string {
 //
 // Returns the chosen address and a note describing the decision, for the
 // instruction log line. An empty address means no candidate was usable.
-func ResolvePunchTarget(registryRaddr, registryPubSocket, registryEndpoint, relayEndpoint, peerMAC string, raddrFresh bool) (string, string) {
+func ResolvePunchTarget(registryRaddr, registryPubSocket, registryEndpoint, relayEndpoint, peerMAC string, raddrFresh bool, isReceiver bool) (string, string) {
 	type cand struct {
 		addr   string
 		source string
@@ -171,7 +171,35 @@ func ResolvePunchTarget(registryRaddr, registryPubSocket, registryEndpoint, rela
 		// An observed address is trusted even when it is off-link or
 		// private: we received a packet from it, which is stronger evidence
 		// than any classification rule can produce.
-		if source == "observed raddr" && !isSelfOrReservedHost(endpointHost(addr)) {
+		//
+		// The receiver is the exception, and the exception is the whole point
+		// of the role. A punch is only useful if the peer can punch back to
+		// where it landed, and reciprocity is not symmetric between the two
+		// roles:
+		//
+		//   - Sender punching an off-link private raddr is fine. The peer's
+		//     router SNATs it, and the receiver is concurrently punching the
+		//     sender's public mapping, so the hole gets opened from the side
+		//     that matters.
+		//   - Receiver punching an off-link private raddr opens the hole at
+		//     its own router's WAN address (192.168.10.7 -> 192.168.10.1,
+		//     WAN 172.22.2.17 -> 172.22.2.44). The peer's return packets
+		//     arrive at 172.22.2.17 and are only forwarded to 192.168.10.7
+		//     if that router happens to hold a matching port-forward, which
+		//     is the exception rather than the rule. Under CGNAT the peer's
+		//     own public mapping is the only address where the return path
+		//     is guaranteed to be walked.
+		//
+		// So for the receiver an off-link private observed raddr keeps its
+		// classified rank (Unusable) instead of being promoted, and the
+		// public mapping wins. Observed on log3 against log4: the receiver
+		// locked onto 172.22.2.44:58813 for 188 punches across 28 minutes
+		// and the two never reached FullDuplex, while the public
+		// 111.101.5.1:58813 resolved correctly on the very first attempt.
+		// An on-link private raddr is still promoted -- no NAT is involved,
+		// and the 192.168.10.x pairs depend on exactly that.
+		if source == "observed raddr" && !isSelfOrReservedHost(endpointHost(addr)) &&
+			(!isReceiver || rank >= PunchTargetOnLink) {
 			rank = punchTargetObserved
 		}
 		cands = append(cands, cand{addr, source, rank})

@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 )
 
 // FRP parity note: FRP does not reorder m.AssistedAddrs -- it appends them
@@ -272,4 +273,159 @@ func IsCGNATOverlayAddr(ip net.IP) bool {
 		return false
 	}
 	return IsCGNATOverlay(netip.AddrFrom4([4]byte(v4)))
+}
+
+// raddrPunchableByReceiver reports whether a receiver may make this observed
+// source address its primary punch target.
+//
+// A private address is acceptable only when it sits on a subnet configured on
+// one of our own interfaces: that is a genuinely on-link peer, no NAT is
+// involved, and it is the best possible target. An off-link private address
+// is the peer's router WAN side, which the receiver can reach but cannot
+// offer a matching return path for.
+//
+// This mirrors edge.onLocalLink / edge.ClassifyPunchTarget rather than
+// importing them: pkg/edge imports pkg/p2p, so the dependency only runs this
+// way. Keep the rule in sync with ResolvePunchTarget's receiver branch.
+func raddrPunchableByReceiver(endpoint string) bool {
+	host := endpointHostOf(endpoint)
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	if !ip.IsPrivate() {
+		// Public, or not ours to judge -- the caller's freshness gate owns it.
+		return true
+	}
+	if ip.IsLoopback() || !ip.IsGlobalUnicast() {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP == nil {
+			continue
+		}
+		v4 := ipnet.IP.To4()
+		if v4 == nil || v4.IsLoopback() {
+			continue
+		}
+		if ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// endpointHostOf extracts the host portion of a "host:port" endpoint.
+func endpointHostOf(endpoint string) string {
+	if h, _, err := net.SplitHostPort(endpoint); err == nil {
+		return h
+	}
+	return endpoint
+}
+
+// PeerClaimingPortExclusive returns the peer that owns port, or nil when no
+// peer owns it or more than one does.
+//
+// PeerClaimingPort answers with the first match, which is the wrong shape for
+// attribution: if two peers happen to publish the same P2P port, picking one
+// silently charges a peer's frames to the other. Returning nil on ambiguity
+// costs a single frame of raddr bookkeeping and keeps the mapping honest.
+func (reg *PeerRegistry) PeerClaimingPortExclusive(port uint16) *Peer {
+	if reg == nil || port == 0 {
+		return nil
+	}
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
+
+	var found *Peer
+	for key, owner := range reg.peerBySocket {
+		if owner == nil {
+			continue
+		}
+		_, ps, err := net.SplitHostPort(key)
+		if err != nil {
+			continue
+		}
+		pn, err := strconv.Atoi(ps)
+		if err != nil || uint16(pn) != port {
+			continue
+		}
+		if found != nil && found != owner {
+			return nil // ambiguous: two peers claim this port
+		}
+		found = owner
+	}
+	return found
+}
+
+// localIPSet returns this host's own IPv4 addresses, as strings, for use as a
+// "never this one" filter.
+//
+// It is built from the same enumeration as LocalNATPunchPrefixes, so it
+// inherits that function's exclusions: the n2n tap itself, overlay addresses,
+// and the addresses this package already classifies as unacceptable for a
+// punch candidate. Reusing it rather than enumerating separately keeps the
+// two in step -- a filter that disagreed with the candidate rules would
+// either let one of our own addresses through or hide a peer that merely
+// resembles us.
+//
+// Loopback is deliberately absent. Punching ourselves over loopback would
+// "succeed" instantly and then verify nothing, which is the failure the
+// verified-data-frame gate exists to catch.
+func localIPSet(reg *PeerRegistry) map[string]struct{} {
+	out := make(map[string]struct{})
+	if reg == nil {
+		return out
+	}
+	prefixes := LocalNATPunchPrefixes(reg.SelfTapName, reg.SelfTapIP(), reg.SelfMAC())
+	if len(prefixes) == 0 {
+		return out
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	overlay := netip.Prefix{}
+	if a, err := netip.ParseAddr(reg.SelfTapIP()); err == nil && a.Is4() {
+		overlay = netip.PrefixFrom(a.Unmap(), overlayPrefixBits)
+	}
+	tapMAC := wantMACOf(reg.SelfMAC())
+	for _, ifc := range ifaces {
+		if tapMAC != nil && ifc.Flags&net.FlagUp == 0 {			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(ipnet.IP.To4())
+			if !ok {
+				continue
+			}
+			ip = ip.Unmap()
+			if overlay.IsValid() && overlay.Contains(ip) {
+				continue
+			}
+			if !AddrInLocalPrefix(net.IP(ip.AsSlice()), prefixes) {
+				continue
+			}
+			out[ip.String()] = struct{}{}
+		}
+	}
+	return out
 }

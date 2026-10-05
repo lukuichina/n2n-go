@@ -20,7 +20,7 @@ import (
 // packet from that address already reached us. It must win.
 func TestResolvePunchTargetPrefersObservedSNATAddress(t *testing.T) {
 	const observed = "172.22.2.44:60735"
-	got, note := ResolvePunchTarget(observed, "111.101.5.1:60735", "10.0.10.40:60735", "", "9e:6e:2d:8c:f5:db", true)
+	got, note := ResolvePunchTarget(observed, "111.101.5.1:60735", "10.0.10.40:60735", "", "9e:6e:2d:8c:f5:db", true, false)
 	if got != observed {
 		t.Fatalf("chose %q, want the observed source %q (note: %s)", got, observed, note)
 	}
@@ -40,7 +40,7 @@ func TestResolvePunchTargetRejectsObservedSelfAddress(t *testing.T) {
 	own := addrs[0]
 	// Registry pubSocket is empty, so the observed self address would be the
 	// only candidate if it were not rejected.
-	got, note := ResolvePunchTarget(own, "", "", "", "aa:bc:3a:74:37:b1", true)
+	got, note := ResolvePunchTarget(own, "", "", "", "aa:bc:3a:74:37:b1", true, false)
 	if got != "" {
 		t.Fatalf("chose %q, want empty -- our own address is not a target (note: %s)", got, note)
 	}
@@ -49,7 +49,7 @@ func TestResolvePunchTargetRejectsObservedSelfAddress(t *testing.T) {
 // With no observation yet, resolution must still fall back sanely: a public
 // STUN mapping beats an off-link private address, exactly as before.
 func TestResolvePunchTargetFallsBackWhenNoObservationYet(t *testing.T) {
-	got, _ := ResolvePunchTarget("", "111.101.5.1:60735", "10.0.10.40:60735", "", "9e:6e:2d:8c:f5:db", true)
+	got, _ := ResolvePunchTarget("", "111.101.5.1:60735", "10.0.10.40:60735", "", "9e:6e:2d:8c:f5:db", true, false)
 	if got != "111.101.5.1:60735" {
 		t.Fatalf("chose %q, want the public STUN mapping", got)
 	}
@@ -63,7 +63,7 @@ func TestResolvePunchTargetStillPrefersOnLinkWhenUnobserved(t *testing.T) {
 	if addrs == "" {
 		t.Skip("no usable on-link peer address to construct")
 	}
-	got, note := ResolvePunchTarget("", "111.101.5.1:56436", addrs, "", "52:eb:72:ed:64:1f", true)
+	got, note := ResolvePunchTarget("", "111.101.5.1:56436", addrs, "", "52:eb:72:ed:64:1f", true, false)
 	if got != addrs {
 		t.Fatalf("chose %q, want the on-link %s (note: %s)", got, addrs, note)
 	}

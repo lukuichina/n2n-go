@@ -134,6 +134,37 @@ type Peer struct {
 	punchSeenAt time.Time
 	dataSeenAt  time.Time
 
+	// punchPathOpen records that the punch handshake for this pair
+	// completed: we exchanged punch packets and both NAT mappings are open,
+	// so packets can flow even though no real data frame has been
+	// confirmed yet.
+	//
+	// This is the missing half of the punch verdict and it exists because
+	// P2PStatus cannot express it. P2PStatus answers "which path may this
+	// peer use", and its only affirmative answers are Available and
+	// FullDuplex. But FullDuplex is gated on a verified data frame
+	// (HasVerifiedDataPath), so during the window between "the hole is
+	// punched" and "the first frame proves it" there is no status that is
+	// both true and affirmative -- and the punch loop's own report of that
+	// window, PunchStateInProgress, was being smuggled into the status
+	// field on its way to the relay. The relay read it back, and a control
+	// plane probe arriving in the same instant overwrote the peer's status
+	// with Unknown, discarding a path that was already carrying traffic.
+	//
+	// Observed 2026-10-04 on log3 (192.168.10.7) against log4
+	// (172.22.2.44), both behind CGNAT 111.101.5.1. The pair reached
+	// strat=2 via p2p at 21:08:52 and was demoted to relay by Unknown
+	// nine times before the first data frame landed at 21:09:28 -- 36 of
+	// the 40 seconds the pair needed, spent re-punching a hole that had
+	// been open the whole time.
+	//
+	// It is a capability, not a status: it never travels to the relay and
+	// never appears in PeerP2PInfos. Nothing should set it from a control
+	// plane message. Guarded by raddrMu with the other punch evidence,
+	// since NotePunchPacket on the reader goroutine sets it.
+	punchPathOpen   bool
+	punchPathOpenAt time.Time
+
 	// punchAckMu guards lastAckSentAt and lastPunchPublishedAt, which bound
 	// how often we answer a punch and how often inbound punch traffic may
 	// refresh the state we publish about this peer. See punch.go: without
@@ -369,6 +400,46 @@ func (p *Peer) PunchSeenAt() time.Time {
 func (p *Peer) NoteDataPacket() {
 	p.raddrMu.Lock()
 	p.dataSeenAt = time.Now()
+	// A real frame is the strongest form of the same fact the punch handshake
+	// records, so it must keep the capability set even if the handshake was
+	// the slower of the two to land.
+	p.punchPathOpen = true
+	p.punchPathOpenAt = p.dataSeenAt
+	p.raddrMu.Unlock()
+}
+
+// NotePunchPathOpen records that the punch handshake completed for this
+// peer, so a direct path exists even if no data frame has been verified yet.
+// Deliberately idempotent and monotonic within a path's lifetime: a later
+// punch packet cannot un-open a hole. Only ClearPunchPath, driven by the
+// data-plane keepalive timeout, closes it again.
+func (p *Peer) NotePunchPathOpen() {
+	p.raddrMu.Lock()
+	if !p.punchPathOpen {
+		p.punchPathOpenAt = time.Now()
+		p.punchPathOpen = true
+	}
+	p.raddrMu.Unlock()
+}
+
+// PunchPathOpen reports whether a direct path to this peer is known to be
+// open -- either because the punch handshake completed or because a real data
+// frame arrived. Guarded by raddrMu, like the punch evidence it is derived
+// from.
+func (p *Peer) PunchPathOpen() bool {
+	p.raddrMu.RLock()
+	defer p.raddrMu.RUnlock()
+	return p.punchPathOpen
+}
+
+// ClearPunchPath withdraws the open-path capability. The only caller is the
+// data-plane keepalive, which is the sole authority entitled to say a direct
+// path stopped working: a control plane probe failing to arrive is not
+// evidence that traffic stopped.
+func (p *Peer) ClearPunchPath() {
+	p.raddrMu.Lock()
+	p.punchPathOpen = false
+	p.punchPathOpenAt = time.Time{}
 	p.raddrMu.Unlock()
 }
 
@@ -456,6 +527,14 @@ type PeerRegistry struct {
 	// already up and re-arm pairs that just failed. Without this feedback
 	// the relay is blind and either loops forever or gives up too early.
 	natHolePunchResults map[string]*NatHolePunchResult
+	// natHoleLastRound records when a punch round last reported an outcome
+	// for a peer, and natHoleStallCount how many times
+	// ReArmStalledNatHolePeers has re-armed a pair that never reached a
+	// verified data path. Both are keyed by MAC and guarded by peerMu. See
+	// ReArmStalledNatHolePeers for why a pair that fell back to the relay
+	// used to have no way back.
+	natHoleLastRound  map[string]time.Time
+	natHoleStallCount map[string]int
 }
 
 // NumPeers returns how many peers are currently in the registry.
@@ -808,8 +887,36 @@ func receiverPunchCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSo
 func RankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSocket *net.UDPAddr, localPrefixes []netip.Prefix) []*net.UDPAddr {
 	var out []*net.UDPAddr
 	seen := make(map[string]bool)
+	// A candidate that is one of our own addresses can never be the peer. The
+	// relay fills these fields from what each side published, so a peer's
+	// endpoint can arrive carrying our address back at us -- the relay has no
+	// reason to prefer the correct pairing, and a peer behind a different
+	// masquerade can legitimately publish something that collides with us.
+	//
+	// Observed 2026-10-05 on log5 (192.168.10.13) resolving a punch against
+	// E2: the candidate list came back as
+	//
+	//	57.129.106.133:54369 (peer's endpoint)
+	//	192.168.10.13:41559 (log5's own address)
+	//
+	// The second was rejected, but by the reachable-candidate filter rather
+	// than by any judgement about identity, and that filter exists to drop
+	// unroutable addresses -- not to recognise our own. Anything that made
+	// our own address look reachable would punch at ourselves, spend the
+	// whole ladder on it, and log a target resolution that reads as though
+	// the peer were the problem.
+	//
+	// Port is deliberately not part of the test: the masquerade rewrites the
+	// source port too, so an address with the wrong port is still us, and
+	// requiring a port match would let our own address through whenever a
+	// peer happens to publish a colliding one.
+	selfIPs := localIPSet(reg)
 	add := func(a *net.UDPAddr) {
 		if a == nil || a.IP == nil || seen[a.String()] {
+			return
+		}
+		if _, ours := selfIPs[a.IP.String()]; ours {
+			log.Printf("[P2P] dropping punch candidate %s: it is one of our own addresses", a)
 			return
 		}
 		seen[a.String()] = true
@@ -821,9 +928,44 @@ func RankReceiverCandidates(instr *NatHoleInstruction, reg *PeerRegistry, pubSoc
 	// to look up the receiver's addresses. Reading it here would have found
 	// our own overlay IP and filtered the wrong address.
 	var peerTapIP string
+	var observedRaddr string
 	if reg != nil && pubSocket != nil {
 		if sp := reg.LookupPeerByPubSocket(pubSocket.String()); sp != nil {
 			peerTapIP = sp.Infos.GetVirtualIp()
+			// The sender's observed raddr is the only address we have ever
+			// seen its traffic come from, and it is routinely the only one
+			// that works. The sender branch has sprayed to it since the
+			// observed-raddr work; the receiver did not, which is
+			// one-sided.
+			//
+			// Observed 2026-10-04 on log5 vs log3: log3 advertises
+			// P2PEndpoint 192.168.10.7:58186 and is on the same /24 as
+			// log5 (192.168.10.13), so the receiver ranked that address
+			// first. It is undialable: a wireless repeater between them
+			// splits the segment and masquerades, so log3's packets reach
+			// log5 from 192.168.0.1:58186 and never from 192.168.10.7.
+			// 117 status changes, no FullDuplex, fall back to relay. The
+			// receiver's own log showed the 121 frames arriving from
+			// 192.168.0.1 -- an address in no peer's registry entry.
+			//
+			// Spraying it costs one datagram and is gated on freshness, so a
+			// stale raddr (one that predates the peer's current mapping) is
+			// still skipped rather than turned back into a primary target.
+			if r := sp.GetP2PRaddr(); r != "" && sp.RaddrCoversCurrentMapping() {
+				observedRaddr = r
+			}
+		}
+	}
+
+	// The observed source goes in front: it is measured rather than declared,
+	// so it outranks anything the peer said about itself. The rest of the
+	// list still gets its packet -- this widens the spray, it does not
+	// replace it. A dead observed address simply goes unanswered and costs
+	// one datagram, which is the self-correcting property that made
+	// observed-priority worth having in the first place.
+	if observedRaddr != "" {
+		if ra, err := net.ResolveUDPAddr("udp", observedRaddr); err == nil && ra != nil && ra.IP != nil {
+			add(ra)
 		}
 	}
 
@@ -1018,7 +1160,11 @@ func (reg *PeerRegistry) UnlistPeerLocked(MACAddr string) {
 		delete(reg.peerByP2PSocket, p.P2PEndpoint)
 	}
 	delete(reg.Peers, MACAddr)
-	reg.graceUnlisted[MACAddr] = &graceTombstone{peer: p, expiresAt: time.Now().Add(GraceUnlistedTTL)}
+	reg.graceUnlisted[MACAddr] = &graceTombstone{
+		peer:      p,
+		expiresAt: time.Now().Add(GraceUnlistedTTL),
+		pubSocket: p.Infos.PubSocket,
+	}
 	log.Printf("unlisted peer %s/%s/%s — keeping direct-path state for %v in case it returns",
 		dDesc, dVip, MACAddr, GraceUnlistedTTL)
 	reg.SetPendingChanges()
@@ -1149,6 +1295,13 @@ func (reg *PeerRegistry) recordNatHolePunchResultLocked(peerMAC string, state Na
 		Detail:        detail,
 		BehaviorIndex: behaviorIndex,
 	}
+	// Single choke point for every outcome (in progress, failed, succeeded),
+	// so this is the one place that has to know a round just ended. The
+	// stall re-arm measures its backoff from here.
+	if reg.natHoleLastRound == nil {
+		reg.natHoleLastRound = make(map[string]time.Time)
+	}
+	reg.natHoleLastRound[peerMAC] = time.Now()
 	// A new outcome must reach the relay on the next P2PStateInfo, and a
 	// success must also refresh the peer list the relay builds instructions
 	// from. Without this the report would sit in the map until some unrelated
@@ -1209,6 +1362,31 @@ func (p *Peer) SetFullDuplex(value bool) (bool, error) {
 		if p.IsFullDuplex && p.P2PStatus == P2PFullDuplex {
 			p.P2PStatus = P2PAvailable
 		}
+		// Withdraw the punch-path capability only when the data plane has concluded,
+		// on a real timeout, that the path is dead -- which is what the
+		// caller in keepAliveTick is doing. The asymmetry is the point: a
+		// control-plane probe failing to arrive must not be able to take a
+		// direct path away, so the capability is opened by the punch
+		// handshake and closed only here.
+		//
+		// SetFullDuplex(false) deliberately does NOT withdraw it. That
+		// function is also called from handlePeerToPing when a pong arrives
+		// via the supernode, meaning only that *this liveness probe* took the
+		// relay -- which is true of every probe in the window between a
+		// successful punch and the first data frame, and says nothing about
+		// whether the hole is open. Clearing the capability there made the
+		// guard useless: log3 against log4, both behind CGNAT 111.101.5.1,
+		// was punched successfully at 18:24:48 and had the capability
+		// withdrawn 40ms later by a relay pong, so the pair oscillated
+		// between p2p and relay through 316 seconds of re-punching (2026-10-05,
+		// superseding the 36-second case the capability was added for).
+		//
+		// Not withdrawing it on that path would be the mirror-image bug if it
+		// were also skipped on the data-plane path: a genuinely dead path
+		// would keep its capability, UpdateP2PStatus would keep refusing
+		// every later Unknown, and the only way out would be another
+		// successful punch. Hence the split -- keepAliveTick withdraws,
+		// handlePeerToPing does not.
 	}
 	if value != p.IsFullDuplex {
 		log.Printf("updated peer %s/%s/%s with FullDuplex=%v", p.Infos.Desc, p.Infos.VirtualIp, net.HardwareAddr(p.Infos.MacAddr).String(), value)
@@ -1224,6 +1402,18 @@ func (p *Peer) SetFullDuplex(value bool) (bool, error) {
 	}
 	p.IsFullDuplex = value
 	return changed, nil
+}
+
+// NatHolePunchResultsSnapshotLocked is NatHolePunchResultsForTest for a caller
+// that already holds peerMu. It exists because peerMu is not reentrant: a test
+// holding the write lock cannot call the RLock-taking accessor without
+// deadlocking against itself.
+func (reg *PeerRegistry) NatHolePunchResultsSnapshotLocked() map[string]*NatHolePunchResult {
+	out := make(map[string]*NatHolePunchResult, len(reg.natHolePunchResults))
+	for k, v := range reg.natHolePunchResults {
+		out[k] = v
+	}
+	return out
 }
 
 func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
@@ -1260,6 +1450,35 @@ func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
 			status == P2PUnknown || status == P2PUnavailable) {
 		p.P2PCheckID = checkid
 		p.UpdatedAt = time.Now()
+		return false
+	}
+
+	// Same rule, one rung lower. P2PAvailable is where a pair sits in the
+	// window between "hole punched" and "data frame verified", and it is
+	// reached only after a successful punch, so a control-plane demotion
+	// arriving in that window threw away a working path and made the pair
+	// re-punch.
+	//
+	// The status is demoted but the routing decision is not: this returns
+	// early with P2PStatus left alone, so UDPAddrWithStrategy keeps taking
+	// the direct path. The distinction matters because the two pieces of
+	// evidence answer different questions. P2PStatus is what the peer is
+	// worth over the relay -- and over the relay a pair awaiting its first
+	// data frame genuinely is worth no more than before. The punch path
+	// capability is what can be sent directly right now, and the handshake
+	// has already answered that affirmatively.
+	//
+	// Without this, the punch loop's own report of that window fought the
+	// status: it reports PunchStateInProgress, publishes, and a pong with a
+	// superseded checkID lands in the same instant, and the pair fell back
+	// to relay nine times in 36s (log3/log4, 2026-10-04) while its hole was
+	// open the entire time.
+	if status == P2PUnknown && p.PunchPathOpen() &&
+		p.P2PStatus != P2PUnavailable {
+		p.P2PCheckID = checkid
+		p.UpdatedAt = time.Now()
+		log.Printf("not demoting peer %s to Unknown on a control-plane probe: its punch path is still open (reporting %s to the relay instead)",
+			net.HardwareAddr(p.Infos.MacAddr).String(), p.P2PStatus.String())
 		return false
 	}
 
@@ -1352,6 +1571,21 @@ func (reg *PeerRegistry) recentlyAliveLocked(p *Peer) bool {
 type graceTombstone struct {
 	peer      *Peer
 	expiresAt time.Time
+	// pubSocket is the peer's advertised public mapping at the moment it was
+	// unlisted. The tombstoned raddr was observed against that mapping, so
+	// restoring it is only meaningful while the mapping still holds. If the
+	// peer comes back advertising a different pubSocket its NAT has re-mapped
+	// and the remembered raddr is a dead address.
+	//
+	// Without this, a peer that restarts inside the grace window resumes with
+	// its previous port. Observed on E1: log3/log4/log5 were unlisted at
+	// 02:32:06 and re-registered at 02:33:07-25 with new STUN mappings
+	// (65060/46112/58813), yet the restore handed back the old raddrs
+	// (57443/37557/61401). E1 then punched those dead addresses 516/178/106
+	// times over the next 27 minutes and never reached FullDuplex with any of
+	// them -- while E2, whose mapping never moved, punched fine. See
+	// AddPeer's grace restore below.
+	pubSocket string
 }
 
 // SetP2PRaddr for a tombstoned peer still works, so a punch arriving while
@@ -1436,9 +1670,26 @@ func (reg *PeerRegistry) AddPeer(infos PeerInfo, overwrite bool) (*Peer, error) 
 	// a fresh raddr against a dead end.
 	if t, ok := reg.graceUnlisted[macAddr]; ok {
 		if r := t.peer.GetP2PRaddr(); r != "" {
-			peer.SetP2PRaddr(r)
-			log.Printf("peer %s/%s/%s returned within grace — restored raddr %s from before it was unlisted",
-				peer.Infos.Desc, peer.Infos.VirtualIp, macAddr, r)
+			// Only restore if the public mapping we observed that raddr
+			// against is still the one the peer is advertising. A peer that
+			// comes back with a different pubSocket has been re-mapped by its
+			// NAT, so the remembered address is a closed socket -- restoring
+			// it would send every punch into the void.
+			//
+			// The pubSocketChangedAt stamp still has to be set on the new
+			// peer in the mismatch case: AddPeer took the not-exists branch
+			// here, so the stamp is not set anywhere else, and without it
+			// RaddrCoversCurrentMapping cannot protect any raddr the peer
+			// records from this point on.
+			if t.pubSocket != "" && t.pubSocket != infos.PubSocket {
+				peer.pubSocketChangedAt = time.Now()
+				log.Printf("peer %s/%s/%s returned within grace but its public mapping moved %s -> %s; not restoring raddr %s, it describes a closed socket",
+					peer.Infos.Desc, peer.Infos.VirtualIp, macAddr, t.pubSocket, infos.PubSocket, r)
+			} else {
+				peer.SetP2PRaddr(r)
+				log.Printf("peer %s/%s/%s returned within grace — restored raddr %s from before it was unlisted",
+					peer.Infos.Desc, peer.Infos.VirtualIp, macAddr, r)
+			}
 		}
 		delete(reg.graceUnlisted, macAddr)
 	}
@@ -1760,6 +2011,130 @@ func (reg *PeerRegistry) HasNatHoleInstruction() bool {
 	return len(reg.natHoleInstrs) > 0
 }
 
+// ReArmStalledNatHolePeers re-arms the punch for every pair that has never
+// reached a verified data path and is currently sitting on the relay.
+// Returns how many were re-armed.
+//
+// The hole this closes is the one ReArmNatHoleInstruction's caller could not:
+// that loop only walks GetFullDuplexPeers, so it fires when a working tunnel
+// dies. A pair that never worked was left with no retry at all. It burned its
+// five attempts, fell back to the relay, and then nothing would ever re-arm it
+// again — p2pKeepAliveTick's demote branch never sees it, and the relay
+// suppresses the pair on its stale "succeeded" report. Measured on E1<->E2:
+// both sides punched into the void (E2 23:53:58-23:54:16, E1 23:54:36-23:54:42 —
+// windows missed each other by 20s), then went quiet for the rest of the run
+// with routing pinned to the relay.
+//
+// FRP's equivalent is keepTunnelOpenWorker (client/visitor/xtcp.go:114), which
+// re-runs makeNatHole() every MinRetryInterval=90s for as long as the tunnel
+// is not healthy. This is that, restricted to the pairs that never came up.
+//
+// The backoff starts below FRP's 90s on purpose. FRP can afford a flat 90s
+// because KCP holds its NAT mapping open underneath (pkg/util/net/kcp.go:96);
+// this edge has no lower layer, and its failure mode here is a *narrow window
+// misalignment* — the two sides' five attempts are ~30s each and can start
+// 20s apart, so a retry that lands promptly walks straight into the other
+// side's window instead of missing it again. It grows by 2x to the 300s cap
+// so a genuinely unreachable peer settles down instead of looping.
+//
+// Peers that already carry real traffic are left alone: they are the
+// FullDuplex case, which ReArmNatHoleInstruction handles on keepalive timeout.
+func (reg *PeerRegistry) ReArmStalledNatHolePeers(now time.Time, baseBackoff, maxBackoff, healthyWindow time.Duration) int {
+	if baseBackoff <= 0 {
+		return 0
+	}
+	if maxBackoff < baseBackoff {
+		maxBackoff = baseBackoff
+	}
+
+	reg.peerMu.Lock()
+	var candidates []*Peer
+	for _, p := range reg.Peers {
+		if p == nil || p.P2PStatus == P2PFullDuplex && p.IsFullDuplex {
+			continue
+		}
+		// A pair that is carrying traffic right now is not stalled.
+		//
+		// This was HasVerifiedDataPath() alone, which is a latch that is set
+		// once and never cleared -- it records that a real data frame was ever
+		// seen, not that one is being seen now. So the first successful punch
+		// permanently excluded the pair, and E1 (which did reach FullDuplex
+		// with 3 real frames from E2) never re-armed for the rest of the run
+		// even after E2 went dark. Gate on recency instead.
+		if p.HasVerifiedDataPath() {
+			if last := p.LastDataSeenAt(); !last.IsZero() && now.Sub(last) < healthyWindow {
+				continue
+			}
+		}
+		// No instruction was ever negotiated for this peer, so there is
+		// nothing to re-arm: the Worker never considered the pair punchable.
+		peerKey := macAddrStr(p.Infos.MacAddr)
+		if _, ok := reg.lastNatHoleInstrs[peerKey]; !ok {
+			continue
+		}
+		if last, ok := reg.natHoleLastRound[peerKey]; ok && now.Sub(last) < reg.stallBackoff(reg.natHoleStallCount[peerKey], baseBackoff, maxBackoff) {
+			continue
+		}
+		candidates = append(candidates, p)
+	}
+	if len(candidates) == 0 {
+		reg.peerMu.Unlock()
+		return 0
+	}
+
+	// ReArmNatHoleInstruction takes the write lock itself, so the restore has
+	// to happen after the unlock rather than inside this critical section.
+	macs := make([][]byte, 0, len(candidates))
+	for _, p := range candidates {
+		macs = append(macs, p.Infos.MacAddr)
+	}
+	reg.peerMu.Unlock()
+
+	rearmed := 0
+	for _, mac := range macs {
+		key := macAddrStr(mac)
+		reg.ReArmNatHoleInstruction(mac)
+		reg.peerMu.Lock()
+		if _, pending := reg.natHoleInstrs[key]; pending {
+			if reg.natHoleStallCount == nil {
+				reg.natHoleStallCount = make(map[string]int)
+			}
+			reg.natHoleStallCount[key]++
+			rearmed++
+		}
+		reg.peerMu.Unlock()
+		log.Printf("[P2P] re-arming stalled punch for %s (attempt %d since it never reached a verified data path)",
+			key, reg.natHoleStallCount[key])
+	}
+	return rearmed
+}
+
+// stallBackoff is the wait before the n-th consecutive stalled re-arm.
+func (reg *PeerRegistry) stallBackoff(n int, base, max time.Duration) time.Duration {
+	if n <= 0 {
+		return base
+	}
+	d := base
+	for i := 0; i < n && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	return d
+}
+
+// ResetNatHoleStallCount clears the backoff for a peer, so a pair that has
+// just been promoted is not held at its longest wait if it ever drops again.
+func (reg *PeerRegistry) ResetNatHoleStallCount(peerMAC []byte) {
+	if len(peerMAC) != 6 {
+		return
+	}
+	reg.peerMu.Lock()
+	defer reg.peerMu.Unlock()
+	delete(reg.natHoleStallCount, macAddrStr(peerMAC))
+}
+
 // ReArmNatHoleInstruction re-arms the NAT hole instruction for the given peer
 // MAC so the next punch tick retries it from scratch.
 //
@@ -1919,6 +2294,19 @@ func natHoleProbeTTL(instr *NatHoleInstruction, fallback int) int {
 	if instr == nil {
 		return fallback
 	}
+	// A non-positive fallback is `--nat-hole-probe-ttl 0`: the operator asked
+	// for no low-TTL probe at all. That has to beat the instruction's own ttl,
+	// not just stand in for it. The relay picks the ladder entry from the two
+	// NAT types, which cannot see where a cloud EIP translation actually sits;
+	// on a path where that point is further away than the probe's hop limit,
+	// every probe dies before the NAT it exists to open, and neither side ever
+	// sees a packet. Before this the flag only moved the fallback, so an
+	// instruction carrying ttl 7 still went out at ttl 7 and the documented
+	// "set 0 to disable" did nothing -- measured: E1<->E2 is an 11-hop path
+	// (ping ttl=53), the probe is capped at 7, and the pair never punched.
+	if fallback <= 0 {
+		return 0
+	}
 	// Entries 4 and 5 of the Mode 0 ladder are the "no TTL" pair. Any other
 	// index that explicitly says 0 (e.g. the sender's own instruction, which
 	// always has ttl 0) is not a receiver probe, and entries outside the
@@ -2048,6 +2436,13 @@ func waitForPunchSuccess(reg *PeerRegistry, targetMACStr string, label string) b
 	}
 	for {
 		if p, err := reg.GetPeer(targetMACStr); err == nil && p.PunchSeenAt().After(baseline) {
+			// The hole is open. Both NAT mappings now exist and packets can
+			// pass, which is a fact the status field cannot hold (see
+			// Peer.punchPathOpen): FullDuplex still owes a real data frame.
+			// Recording it here rather than at the FullDuplex promotion is
+			// what lets a control-plane probe arriving during that window
+			// leave the direct path in place.
+			p.NotePunchPathOpen()
 			log.Printf("[P2P] %s: peer punched back within the read timeout", label)
 			return true
 		}
@@ -2080,7 +2475,40 @@ func (reg *PeerRegistry) ExpectedPunchPeerMAC() string {
 		self = macAddrStr(reg.Me.Infos.GetMacAddr())
 	}
 
-	for _, instr := range reg.natHoleInstrs {
+	// Scan every pending instruction, in a stable order. Two things were
+	// wrong here and they compounded:
+	//
+	//   - the loop body ended in `return ""`, so the scan stopped after the
+	//     *first* instruction examined;
+	//   - "first" was whatever Go's randomised map iteration yielded, and
+	//     several peers are routinely mid-punch at once.
+	//
+	// So whenever the one instruction drawn happened to name us as target
+	// (or carried neither MAC), the answer was "" and the attribution
+	// window was silently closed for the entire round -- the correct punch
+	// then arrived, was answered, and was not recorded, because only the
+	// attribution branch records an raddr. Nothing logged the loss.
+	//
+	// Observed 2026-10-03 on log3: 10 consecutive punches from
+	// 52:eb:72:ed:64:1f arriving at 192.168.10.2:33377 -- the address an
+	// OpenWrt in the path had rewritten the source to -- were answered as
+	// "Punch packet from unknown peer", which records no raddr, so the peer
+	// stayed indexed only under its advertised 192.168.10.13:33377. The one
+	// round that drew a usable instruction logged "attributed to instruction
+	// peer (source address was rewritten in transit)", recorded 192.168.10.2
+	// and closed the tunnel immediately: 42s after the first punch, decided
+	// by map iteration order rather than by anything the protocol knew.
+	keys := make([]string, 0, len(reg.natHoleInstrs))
+	for k := range reg.natHoleInstrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		instr := reg.natHoleInstrs[k]
+		if instr == nil {
+			continue
+		}
 		var sender, target string
 		if sm := instr.GetSenderMac(); len(sm) > 0 {
 			sender = macAddrStr(sm)
@@ -2100,7 +2528,8 @@ func (reg *PeerRegistry) ExpectedPunchPeerMAC() string {
 		if sender != "" && sender != self {
 			return sender
 		}
-		return ""
+		// This instruction names no peer we can attribute to; try the next
+		// one rather than closing the window.
 	}
 	return ""
 }
@@ -2287,6 +2716,21 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 				// nothing to prefer, or it is us
 			case !tp.RaddrCoversCurrentMapping():
 				log.Printf("[P2P] Receiver: ignoring stale observed raddr %s for %s (it predates the peer's current public mapping, so that socket is closed); using the address resolved from what it advertises",
+					raddr, obsMAC)
+			case !raddrPunchableByReceiver(raddr):
+				// Off-link private. Punching it opens the hole at our own
+				// router's WAN address, so the peer's return packets only
+				// reach us if that router happens to hold a matching
+				// port-forward -- the exception, not the rule. Under CGNAT
+				// the peer's advertised public mapping is the only address
+				// where the return path is guaranteed to be walked, and the
+				// edge-side resolver already chose it for us.
+				//
+				// Observed 2026-10-04 on log3 against log4: this branch made
+				// 172.22.2.44:58813 the primary target for 188 rounds across
+				// 28 minutes while the public 111.101.5.1:58813 sat unused
+				// as the secondary; the pair never reached FullDuplex.
+				log.Printf("[P2P] Receiver: not preferring off-link private observed raddr %s for %s (the return path needs a port-forward on our router that we cannot count on); keeping the address resolved from what it advertises",
 					raddr, obsMAC)
 			default:
 				punchTarget = raddr
@@ -2919,6 +3363,36 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 	if achievedFullDuplex {
 		log.Printf("[P2P] NatHole punch succeeded — FullDuplex achieved with %s, clearing instruction", macAddrStr(targetMAC))
 		reg.peerMu.Lock()
+		// Tell the relay, and make it the only way out of "in progress".
+		//
+		// Nothing here reported success: this branch cleared the instruction
+		// and logged, and PunchStateSucceeded had no producer anywhere in the
+		// edge (only the enum in p2p.pb.go). The relay therefore never saw a
+		// pair succeed -- it saw InProgress, then silence, because the success
+		// path also drops the instruction so no further report follows. Two
+		// consequences: shouldRetireSuccess() was dead (it only fires on
+		// state 3), and the strategy analyzer never got credit, so a rung that
+		// genuinely worked scored the same as one that never ran.
+		//
+		// It is reported here, at the one point where the claim is backed by a
+		// real data frame: SetFullDuplex(true) refuses to promote a peer
+		// without HasVerifiedDataPath(), and FullDuplex in this function is
+		// read off p.IsFullDuplex, so state 3 can only mean real traffic moved
+		// over the direct path.
+		attempts := 1
+		if n := reg.natHoleRetryCounts[instrKey]; n > 0 {
+			attempts = n
+		}
+		reg.recordNatHolePunchResultLocked(
+			macAddrStr(targetMAC),
+			NatHolePunchState_PunchStateSucceeded,
+			uint32(attempts),
+			"FullDuplex verified by a real data frame",
+			instr.GetBehaviorIndex(),
+		)
+		// A pair that has come up should not sit at its longest stalled
+		// backoff if it drops again.
+		delete(reg.natHoleStallCount, macAddrStr(targetMAC))
 		// Clear this target's entry and nothing else.
 		//
 		// The old code cleared EVERY entry when the key it had captured was
@@ -3283,8 +3757,19 @@ func (reg *PeerRegistry) RecordNatHolePunchResultForTest(peerMAC string, state N
 // NatHolePunchResultsForTest returns the live punch-result map, not a copy, so a
 // test can seed and clear entries directly. Not safe to touch without
 // LockForTest. Exported for test/p2p; not part of the supported API.
+// NatHolePunchResultsForTest returns a snapshot of the punch results, for
+// tests that poll while a punch goroutine is running.
+//
+// It copies under peerMu rather than handing back the live map. Returning the
+// map itself made every such poll a data race against
+// recordNatHolePunchResultLocked, which -race reports as a failure of the test
+// under test rather than of the accessor, so the race detector was unusable on
+// this package. The copy also keeps a test from observing a half-written
+// NatHolePunchResult.
 func (reg *PeerRegistry) NatHolePunchResultsForTest() map[string]*NatHolePunchResult {
-	return reg.natHolePunchResults
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
+	return reg.NatHolePunchResultsSnapshotLocked()
 }
 
 // NatHoleRetryCountsForTest returns the live retry-count map, not a copy. Not

@@ -97,7 +97,7 @@ func TestResolvePunchTargetPrefersRegistryPublicOverRelayPrivate(t *testing.T) {
 		t.Skip("no IPv4 address to stand in for the relay-supplied value")
 	}
 
-	got, note := ResolvePunchTarget("", "57.129.106.133:46718", "", relay, "aa:bc:3a:74:37:b1", true)
+	got, note := ResolvePunchTarget("", "57.129.106.133:46718", "", relay, "aa:bc:3a:74:37:b1", true, false)
 	if got != "57.129.106.133:46718" {
 		t.Fatalf("ResolvePunchTarget chose %q, want the registry public socket (note: %s)", got, note)
 	}
@@ -107,7 +107,7 @@ func TestResolvePunchTargetPrefersRegistryPublicOverRelayPrivate(t *testing.T) {
 // empty result stops the punch round; a wrong address burns the retry budget
 // against a black hole and, worse, suppresses the receiver's return traffic.
 func TestResolvePunchTargetYieldsNothingRatherThanPrivate(t *testing.T) {
-	got, note := ResolvePunchTarget("", "", "", "10.2.80.2:46718", "aa:bc:3a:74:37:b1", true)
+	got, note := ResolvePunchTarget("", "", "", "10.2.80.2:46718", "aa:bc:3a:74:37:b1", true, false)
 	if got != "" {
 		t.Fatalf("ResolvePunchTarget chose %q, want empty (note: %s)", got, note)
 	}

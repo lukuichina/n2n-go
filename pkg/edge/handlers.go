@@ -131,6 +131,33 @@ func (e *EdgeClient) handleVFuzePacket(packetBuf []byte, n int, addr *net.UDPAdd
 		} else if peer, err := e.Peers.GetPeerBySocketIP(addr.IP); err == nil {
 			peer.SetP2PRaddr(addr.String())
 			e.Peers.IndexPeerRaddr(peer, addr.String())
+		} else if peer := e.Peers.PeerClaimingPortExclusive(uint16(addr.Port)); peer != nil {
+			// Last resort, and the only one that closes the log3/log5 gap.
+			//
+			// A vFuze header carries the destination MAC and nothing about
+			// the sender (pkg/protocol/vfuze.go: ProtoVFuzeSize = 7), so a
+			// frame's only peer-identifying evidence is its source socket.
+			// When a router in the path masquerades, that socket is an
+			// address nobody ever advertised -- not the peer's pubSocket,
+			// not the peer's IP, and not an raddr we have already indexed.
+			// Both lookups above miss, the frame is dropped without ever
+			// becoming the peer's raddr, and the pair stays on the relay
+			// while real frames arrive every few seconds.
+			//
+			// The UDP source port survives that SNAT: it is the peer's own
+			// P2P port, preserved by the masquerade. Matching on it is what
+			// finally turns those frames into the peer's raddr, and it is
+			// the same signal PeerClaimingPort already uses to refuse a
+			// misattributed punch.
+			//
+			// Observed 2026-10-04 on log5: 121 frames from 192.168.0.1:58186
+			// where 58186 is log3's port, and log5's raddr for log3 stayed
+			// 192.168.10.7:58186 -- an address on a segment the repeater has
+			// split, so undialable -- for 21 minutes.
+			log.Printf("[P2P] Attributing frame from unindexed %s to peer %s by exclusive P2P port %d (its source address is rewritten in transit); recording it as the raddr",
+				addr, net.HardwareAddr(peer.Infos.MacAddr).String(), addr.Port)
+			peer.SetP2PRaddr(addr.String())
+			e.Peers.IndexPeerRaddr(peer, addr.String())
 		}
 	}
 
@@ -193,6 +220,13 @@ func (e *EdgeClient) handleDataMessage(r *protocol.RawMessage) error {
 		// Same invariant as above: set and index together, or the new raddr
 		// is unreachable by lookup.
 		if peer, err := e.Peers.GetPeerBySocket(udpAddr); err == nil {
+			peer.SetP2PRaddr(udpAddr.String())
+			e.Peers.IndexPeerRaddr(peer, udpAddr.String())
+		} else if peer := e.Peers.PeerClaimingPortExclusive(uint16(udpAddr.Port)); peer != nil {
+			// Same masquerade case as the vFuze path above; see the comment
+			// there. Symmetric NAT is the ordinary reason this address keeps
+			// moving, so this is what tracks a peer's raddr across the
+			// per-destination ports it hands out.
 			peer.SetP2PRaddr(udpAddr.String())
 			e.Peers.IndexPeerRaddr(peer, udpAddr.String())
 		}
