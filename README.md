@@ -171,6 +171,12 @@ Several keys can also be set through the environment, which takes the form
 | `--wss-key` | — | WSS client key file | - |
 | `--stdout-log` | `-l` | Log to stdout instead of SQLite | `false` |
 | `--db-log` | — | Log into SQLite (`~/.n2n-go/edge.db`) instead of the console | `false` |
+| `--socks5-listen` | `-S` | SOCKS5 / HTTP ingress proxy URL | - |
+| `--socks5-policy` | — | Proxy destination policy: `overlay` (default) or `any` | `overlay` |
+| `--socks5-auth` | — | Username/password auth as `user:pass` | - |
+| `--socks5-idle-timeout` | — | Idle timeout for proxied connections (default: `30m`) | `30m` |
+| `--port-forward` | `-L` | Local port forward, repeatable | - |
+| `--remote-forward` | `-R` | Remote port forward, repeatable | - |
 
 ##### Address family preference: `--ipv6-prefer`
 
@@ -245,6 +251,107 @@ out-of-range value is rejected at startup rather than silently ignored.
 > **Note on `--api-listen`:** it binds `127.0.0.1` when the address is omitted.
 > Bind `0.0.0.0` explicitly to expose the management API to the network — the API
 > password is the community name, so exposing it is a real risk.
+
+##### Ingress Proxy: `--socks5-listen` / `-S`
+
+Runs a SOCKS5 and HTTP proxy whose traffic is routed through this edge's TAP.
+The proxy itself does not speak n2n: it accepts a connection, dials the target
+through the kernel, and the kernel routes the packets into the TAP, where
+`handleTAP` encrypts them. The data path is unchanged from ordinary edge
+traffic.
+
+The flag takes a proxy URL because that is how every other proxy in the world
+is configured, and remembering a separate password flag is one more thing to
+get wrong:
+
+| Value | Resolves to |
+|-------|-------------|
+| *(omitted)* | no proxy at all |
+| `socks5` | `127.0.0.1:1080` |
+| `socks5://1.2.3.4:1080` | `1.2.3.4:1080` |
+| `http://user:pass@1.2.3.4:8080` | `1.2.3.4:8080` with credentials |
+| `1.2.3.4:1080` | `1.2.3.4:1080`, no credentials |
+| `:1080` | `127.0.0.1:1080` |
+
+One listener serves both SOCKS5 and HTTP — the ingress peeks at the first byte
+to tell them apart. The scheme does not select a different listener; what the
+URL actually carries that matters is the credentials.
+
+```bash
+# Overlay-only proxy on the loopback, no auth
+./edge up -c myc -s wss://supernode:443 -S
+
+# Exposed on the network, with auth
+./edge up -c myc -s wss://supernode:443 -S http://alice:s3cret@0.0.0.0:1080
+
+# Client side
+curl -x socks5h://127.0.0.1:1080 http://100.64.0.4:8080/
+curl -x http://127.0.0.1:1080 https://100.64.0.4/
+```
+
+`socks5h` means the proxy resolves the hostname; `socks5` would ask the client
+to resolve it, which is rarely what you want inside an overlay.
+
+##### Proxy policy: `--socks5-policy`
+
+| Value | Behaviour |
+|-------|-----------|
+| `overlay` (default) | Only serves destinations inside the TAP's own subnet. Cannot turn the host into a relay for the internet. |
+| `any` | Serves any destination, making the edge an egress proxy. |
+
+`any` on a non-loopback address without credentials is an open relay, which is
+why the edge logs a warning rather than failing — `0.0.0.0` with credentials is
+a legitimate combination, and the distinction between "credentials were typed"
+and "credentials are in force" is exactly what is invisible when a tunnel
+unexpectedly has no auth on it.
+
+##### Auth: `--socks5-auth`
+
+`user:pass`, offering the SOCKS5 username/password method. Without it the
+proxy offers the "no authentication required" method.
+
+`--socks5-auth` without `-S` is a configuration error and the edge exits at
+startup: credentials without a listener would otherwise leave the operator
+believing an authenticated proxy is running when nothing is listening at all.
+
+##### Idle timeout: `--socks5-idle-timeout`
+
+Closes a proxied connection after this long with no traffic in either
+direction. Default `30m` — not shorter, because OpenSSH leaves
+`ServerAliveInterval` at 0, so a session sitting idle with nothing typed has
+sent no single byte, and a proxy that treats that as a dead tunnel kills a
+perfectly healthy SSH session with no error on either side.
+
+##### Port forwards: `-L` and `-R`
+
+Both take `BIND:PORT:TARGET:TPORT[/proto]`, where `proto` is `tcp` by default
+and `udp` for stateless forwarding. Both are repeatable.
+
+```bash
+# Local: bind on this host, relay to a service on another edge
+-L 0.0.0.0:1080:100.64.0.4:1080
+-L 0.0.0.0:5353:100.64.0.4:5353/udp
+
+# Remote: peers reach the service at this edge's virtual IP
+-R 0.0.0.0:1080:8.8.8.8:53/udp
+```
+
+**`-L`** binds on this host and relays to `TARGET:TPORT`, which is normally a
+service on another edge. The target is in the overlay, so the kernel's TAP
+route handles it — the same path the ingress proxy already uses.
+
+**`-R`** listens on `0.0.0.0` (not the virtual IP itself, which is a TAP-layer
+address applications cannot bind) and relays to `TARGET:TPORT`, which is
+normally a service outside the overlay. Peers reach it at this edge's
+`100.64.0.x`. Connections arriving from outside the overlay are rejected so the
+forwarder cannot be reached from the host's physical network.
+
+##### Management API
+
+`edge_api_GET /socks5.json` reports the listener address, policy, overlay
+subnets, and accepted/tunneled/active counts. It returns 404 when no ingress
+proxy is configured, so "not running" is distinguishable from "running but
+idle".
 
 #### Proxy Configuration
 

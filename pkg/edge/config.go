@@ -183,6 +183,32 @@ type Config struct {
 	// greater than KeepAliveInterval so a single lost keepalive does not
 	// tear the state down.
 	KeepAliveTimeout time.Duration `mapstructure:"p2p_keepalive_timeout"`
+
+	// SOCKS5 / HTTP ingress. Empty Socks5ListenAddr disables the listener
+	// entirely; see socks5.go for why the default policy is overlay-only.
+	Socks5ListenAddr  string        `mapstructure:"socks5_listen_address"`
+	Socks5Policy      string        `mapstructure:"socks5_policy"`
+	Socks5Auth        string        `mapstructure:"socks5_auth"`
+	Socks5IdleTimeout time.Duration `mapstructure:"socks5_idle_timeout"`
+
+	// Port forwards. Each entry is "BIND:PORT:TARGET:TPORT[/proto]" for a
+	// local forward (-L) or "VIP:PORT:TARGET:TPORT[/proto]" for a remote
+	// forward (-R). proto is "tcp" by default and "udp" for stateless
+	// forwarding. See portforward.go for the relay logic.
+	PortForwards    []PortForwardSpec `mapstructure:"port_forwards"`
+	RemoteForwards  []PortForwardSpec `mapstructure:"remote_forwards"`
+}
+
+// PortForwardSpec is one -L or -R entry, parsed from "BIND:PORT:TARGET:TPORT[/proto]".
+//
+// The bind address is where this edge listens; for -R it is reached through the
+// overlay at this edge's virtual IP. Proto is "tcp" by default and "udp" for
+// stateless forwarding.
+type PortForwardSpec struct {
+	BindAddr  string
+	BindPort  int
+	Target    string // "host:port" as dialled
+	Proto     string // "tcp" or "udp"
 }
 
 func DefaultConfig() *Config {
@@ -201,6 +227,11 @@ func DefaultConfig() *Config {
 		LocalPort:     0,           // 0 means automatically assigned
 		ConfigFile:    "edge.yaml", // Default config file name.
 		APIListenAddr: ":7778",
+
+		// The SOCKS5 listener is opt-in. "" means no listener at all, so an
+		// edge that never asked for one does not grow a new listening socket.
+		Socks5ListenAddr: "",
+		Socks5Policy:     Socks5PolicyOverlay,
 
 		// WS defaults
 		WSEnabled: false,

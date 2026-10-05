@@ -116,6 +116,17 @@ func (eapi *EdgeClientApi) GetHostsFile(c echo.Context) error {
 	return c.String(http.StatusOK, eapi.Client.Hosts.String())
 }
 
+// GetSocks5JSON reports whether the ingress proxy is running and what it has
+// been doing. It answers 404 when no --socks5-listen was given, so a scrape
+// can tell "not enabled" apart from "enabled but idle".
+func (eapi *EdgeClientApi) GetSocks5JSON(c echo.Context) error {
+	if eapi.Client.Socks5 == nil {
+		return c.JSON(http.StatusNotFound, map[string]any{"enabled": false})
+	}
+	st := eapi.Client.Socks5.Stats()
+	return c.JSON(http.StatusOK, map[string]any{"enabled": true, "stats": st})
+}
+
 func NewEdgeApi(edge *EdgeClient) *EdgeClientApi {
 	api := echo.New()
 	eapi := &EdgeClientApi{
@@ -139,6 +150,7 @@ func NewEdgeApi(edge *EdgeClient) *EdgeClientApi {
 	eapi.Api.GET("/leases.json", eapi.GetLeasesInfosJSON)
 	eapi.Api.GET("/offlines.dot", eapi.GetOfflinesDot)
 	eapi.Api.GET("/syshosts/file", eapi.GetHostsFile)
+	eapi.Api.GET("/socks5.json", eapi.GetSocks5JSON)
 	return eapi
 }
 

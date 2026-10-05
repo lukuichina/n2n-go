@@ -134,6 +134,34 @@ var (
 				Name:  "db-log",
 				Usage: "Log into the SQLite database at /root/.n2n-go/edge.db instead of the console",
 			},
+			&cli.StringFlag{
+				Name:    "socks5-listen",
+				Aliases: []string{"S"},
+				Usage:   "Run a SOCKS5 / HTTP proxy whose traffic is routed through this edge's TAP. `SPEC` is a proxy URL: `socks5` for the defaults, `socks5://HOST:PORT`, `http://[USER:PASS@]HOST:PORT`, or a bare `HOST:PORT`. An omitted address means 127.0.0.1 and an omitted port means 1080, so plain `socks5` gives 127.0.0.1:1080. One listener serves both SOCKS5 and HTTP. Omit the flag to run no proxy at all. `-L` and `-R` are the port-forwarding flags; this one is the proxy specifically",
+			},
+			&cli.StringSliceFlag{
+				Name:    "port-forward",
+				Aliases: []string{"L"},
+				Usage:   "Local port forward: bind `BIND:PORT:TARGET:TPORT[/proto]` on this host and relay it to TARGET:TPORT, which is normally a service on another edge (proto is `tcp` by default, `udp` for stateless forwarding). Repeatable. `-R` is the remote direction",
+			},
+			&cli.StringSliceFlag{
+				Name:    "remote-forward",
+				Aliases: []string{"R"},
+				Usage:   "Remote port forward: listen on this edge's own virtual IP as `VIP:PORT:TARGET:TPORT[/proto]` and relay to TARGET:TPORT, which is normally a service outside the overlay. Repeatable. Peers reach the service at this edge's 100.64.0.x",
+			},
+			&cli.StringFlag{
+				Name:  "socks5-policy",
+				Value: "overlay",
+				Usage: "Which destinations the proxy may reach: `overlay` (default) only serves addresses inside the TAP's own subnet, `any` also serves the internet through this host. `any` turns the edge into an egress proxy, and on a non-loopback address without credentials it is an open relay",
+			},
+			&cli.DurationFlag{
+				Name:  "socks5-idle-timeout",
+				Usage: "Close a proxied connection after this long with no traffic in either direction (default: 30m, 0 keeps the default). Raise it for long-lived idle tunnels such as an SSH session running without ServerAliveInterval",
+			},
+			&cli.StringFlag{
+				Name:  "socks5-auth",
+				Usage: "Require username/password authentication, as `user:pass`. Without it the proxy offers the SOCKS5 'no authentication required' method",
+			},
 		},
 		// Positional arg: supernode URL shortcut
 		// Usage: ./edge up wss://host/n2n -l
@@ -324,6 +352,61 @@ func up(c *cli.Context) {
 	}
 	if c.IsSet("compress-payload") {
 		cfg.CompressPayload = c.Bool("compress-payload")
+	}
+
+	if c.IsSet("socks5-listen") {
+		spec, err := edge.ParseProxyListenSpec(c.String("socks5-listen"))
+		if err != nil {
+			log.Fatalf("invalid -S/--socks5-listen value: %v", err)
+		}
+		cfg.Socks5ListenAddr = spec.Addr
+
+		// Credentials: an explicit --socks5-auth wins, but only when it
+		// actually carries a value. Testing IsSet alone is not enough -- cli
+		// reports a flag that was never given as "set" when it has a default,
+		// and c.String then hands back the empty default, which silently
+		// throws away the password that was just parsed out of -S and leaves
+		// an unauthenticated relay on a routable address.
+		if v := c.String("socks5-auth"); v != "" {
+			cfg.Socks5Auth = v
+		} else if a := spec.Auth(); a != "" {
+			cfg.Socks5Auth = a
+		}
+
+		authState := "disabled"
+		if cfg.Socks5Auth != "" {
+			authState = "enabled"
+		}
+		// Log the effective state, not the intent: the difference between
+		// "credentials were typed" and "credentials are in force" is exactly
+		// what is invisible when a tunnel unexpectedly has no auth on it.
+		log.Printf("proxy ingress: %s (auth %s)", spec.Redacted(), authState)
+	} else if v := c.String("socks5-auth"); v != "" {
+		// --socks5-auth without -S is a configuration error, not a silent
+		// no-op. Credentials without a listener to attach them to would
+		// otherwise leave the operator believing an authenticated proxy is
+		// running when nothing is listening at all.
+		log.Fatalf("credentials given without a listener: --socks5-auth %q but no -S/--socks5-listen", v)
+	}
+	if v := c.String("socks5-policy"); v != "" {
+		cfg.Socks5Policy = v
+	}
+	if c.IsSet("socks5-idle-timeout") {
+		cfg.Socks5IdleTimeout = c.Duration("socks5-idle-timeout")
+	}
+	for _, raw := range c.StringSlice("port-forward") {
+		spec, err := edge.ParsePortForwardSpec(raw)
+		if err != nil {
+			log.Fatalf("invalid -L/--port-forward value %q: %v", raw, err)
+		}
+		cfg.PortForwards = append(cfg.PortForwards, spec)
+	}
+	for _, raw := range c.StringSlice("remote-forward") {
+		spec, err := edge.ParsePortForwardSpec(raw)
+		if err != nil {
+			log.Fatalf("invalid -R/--remote-forward value %q: %v", raw, err)
+		}
+		cfg.RemoteForwards = append(cfg.RemoteForwards, spec)
 	}
 
 	client, err := edge.NewEdgeClient(*cfg) // Pass the config struct

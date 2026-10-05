@@ -97,6 +97,10 @@ type EdgeClient struct {
 	EAPI *EdgeClientApi
 	Mgmt *management.ManagementServer
 
+	// Socks5 is the optional SOCKS5 / HTTP-CONNECT ingress. Nil unless
+	// socks5_listen_address is set.
+	Socks5 *Socks5Server
+
 	// STUN
 	STUNClient *STUNClient
 
@@ -357,11 +361,33 @@ func (e *EdgeClient) Run() {
 	e.EAPI = eapi
 	go eapi.Run()
 
+	// The SOCKS5 listener is started after the TAP exists, because the
+	// overlay policy reads the TAP's subnet to decide what it may forward.
+	// A bind failure here is fatal for the same reason it is not started in
+	// NewEdgeClient: a port clash the operator asked for should stop the edge,
+	// not disappear into a goroutine.
+	if e.config.Socks5ListenAddr != "" {
+		s, err := NewSocks5Server(e, Socks5Options{
+			ListenAddr:  e.config.Socks5ListenAddr,
+			Policy:      e.config.Socks5Policy,
+			Auth:        e.config.Socks5Auth,
+			IdleTimeout: e.config.Socks5IdleTimeout,
+		})
+		if err != nil {
+			log.Fatalf("socks5: cannot start listener: %v", err)
+		}
+		e.Socks5 = s
+		go s.Serve()
+	}
+
 	<-e.ctx.Done() // Block until context is cancelled
 }
 
 // Close initiates a clean shutdown.
 func (e *EdgeClient) Close() {
+	if e.Socks5 != nil {
+		e.Socks5.Close()
+	}
 	if err := e.Unregister(); err != nil {
 		log.Printf("Unregister failed: %v", err)
 	}
