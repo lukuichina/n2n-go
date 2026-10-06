@@ -127,6 +127,27 @@ func (eapi *EdgeClientApi) GetSocks5JSON(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"enabled": true, "stats": st})
 }
 
+// GetPortForwardJSON reports the local and remote TCP port forwarders. It
+// answers 404 when neither -L nor -R was given.
+func (eapi *EdgeClientApi) GetPortForwardJSON(c echo.Context) error {
+	if len(eapi.Client.Forwards) == 0 && len(eapi.Client.RemoteForwards) == 0 {
+		return c.JSON(http.StatusNotFound, map[string]any{"enabled": false})
+	}
+	local := make([]PortForwardStats, 0, len(eapi.Client.Forwards))
+	for _, pf := range eapi.Client.Forwards {
+		local = append(local, pf.Stats())
+	}
+	remote := make([]PortForwardStats, 0, len(eapi.Client.RemoteForwards))
+	for _, pf := range eapi.Client.RemoteForwards {
+		remote = append(remote, pf.Stats())
+	}
+	return c.JSON(http.StatusOK, map[string]any{
+		"enabled": true,
+		"local":   local,
+		"remote":  remote,
+	})
+}
+
 func NewEdgeApi(edge *EdgeClient) *EdgeClientApi {
 	api := echo.New()
 	eapi := &EdgeClientApi{
@@ -151,6 +172,7 @@ func NewEdgeApi(edge *EdgeClient) *EdgeClientApi {
 	eapi.Api.GET("/offlines.dot", eapi.GetOfflinesDot)
 	eapi.Api.GET("/syshosts/file", eapi.GetHostsFile)
 	eapi.Api.GET("/socks5.json", eapi.GetSocks5JSON)
+	eapi.Api.GET("/portforward.json", eapi.GetPortForwardJSON)
 	return eapi
 }
 

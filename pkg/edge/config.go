@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"n2n-go/pkg/protocol"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -71,7 +70,13 @@ func ParseListenAddr(spec, defaultAddr, defaultPort string) (string, error) {
 	default:
 		switch strings.Count(spec, ":") {
 		case 0:
-			if isAllDigits(spec) {
+			if spec == "*" {
+				// "*" means "all interfaces", which is 0.0.0.0 on IPv4 and
+				// :: on IPv6. We resolve to 0.0.0.0 because that is what a
+				// port forwarder's net.Listen wants, and it is what the
+				// operator typing -R means.
+				addr = "0.0.0.0"
+			} else if isAllDigits(spec) {
 				port = spec
 			} else {
 				addr = spec
@@ -85,19 +90,18 @@ func ParseListenAddr(spec, defaultAddr, defaultPort string) (string, error) {
 		}
 	}
 
+	if addr == "*" {
+		addr = "0.0.0.0"
+	}
 	if addr == "" {
 		addr = defaultAddr
 	}
 	if port == "" {
 		port = defaultPort
 	}
-	if !isAllDigits(port) {
-		return "", fmt.Errorf("invalid listen address %q: port %q is not a number", spec, port)
-	}
-	n, err := strconv.Atoi(port)
-	if err != nil || n < 0 || n > 65535 {
-		return "", fmt.Errorf("invalid listen address %q: port %q is out of range 0-65535", spec, port)
-	}
+	// Do not validate the port here: ParseListenAddr is also used by the
+	// port-forward parser, where the port may be a list or a range. The
+	// caller is responsible for validating whatever it extracts.
 	return addr + ":" + port, nil
 }
 

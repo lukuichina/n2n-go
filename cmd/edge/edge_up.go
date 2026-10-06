@@ -142,7 +142,7 @@ var (
 			&cli.StringSliceFlag{
 				Name:    "port-forward",
 				Aliases: []string{"L"},
-				Usage:   "Local port forward: bind `BIND:PORT:TARGET:TPORT[/proto]` on this host and relay it to TARGET:TPORT, which is normally a service on another edge (proto is `tcp` by default, `udp` for stateless forwarding). Repeatable. `-R` is the remote direction",
+				Usage:   "Local port forward: bind `BIND:PORT:TARGET:TPORT[/proto]` on this host and relay it to TARGET:TPORT, which is normally a service on another edge (proto is `tcp` by default, `udp` for stateless forwarding, `both` for one TCP plus one UDP listener). Repeatable. `-R` is the remote direction",
 			},
 			&cli.StringSliceFlag{
 				Name:    "remote-forward",
@@ -395,18 +395,18 @@ func up(c *cli.Context) {
 		cfg.Socks5IdleTimeout = c.Duration("socks5-idle-timeout")
 	}
 	for _, raw := range c.StringSlice("port-forward") {
-		spec, err := edge.ParsePortForwardSpec(raw)
+		specs, err := edge.ParsePortForwardSpec(raw)
 		if err != nil {
 			log.Fatalf("invalid -L/--port-forward value %q: %v", raw, err)
 		}
-		cfg.PortForwards = append(cfg.PortForwards, spec)
+		cfg.PortForwards = append(cfg.PortForwards, specs...)
 	}
 	for _, raw := range c.StringSlice("remote-forward") {
-		spec, err := edge.ParsePortForwardSpec(raw)
+		specs, err := edge.ParsePortForwardSpec(raw)
 		if err != nil {
 			log.Fatalf("invalid -R/--remote-forward value %q: %v", raw, err)
 		}
-		cfg.RemoteForwards = append(cfg.RemoteForwards, spec)
+		cfg.RemoteForwards = append(cfg.RemoteForwards, specs...)
 	}
 
 	client, err := edge.NewEdgeClient(*cfg) // Pass the config struct

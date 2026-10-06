@@ -175,8 +175,8 @@ Several keys can also be set through the environment, which takes the form
 | `--socks5-policy` | — | Proxy destination policy: `overlay` (default) or `any` | `overlay` |
 | `--socks5-auth` | — | Username/password auth as `user:pass` | - |
 | `--socks5-idle-timeout` | — | Idle timeout for proxied connections (default: `30m`) | `30m` |
-| `--port-forward` | `-L` | Local port forward, repeatable | - |
-| `--remote-forward` | `-R` | Remote port forward, repeatable | - |
+| `--port-forward` | `-L` | Local port forward, repeatable. `BIND:PORT:TARGET:TPORT[/proto]`, `proto` is `tcp`/`udp`/`both` | - |
+| `--remote-forward` | `-R` | Remote port forward, repeatable. Same syntax as `-L` | - |
 
 ##### Address family preference: `--ipv6-prefer`
 
@@ -324,17 +324,24 @@ perfectly healthy SSH session with no error on either side.
 
 ##### Port forwards: `-L` and `-R`
 
-Both take `BIND:PORT:TARGET:TPORT[/proto]`, where `proto` is `tcp` by default
-and `udp` for stateless forwarding. Both are repeatable.
+Both take `BIND:PORT:TARGET:TPORT[/proto]`, where `proto` is `tcp` by default,
+`udp` for stateless forwarding, or `both` for one TCP plus one UDP listener on
+the same bind address. Both are repeatable.
 
 ```bash
 # Local: bind on this host, relay to a service on another edge
 -L 0.0.0.0:1080:100.64.0.4:1080
 -L 0.0.0.0:5353:100.64.0.4:5353/udp
+-L 0.0.0.0:80:100.64.0.4:80/both
 
 # Remote: peers reach the service at this edge's virtual IP
 -R 0.0.0.0:1080:8.8.8.8:53/udp
 ```
+
+`both` is sugar for two independent listeners sharing nothing but the bind
+address — one TCP, one UDP — each started as its own `PortForwarder`. It is
+handy when a single service answers on both protocols and you do not want to
+repeat the bind address and target by hand.
 
 **`-L`** binds on this host and relays to `TARGET:TPORT`, which is normally a
 service on another edge. The target is in the overlay, so the kernel's TAP

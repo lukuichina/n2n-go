@@ -101,6 +101,11 @@ type EdgeClient struct {
 	// socks5_listen_address is set.
 	Socks5 *Socks5Server
 
+	// Forwards and RemoteForwards are the TCP port forwarders started from
+	// -L and -R. Both are nil-slices when none were configured.
+	Forwards       []*PortForwarder
+	RemoteForwards []*PortForwarder
+
 	// STUN
 	STUNClient *STUNClient
 
@@ -380,6 +385,34 @@ func (e *EdgeClient) Run() {
 		go s.Serve()
 	}
 
+	// Port forwarders are started after the TAP exists for the same reason as
+	// the SOCKS5 ingress: the overlay policy reads the TAP's subnet. A bind
+	// failure here is fatal -- a port clash the operator asked for should stop
+	// the edge, not disappear into a goroutine.
+	for _, spec := range e.config.PortForwards {
+		// -L is an ingress into the overlay: it may only reach targets inside
+		// the TAP's subnet, and it is bound on the host, so no source filter
+		// is needed -- a host-bound listener is not an open ingress.
+		pf, err := NewPortForwarder(e, spec, OverlayPolicyOverlay, false)
+		if err != nil {
+			log.Fatalf("port forward %s: %v", spec, err)
+		}
+		e.Forwards = append(e.Forwards, pf)
+		go pf.Serve()
+	}
+	for _, spec := range e.config.RemoteForwards {
+		// -R is an egress out of the overlay: it may reach any target, but
+		// because it is bound on the overlay's own address (0.0.0.0 by
+		// default) it must only accept connections whose source is inside
+		// the overlay, or it becomes an open ingress to the internet.
+		pf, err := NewPortForwarder(e, spec, OverlayPolicyAny, true)
+		if err != nil {
+			log.Fatalf("port forward %s: %v", spec, err)
+		}
+		e.RemoteForwards = append(e.RemoteForwards, pf)
+		go pf.Serve()
+	}
+
 	<-e.ctx.Done() // Block until context is cancelled
 }
 
@@ -387,6 +420,12 @@ func (e *EdgeClient) Run() {
 func (e *EdgeClient) Close() {
 	if e.Socks5 != nil {
 		e.Socks5.Close()
+	}
+	for _, pf := range e.Forwards {
+		pf.Close()
+	}
+	for _, pf := range e.RemoteForwards {
+		pf.Close()
 	}
 	if err := e.Unregister(); err != nil {
 		log.Printf("Unregister failed: %v", err)

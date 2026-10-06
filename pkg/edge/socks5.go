@@ -26,7 +26,6 @@ package edge
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -659,43 +658,20 @@ func (s *Socks5Server) dialTarget(target string) (net.Conn, byte, error) {
 	return c, socks5RepSuccess, nil
 }
 
-// overlayAllows reports whether host, an IP literal or a name, lands inside the
-// overlay. Names are resolved here because the policy is about where the bytes
-// end up, not about how they were spelled.
+// overlayAllows reports whether host, an IP literal or a name, lands inside
+// the overlay. Names are resolved here because the policy is about where the
+// bytes end up, not about how they were spelled.
 func (s *Socks5Server) overlayAllows(host string) (bool, error) {
-	nets := s.overlayNets()
-	if len(nets) == 0 {
-		return false, errors.New("overlay subnet is unknown (TAP not configured yet)")
-	}
-
-	if ip := net.ParseIP(host); ip != nil {
-		return ipInNets(ip, nets), nil
-	}
-
-	addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
-	if err != nil {
-		return false, fmt.Errorf("cannot resolve %q: %w", host, err)
-	}
-	for _, a := range addrs {
-		if ipInNets(a.IP, nets) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func ipInNets(ip net.IP, nets []*net.IPNet) bool {
-	for _, n := range nets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return overlayAllows(host, s.overlayNets())
 }
 
 // overlayNets returns the subnets configured on the TAP. It prefers asking the
 // interface, because that is what the kernel actually routes with, and falls
 // back to the address the supernode handed us.
+func (s *Socks5Server) overlayNets() []*net.IPNet {
+	return overlayNets(s.edge, &s.overlay, &s.overlayOnce)
+}
+
 // Stats is the snapshot served by the management API.
 type Socks5Stats struct {
 	ListenAddr string   `json:"listen_addr"`
@@ -727,40 +703,6 @@ func (s *Socks5Server) Stats() Socks5Stats {
 		Tunneled:   s.Tunneled.Load(),
 		Active:     s.Active.Load(),
 	}
-}
-
-func (s *Socks5Server) overlayNets() []*net.IPNet {
-	s.overlayOnce.Do(func() {
-		if s.edge != nil {
-			name := ""
-			if s.edge.TAP != nil {
-				name = s.edge.TAP.Name()
-			} else if s.edge.config != nil {
-				name = s.edge.config.TapName
-			}
-			if name != "" {
-				if ifc, err := net.InterfaceByName(name); err == nil {
-					if addrs, err := ifc.Addrs(); err == nil {
-						for _, a := range addrs {
-							if n, ok := a.(*net.IPNet); ok {
-								s.overlay = append(s.overlay, n)
-							}
-						}
-					} else {
-						log.Printf("socks5: cannot list addresses of %s: %v", name, err)
-					}
-				} else {
-					log.Printf("socks5: cannot look up interface %s: %v", name, err)
-				}
-			}
-		}
-		if len(s.overlay) == 0 && s.edge != nil && s.edge.VirtualIP != "" {
-			if _, n, err := net.ParseCIDR(s.edge.VirtualIP); err == nil {
-				s.overlay = append(s.overlay, n)
-			}
-		}
-	})
-	return s.overlay
 }
 
 // ------------------------------------------------------------------ relay --
