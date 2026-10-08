@@ -176,8 +176,18 @@ type PeerInfo struct {
 	// The peer's LAN addresses (see RegisterRequest.assisted_sockets), carried
 	// so the relay can copy them into NatHoleInstruction.sender_assisted_endpoints.
 	AssistedSockets []string `protobuf:"bytes,14,rep,name=assisted_sockets,json=assistedSockets,proto3" json:"assisted_sockets,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Operating system name (e.g. "linux", "windows", "darwin").
+	Os string `protobuf:"bytes,16,opt,name=os,proto3" json:"os,omitempty"`
+	// Platform description (e.g. "ubuntu", "centos", "windows 10").
+	Platform string `protobuf:"bytes,17,opt,name=platform,proto3" json:"platform,omitempty"`
+	// CPU architecture (e.g. "amd64", "arm64", "x86_64").
+	Arch string `protobuf:"bytes,18,opt,name=arch,proto3" json:"arch,omitempty"`
+	// Last measured ping latency to this peer in milliseconds.
+	PingLatencyMs uint32 `protobuf:"varint,19,opt,name=ping_latency_ms,json=pingLatencyMs,proto3" json:"ping_latency_ms,omitempty"`
+	// Degradation history entries (human-readable, oldest first).
+	DegradeHistory []string `protobuf:"bytes,20,rep,name=degrade_history,json=degradeHistory,proto3" json:"degrade_history,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PeerInfo) Reset() {
@@ -315,6 +325,41 @@ func (x *PeerInfo) GetAssistedSockets() []string {
 	return nil
 }
 
+func (x *PeerInfo) GetOs() string {
+	if x != nil {
+		return x.Os
+	}
+	return ""
+}
+
+func (x *PeerInfo) GetPlatform() string {
+	if x != nil {
+		return x.Platform
+	}
+	return ""
+}
+
+func (x *PeerInfo) GetArch() string {
+	if x != nil {
+		return x.Arch
+	}
+	return ""
+}
+
+func (x *PeerInfo) GetPingLatencyMs() uint32 {
+	if x != nil {
+		return x.PingLatencyMs
+	}
+	return 0
+}
+
+func (x *PeerInfo) GetDegradeHistory() []string {
+	if x != nil {
+		return x.DegradeHistory
+	}
+	return nil
+}
+
 type NatHolePunchResult struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	State NatHolePunchState      `protobuf:"varint,1,opt,name=state,proto3,enum=p2p.NatHolePunchState" json:"state,omitempty"`
@@ -331,8 +376,11 @@ type NatHolePunchResult struct {
 	// own last dispatch, which is wrong whenever an instruction was replaced
 	// between being sent and the outcome coming back.
 	BehaviorIndex uint32 `protobuf:"varint,4,opt,name=behavior_index,json=behaviorIndex,proto3" json:"behavior_index,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Elapsed time from instruction receipt to first verified data frame
+	// (milliseconds). 0 means "not measured".
+	PunchDurationMs uint32 `protobuf:"varint,5,opt,name=punch_duration_ms,json=punchDurationMs,proto3" json:"punch_duration_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *NatHolePunchResult) Reset() {
@@ -389,6 +437,13 @@ func (x *NatHolePunchResult) GetDetail() string {
 func (x *NatHolePunchResult) GetBehaviorIndex() uint32 {
 	if x != nil {
 		return x.BehaviorIndex
+	}
+	return 0
+}
+
+func (x *NatHolePunchResult) GetPunchDurationMs() uint32 {
+	if x != nil {
+		return x.PunchDurationMs
 	}
 	return 0
 }
@@ -1000,7 +1055,7 @@ var File_pkg_p2p_proto_p2p_proto protoreflect.FileDescriptor
 
 const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\n" +
-	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xc6\x04\n" +
+	"\x17pkg/p2p/proto/p2p.proto\x12\x03p2p\"\xd7\x05\n" +
 	"\bPeerInfo\x12\x1d\n" +
 	"\n" +
 	"virtual_ip\x18\x01 \x01(\tR\tvirtualIp\x12\x19\n" +
@@ -1020,12 +1075,18 @@ const file_pkg_p2p_proto_p2p_proto_rawDesc = "" +
 	"\x15punch_result_peer_mac\x18\r \x01(\tR\x12punchResultPeerMac\x12\x1d\n" +
 	"\n" +
 	"p2p_status\x18\x0f \x01(\rR\tp2pStatus\x12)\n" +
-	"\x10assisted_sockets\x18\x0e \x03(\tR\x0fassistedSockets\"\x9d\x01\n" +
+	"\x10assisted_sockets\x18\x0e \x03(\tR\x0fassistedSockets\x12\x0e\n" +
+	"\x02os\x18\x10 \x01(\tR\x02os\x12\x1a\n" +
+	"\bplatform\x18\x11 \x01(\tR\bplatform\x12\x12\n" +
+	"\x04arch\x18\x12 \x01(\tR\x04arch\x12&\n" +
+	"\x0fping_latency_ms\x18\x13 \x01(\rR\rpingLatencyMs\x12'\n" +
+	"\x0fdegrade_history\x18\x14 \x03(\tR\x0edegradeHistory\"\xc9\x01\n" +
 	"\x12NatHolePunchResult\x12,\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x16.p2p.NatHolePunchStateR\x05state\x12\x1a\n" +
 	"\battempts\x18\x02 \x01(\rR\battempts\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12%\n" +
-	"\x0ebehavior_index\x18\x04 \x01(\rR\rbehaviorIndex\"\xa1\x01\n" +
+	"\x0ebehavior_index\x18\x04 \x01(\rR\rbehaviorIndex\x12*\n" +
+	"\x11punch_duration_ms\x18\x05 \x01(\rR\x0fpunchDurationMs\"\xa1\x01\n" +
 	"\fPeerInfoList\x12\x1d\n" +
 	"\n" +
 	"has_origin\x18\x01 \x01(\bR\thasOrigin\x12%\n" +

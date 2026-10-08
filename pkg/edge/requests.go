@@ -84,7 +84,14 @@ func (e *EdgeClient) sendP2PInfos() error {
 		e.Peers.ClearPendingChanges()
 		return nil
 	}
-	log.Printf("sending pending PeerP2PInfos changes to supernode... (from MAC=%s, to=%d peers)", net.HardwareAddr(infos.From.MacAddr).String(), len(infos.To))
+	firstTo := "(none)"
+	if len(infos.To) > 0 {
+		firstTo = net.HardwareAddr(infos.To[0].MacAddr).String()
+	}
+	log.Printf("sending pending PeerP2PInfos changes to supernode... (from MAC=%s, Os=%s, Platform=%s, Arch=%s, to=%d peers, firstTo=%s)",
+		net.HardwareAddr(infos.From.MacAddr).String(),
+		infos.From.Os, infos.From.Platform, infos.From.Arch,
+		len(infos.To), firstTo)
 	e.Peers.ClearPendingChanges()
 	err := e.SendStruct(infos, nil, p2p.UDPEnforceSupernode)
 	if err != nil {

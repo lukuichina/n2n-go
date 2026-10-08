@@ -10,6 +10,7 @@ import (
 	"n2n-go/pkg/protocol/netstruct"
 	"n2n-go/pkg/protocol/spec"
 	"net"
+	"time"
 )
 
 var ErrNACKRegister = errors.New("Edge: supernode refused register request. Aborting")
@@ -250,7 +251,6 @@ func (e *EdgeClient) handlePeerInfoMessage(r *protocol.RawMessage) error {
 	// state (pubSocket from STUN, NAT type) to the Worker. Without this,
 	// the Worker never learns our NAT info and cannot coordinate hole
 	// punching — only the peer that received P2PStateInfo gets eligible.
-	e.Peers.SetPendingChanges()
 	// Extract and dispatch relay-coordinated NAT hole instructions.
 	// The Worker embeds an instruction in each peer's PeerInfo entry, but
 	// only the entry matching our own MAC is addressed to us. Processing
@@ -349,22 +349,26 @@ func (e *EdgeClient) handlePingMessage(r *protocol.RawMessage) error {
 		}
 		if p.P2PCheckID == pingMsg.Msg.CheckId {
 			if p.UpdateP2PStatus(p2p.P2PAvailable, pingMsg.Msg.CheckId) {
-				e.Peers.SetPendingChanges()
+			}
+			// Measure round-trip time from the last ping we sent.
+			if sent := p.PingSentAt(); !sent.IsZero() {
+				if latency := uint32(time.Since(sent).Milliseconds()); latency > 0 {
+					p.SetPingLatencyMs(latency)
+					e.Peers.SetPendingChanges()
+				}
+				p.SetPingSentAt(time.Time{})
 			}
 		} else {
 			err = fmt.Errorf("received a pong for MACAddress %s but checkID differs (want %s, received %s)", pingMsg.EdgeMACAddr(), p.P2PCheckID, pingMsg.Msg.CheckId)
 			if p.UpdateP2PStatus(p2p.P2PUnknown, "") {
-				e.Peers.SetPendingChanges()
 			}
 		}
 		if p.P2PStatus == p2p.P2PAvailable {
 			if !pingMsg.Header.IsFromSupernode() {
 				if changed, _ := p.SetFullDuplex(true); changed {
-					e.Peers.SetPendingChanges()
 				}
 			} else {
 				if changed, _ := p.SetFullDuplex(false); changed {
-					e.Peers.SetPendingChanges()
 				}
 			}
 		}

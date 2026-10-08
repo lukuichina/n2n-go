@@ -185,6 +185,21 @@ type Peer struct {
 	routeDbgMu  sync.Mutex
 	routeDbgKey string
 	routeDbgAt  time.Time
+
+	// pingSentAt is when we last sent a ping to this peer. Used to measure
+	// round-trip time when the pong arrives.
+	pingSentAt time.Time
+
+	// PingLatencyMs is the last measured ping latency in milliseconds.
+	PingLatencyMs uint32
+
+	// DegradeHistory records human-readable entries for each status demotion,
+	// oldest first, capped at a small size to bound memory.
+	DegradeHistory []string
+
+	// PunchDurationMs is the elapsed time from receiving a NatHoleInstruction
+	// to the first verified data frame (milliseconds). 0 means not measured.
+	PunchDurationMs uint32
 }
 
 // routeDbgReLogInterval is how often an unchanged routing decision is still
@@ -279,6 +294,32 @@ func (p *Peer) RaddrAt() time.Time {
 	p.raddrMu.RLock()
 	defer p.raddrMu.RUnlock()
 	return p.raddrAt
+}
+
+// SetPingSentAt records when we sent a ping to this peer, so the pong
+// handler can compute round-trip time.
+func (p *Peer) SetPingSentAt(t time.Time) {
+	p.pingSentAt = t
+}
+
+// PingSentAt returns when we last sent a ping to this peer.
+func (p *Peer) PingSentAt() time.Time {
+	return p.pingSentAt
+}
+
+// SetPingLatencyMs records the last measured ping latency in milliseconds.
+func (p *Peer) SetPingLatencyMs(ms uint32) {
+	p.PingLatencyMs = ms
+}
+
+// AddDegradeHistory appends a human-readable entry to the peer's degrade
+// history, capped at 20 entries to bound memory.
+func (p *Peer) AddDegradeHistory(entry string) {
+	if len(p.DegradeHistory) >= 20 {
+		p.DegradeHistory = append(p.DegradeHistory[1:], entry)
+	} else {
+		p.DegradeHistory = append(p.DegradeHistory, entry)
+	}
 }
 
 // PubSocketChangedAt reports when this peer last announced a *different*
@@ -500,6 +541,9 @@ type PeerRegistry struct {
 	// Retry counts for NAT hole instructions (keyed by our MAC).
 	// Allows multiple punch attempts before giving up.
 	natHoleRetryCounts map[string]int
+	// natHoleInstrStartTimes records when each pending instruction was first
+	// received, so a successful punch can report elapsed time to the relay.
+	natHoleInstrStartTimes map[string]time.Time
 	// lastNatHoleInstrs keeps the most recent instruction per PEER MAC after
 	// it has been executed and deleted from natHoleInstrs.
 	//
@@ -625,13 +669,14 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 	return &PeerRegistry{
 		CommunityName:       communityName,
 		Peers:               make(map[string]*Peer),
-		peerBySocket:        make(map[string]*Peer),
-		peerByP2PSocket:     make(map[string]*Peer),
-		graceUnlisted:       make(map[string]*graceTombstone),
-		natHoleInstrs:       make(map[string]*NatHoleInstruction),
-		natHoleRetryCounts:  make(map[string]int),
-		lastNatHoleInstrs:   make(map[string]*NatHoleInstruction),
-		natHolePunchResults: make(map[string]*NatHolePunchResult),
+		peerBySocket:           make(map[string]*Peer),
+		peerByP2PSocket:        make(map[string]*Peer),
+		graceUnlisted:          make(map[string]*graceTombstone),
+		natHoleInstrs:          make(map[string]*NatHoleInstruction),
+		natHoleRetryCounts:     make(map[string]int),
+		natHoleInstrStartTimes: make(map[string]time.Time),
+		lastNatHoleInstrs:      make(map[string]*NatHoleInstruction),
+		natHolePunchResults:    make(map[string]*NatHolePunchResult),
 	}
 }
 
@@ -724,12 +769,18 @@ func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
 			infos.PunchResultPeerMac = mac
 			delivered = append(delivered, mac)
 		}
+		// Copy fields that live on Peer but not on PeerInfo so the relay
+		// can display them. Os/Platform/Arch are already on infos via setup;
+		// PingLatencyMs and DegradeHistory are maintained on Peer.
+		infos.PingLatencyMs = v.PingLatencyMs
+		infos.DegradeHistory = v.DegradeHistory
 		to = append(to, &infos)
 	}
 	infos := &PeerP2PInfos{
 		From: &reg.Me.Infos,
 		To:   to,
 	}
+	log.Printf("DEBUG GetPeerP2PInfos: reg=%p Me=%p Me.Infos.Os=%q Me.Infos.Platform=%q Me.Infos.Arch=%q", reg, reg.Me, reg.Me.Infos.Os, reg.Me.Infos.Platform, reg.Me.Infos.Arch)
 	reg.peerMu.RUnlock()
 
 	// Drop the outcomes this message just carried. Written under the write
@@ -774,6 +825,7 @@ func (reg *PeerRegistry) ClearPendingChanges() {
 // P2PStateInfo (pubSocket, NAT type) to the supernode, enabling the
 // supernode to generate NatHoleInstructions for peer coordination.
 func (reg *PeerRegistry) SetMe(infos PeerInfo) {
+	log.Printf("DEBUG SetMe CALLED: reg=%p Os=%q Platform=%q Arch=%q", reg, infos.Os, infos.Platform, infos.Arch)
 	reg.peerMu.Lock()
 	defer reg.peerMu.Unlock()
 	reg.Me = &Peer{
@@ -796,6 +848,7 @@ func (reg *PeerRegistry) SetMe(infos PeerInfo) {
 		// whole run while relaying normally.
 		P2PStatus: P2PAvailable,
 	}
+	log.Printf("DEBUG SetMe: Os=%q Platform=%q Arch=%q", infos.Os, infos.Platform, infos.Arch)
 }
 
 func (reg *PeerRegistry) GetPeer(MACAddr string) (*Peer, error) {
@@ -1267,13 +1320,15 @@ func (reg *PeerRegistry) GetPeerBySocketIP(ip net.IP) (*Peer, error) {
 // behaviorIndex is the relay behaviour-ladder rung this outcome belongs to,
 // so the relay can credit or blame the right one. 0 is a valid rung, so it is
 // always meaningful; callers that have no instruction in hand pass 0.
-func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32) {
+// punchDurationMs is the elapsed time from instruction receipt to first
+// verified data frame, or 0 if not measured.
+func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32, punchDurationMs uint32) {
 	if peerMAC == "" {
 		return
 	}
 	reg.peerMu.Lock()
 	defer reg.peerMu.Unlock()
-	reg.recordNatHolePunchResultLocked(peerMAC, state, attempts, detail, behaviorIndex)
+	reg.recordNatHolePunchResultLocked(peerMAC, state, attempts, detail, behaviorIndex, punchDurationMs)
 }
 
 // recordNatHolePunchResultLocked is RecordNatHolePunchResult for callers that
@@ -1285,15 +1340,16 @@ func (reg *PeerRegistry) RecordNatHolePunchResult(peerMAC string, state NatHoleP
 // worked around this by writing reg.natHolePunchResults inline at that site,
 // which duplicated the struct literal and, more importantly, left the two
 // paths free to drift -- they already had.
-func (reg *PeerRegistry) recordNatHolePunchResultLocked(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32) {
+func (reg *PeerRegistry) recordNatHolePunchResultLocked(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32, punchDurationMs uint32) {
 	if reg.natHolePunchResults == nil {
 		reg.natHolePunchResults = make(map[string]*NatHolePunchResult)
 	}
 	reg.natHolePunchResults[peerMAC] = &NatHolePunchResult{
-		State:         state,
-		Attempts:      attempts,
-		Detail:        detail,
-		BehaviorIndex: behaviorIndex,
+		State:           state,
+		Attempts:        attempts,
+		Detail:          detail,
+		BehaviorIndex:   behaviorIndex,
+		PunchDurationMs: punchDurationMs,
 	}
 	// Single choke point for every outcome (in progress, failed, succeeded),
 	// so this is the one place that has to know a round just ended. The
@@ -1514,6 +1570,11 @@ func (p *Peer) UpdateP2PStatus(status P2PCapacity, checkid string) bool {
 	p.UpdatedAt = time.Now()
 	if !skipLog {
 		log.Printf("updated peer %s/%s/%s with P2PStatus=%s %s", p.Infos.Desc, p.Infos.VirtualIp, net.HardwareAddr(p.Infos.MacAddr).String(), p.P2PStatus.String(), forcedStatement)
+	}
+	// Record demotion events for the relay to inspect. A full history is not
+	// wanted -- only the fact that a demotion happened, and roughly why.
+	if previousStatus != status && status < previousStatus {
+		p.AddDegradeHistory(fmt.Sprintf("%s -> %s%s", previousStatus.String(), p.P2PStatus.String(), forcedStatement))
 	}
 	return previousStatus != status
 }
@@ -1929,6 +1990,40 @@ func (reg *PeerRegistry) CurrentNatHoleBehaviorIndex(peerMAC string) uint32 {
 	return 0
 }
 
+// GetPunchDurationMs returns the elapsed milliseconds from when the
+// instruction for peerMAC was first received to now. Returns 0 if no
+// instruction start time is recorded for that peer.
+func (reg *PeerRegistry) GetPunchDurationMs(peerMAC string) uint32 {
+	if peerMAC == "" {
+		return 0
+	}
+	reg.peerMu.RLock()
+	defer reg.peerMu.RUnlock()
+	if reg.natHoleInstrStartTimes == nil {
+		return 0
+	}
+	// Find the key for this peerMAC
+	key := ""
+	for k, instr := range reg.natHoleInstrs {
+		if instr != nil && len(instr.GetTargetMac()) == 6 {
+			if macAddrStr(instr.GetTargetMac()) == peerMAC {
+				key = k
+				break
+			}
+		}
+	}
+	if key == "" {
+		// Fallback: check if there's a direct entry
+		key = peerMAC
+	}
+	if start, ok := reg.natHoleInstrStartTimes[key]; ok && !start.IsZero() {
+		if d := time.Since(start); d > 0 {
+			return uint32(d.Milliseconds())
+		}
+	}
+	return 0
+}
+
 // natHoleInstrKeyFor returns the key an instruction is stored under: the
 // TARGET peer's MAC.
 //
@@ -1981,6 +2076,14 @@ func (reg *PeerRegistry) SetNatHoleInstruction(macAddr []byte, instr *NatHoleIns
 	prevInstr, exists := reg.natHoleInstrs[key]
 	reg.natHoleInstrs[key] = instr
 	reg.natHoleInstrKey = key
+	if !exists {
+		// New instruction: record when it arrived so we can measure elapsed
+		// time to first verified data frame on success.
+		if reg.natHoleInstrStartTimes == nil {
+			reg.natHoleInstrStartTimes = make(map[string]time.Time)
+		}
+		reg.natHoleInstrStartTimes[key] = time.Now()
+	}
 	// Remember it per peer so the self-healing path can re-run it after a
 	// successful round has already deleted it from natHoleInstrs.
 	if tm := instr.GetTargetMac(); len(tm) == 6 {
@@ -2815,6 +2918,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 			// peerMu, for the failure report at the end of this round. Taking
 			// peerMu here would deadlock: Go's RWMutex is not reentrant.
 			reg.CurrentNatHoleBehaviorIndex(macAddrStr(tm)),
+			0,
 		)
 	}
 
@@ -3383,12 +3487,22 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 		if n := reg.natHoleRetryCounts[instrKey]; n > 0 {
 			attempts = n
 		}
+		// Measure elapsed time from instruction receipt to first verified
+		// data frame, so the relay can show "time to P2P" to operators.
+		var punchDurationMs uint32
+		if start, ok := reg.natHoleInstrStartTimes[instrKey]; ok {
+			if d := time.Since(start); d > 0 {
+				punchDurationMs = uint32(d.Milliseconds())
+			}
+			delete(reg.natHoleInstrStartTimes, instrKey)
+		}
 		reg.recordNatHolePunchResultLocked(
 			macAddrStr(targetMAC),
 			NatHolePunchState_PunchStateSucceeded,
 			uint32(attempts),
 			"FullDuplex verified by a real data frame",
 			instr.GetBehaviorIndex(),
+			punchDurationMs,
 		)
 		// A pair that has come up should not sit at its longest stalled
 		// backoff if it drops again.
@@ -3480,6 +3594,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 							uint32(retryCount+1),
 							"retrying",
 							currentInstr.GetBehaviorIndex(),
+							0,
 						)
 					}
 				}
@@ -3546,6 +3661,7 @@ func (reg *PeerRegistry) ExecuteNatHolePunch(p2pConn *net.UDPConn) bool {
 							5,
 							"exhausted 5 punch attempts",
 							currentInstr.GetBehaviorIndex(),
+							0,
 						)
 						log.Printf("[P2P] Reported punch FAILED for %s to relay", targetMACStr)
 					}
@@ -3581,13 +3697,32 @@ func (reg *PeerRegistry) HandlePeerInfoList(peerInfoList *PeerInfoList, reset bo
 			log.Printf("resetting peer registry")
 		}
 		if peerInfoList.GetHasOrigin() {
-			me := &Peer{
-				Infos:     *peerInfoList.GetOrigin(),
-				UpdatedAt: time.Now(),
+			origin := peerInfoList.GetOrigin()
+			if reg.Me == nil {
+				reg.Me = &Peer{
+					Infos:     *origin,
+					UpdatedAt: time.Now(),
+				}
+			} else {
+				// Merge: keep the locally-populated Os/Platform/Arch if the
+				// supernode echo did not carry them. The relay's Origin list
+				// is built from our own registrations and may strip these
+				// fields if they were not encoded, but the edge has already
+				// probed them locally.
+				if reg.Me.Infos.Os != "" {
+					origin.Os = reg.Me.Infos.Os
+				}
+				if reg.Me.Infos.Platform != "" {
+					origin.Platform = reg.Me.Infos.Platform
+				}
+				if reg.Me.Infos.Arch != "" {
+					origin.Arch = reg.Me.Infos.Arch
+				}
+				reg.Me.Infos = *origin
+				reg.Me.UpdatedAt = time.Now()
 			}
-			reg.Me = me
 			log.Printf("setting self PeerInfo from Origin Peerlist in supernode")
-			ourMAC = net.HardwareAddr(me.Infos.MacAddr).String()
+			ourMAC = net.HardwareAddr(reg.Me.Infos.MacAddr).String()
 		}
 		for _, info := range peerInfoList.GetPeerInfos() {
 			peerMAC := net.HardwareAddr(info.MacAddr).String()
@@ -3750,8 +3885,8 @@ func (reg *PeerRegistry) ExpireGraceTombstonesForTest(now time.Time) {
 // RecordNatHolePunchResultForTest records a punch result. The caller must hold
 // the registry lock, as the internal caller does. Exported for test/p2p; not
 // part of the supported API.
-func (reg *PeerRegistry) RecordNatHolePunchResultForTest(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32) {
-	reg.recordNatHolePunchResultLocked(peerMAC, state, attempts, detail, behaviorIndex)
+func (reg *PeerRegistry) RecordNatHolePunchResultForTest(peerMAC string, state NatHolePunchState, attempts uint32, detail string, behaviorIndex uint32, punchDurationMs uint32) {
+	reg.recordNatHolePunchResultLocked(peerMAC, state, attempts, detail, behaviorIndex, punchDurationMs)
 }
 
 // NatHolePunchResultsForTest returns the live punch-result map, not a copy, so a

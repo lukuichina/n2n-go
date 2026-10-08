@@ -36,6 +36,7 @@ func TestExhaustedRoundReportsTheRungItActuallyRan(t *testing.T) {
 		5,
 		"exhausted 5 punch attempts",
 		instr.GetBehaviorIndex(),
+		0,
 	)
 	reg.UnlockForTest()
 
@@ -82,11 +83,11 @@ func TestBothWritersProduceTheSameOutcome(t *testing.T) {
 	const mac = "0a:e3:8f:d6:51:a2"
 
 	viaExport := NewPeerRegistry("myc")
-	viaExport.RecordNatHolePunchResult(mac, NatHolePunchState_PunchStateFailed, 5, "d", 4)
+	viaExport.RecordNatHolePunchResult(mac, NatHolePunchState_PunchStateFailed, 5, "d", 4, 0)
 
 	viaLocked := NewPeerRegistry("myc")
 	viaLocked.LockForTest()
-	viaLocked.RecordNatHolePunchResultForTest(mac, NatHolePunchState_PunchStateFailed, 5, "d", 4)
+	viaLocked.RecordNatHolePunchResultForTest(mac, NatHolePunchState_PunchStateFailed, 5, "d", 4, 0)
 	viaLocked.UnlockForTest()
 
 	a := viaExport.NatHolePunchResultsForTest()[mac]

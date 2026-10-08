@@ -71,7 +71,7 @@ func TestPunchResultIsDeliveredOnceThenConsumed(t *testing.T) {
 	reg, targetStr, _ := newPunchResultRegistry(t)
 
 	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateSucceeded, 3,
-		"verified by real data frame from 172.22.1.17:64165", 1)
+		"verified by real data frame from 172.22.1.17:64165", 1, 0)
 
 	first := rowFor(reg.GetPeerP2PInfos(), targetStr)
 	if first == nil {
@@ -101,7 +101,7 @@ func TestPunchResultIsDeliveredOnceThenConsumed(t *testing.T) {
 func TestConsumedPunchResultLeavesTheMap(t *testing.T) {
 	reg, targetStr, _ := newPunchResultRegistry(t)
 
-	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateFailed, 5, "exhausted", 2)
+	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateFailed, 5, "exhausted", 2, 0)
 	if reg.NatHolePunchResultsForTest()[targetStr] == nil {
 		t.Fatal("result missing from map before publish")
 	}
@@ -122,11 +122,11 @@ func TestConsumedPunchResultLeavesTheMap(t *testing.T) {
 func TestFreshResultRecordedAfterConsumptionIsStillDelivered(t *testing.T) {
 	reg, targetStr, _ := newPunchResultRegistry(t)
 
-	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateFailed, 5, "round one", 2)
+	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateFailed, 5, "round one", 2, 0)
 	reg.GetPeerP2PInfos() // consumes round one
 
 	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateInProgress, 1,
-		"punch dispatched to 172.22.1.17:64165", 1)
+		"punch dispatched to 172.22.1.17:64165", 1, 0)
 
 	row := rowFor(reg.GetPeerP2PInfos(), targetStr)
 	if row == nil || row.GetPunchResult() == nil {
@@ -200,7 +200,7 @@ func TestStatusAndOutcomeArriveTogether(t *testing.T) {
 	reg.UnlockForTest()
 
 	reg.RecordNatHolePunchResult(targetStr, NatHolePunchState_PunchStateSucceeded, 3,
-		"verified by real data frame from 172.22.1.17:64165", 1)
+		"verified by real data frame from 172.22.1.17:64165", 1, 0)
 
 	row := rowFor(reg.GetPeerP2PInfos(), targetStr)
 	if row == nil || row.GetPunchResult() == nil {

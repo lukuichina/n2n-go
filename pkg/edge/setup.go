@@ -10,6 +10,8 @@ import (
 	"n2n-go/pkg/transport"
 	"n2n-go/pkg/tuntap"
 	"net"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -389,12 +391,17 @@ func (e *EdgeClient) InitialRegister() error {
 		P2PCapabilities: p2pCaps,
 		NatType:         natType,
 		LastSeen:        uint64(time.Now().Unix()),
+		Os:              getOSPrettyName(),
+		Platform:        runtime.GOARCH,
+		Arch:            runtime.GOARCH,
 	}
 	e.Peers.SetMe(meInfo)
+	log.Printf("DEBUG setup.SetMe called: infos.Os=%q infos.Platform=%q infos.Arch=%q", meInfo.Os, meInfo.Platform, meInfo.Arch)
 	e.Peers.SetPendingChanges()
-	log.Printf("set local reg.Me: MAC=%s VirtualIP=%s PubSocket=%s NatType=%s P2PEndpoint=%s",
+	log.Printf("set local reg.Me: MAC=%s VirtualIP=%s PubSocket=%s NatType=%s P2PEndpoint=%s Os=%s Platform=%s Arch=%s",
 		net.HardwareAddr(macBytes).String(),
-		meInfo.VirtualIp, meInfo.PubSocket, meInfo.NatType, meInfo.P2PEndpoint)
+		meInfo.VirtualIp, meInfo.PubSocket, meInfo.NatType, meInfo.P2PEndpoint,
+		meInfo.Os, meInfo.Platform, meInfo.Arch)
 
 	// Ask for a hole-punch instruction now rather than waiting for the
 	// handleP2PInfos ticker. The Worker drives coordination entirely off
@@ -757,4 +764,28 @@ func (e *EdgeClient) refreshPubSocketFromSTUN(result *STUNResult) string {
 
 	e.cachedPubSocket = result_str
 	return result_str
+}
+
+// getOSPrettyName returns a human-readable OS description.
+// On Linux it reads /etc/os-release PRETTY_NAME.
+// On Windows it reads the registry to get the OS version.
+// On other OSes it falls back to runtime.GOOS.
+func getOSPrettyName() string {
+	if runtime.GOOS == "linux" {
+		data, err := os.ReadFile("/etc/os-release")
+		if err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "PRETTY_NAME=") {
+					v := strings.TrimPrefix(line, "PRETTY_NAME=")
+					v = strings.Trim(v, "\"")
+					return v
+				}
+			}
+		}
+		return "Linux"
+	}
+	if runtime.GOOS == "windows" {
+		return getWindowsVersion()
+	}
+	return runtime.GOOS
 }

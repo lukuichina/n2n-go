@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"n2n-go/pkg/protocol"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -352,9 +353,19 @@ func LoadConfig(parseFlags bool) (*Config, error) {
 
 	// Handle defaults that Viper can't.
 	if cfg.EdgeID == "" {
-		h, err := os.Hostname()
-		if err != nil {
-			return nil, err // We MUST have an edge ID
+		var h string
+		var err error
+		if runtime.GOOS == "windows" {
+			h = getWindowsHostname()
+			if h == "" {
+				// Fallback to os.Hostname()
+				h, err = os.Hostname()
+			}
+		} else {
+			h, err = os.Hostname()
+		}
+		if err != nil || h == "" {
+			return nil, fmt.Errorf("failed to get hostname: %w", err)
 		}
 		cfg.EdgeID = h
 	}

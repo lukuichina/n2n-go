@@ -57,6 +57,7 @@ func (e *EdgeClient) PingPeer(p *p2p.Peer, n int, interval time.Duration, status
 	if p.UpdateP2PStatus(status, checkid) {
 		e.Peers.SetPendingChanges()
 	}
+	p.SetPingSentAt(time.Now())
 	for range n {
 		e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPBestEffort)
 	}
@@ -464,6 +465,10 @@ func (e *EdgeClient) sendKeepAlivePing(p *p2p.Peer) {
 		IsPong:  false,
 		CheckId: checkid,
 	}
+	// Update P2PCheckID so the returning pong is accepted and latency is measured.
+	// For FullDuplex peers UpdateP2PStatus is a no-op (guard prevents demotion).
+	p.UpdateP2PStatus(p2p.P2PAvailable, checkid)
+	p.SetPingSentAt(time.Now())
 	if err := e.SendStruct(pingMsg, net.HardwareAddr(p.Infos.MacAddr), p2p.UDPBestEffort); err != nil {
 		log.Printf("[P2P] keepalive ping to %s failed: %v", net.HardwareAddr(p.Infos.MacAddr).String(), err)
 	}
@@ -803,20 +808,23 @@ func (e *EdgeClient) handlePunchDatagram(n int, addr *net.UDPAddr, buf []byte) {
 	// pair the moment it sees Succeeded, so claiming it on punch evidence
 	// alone is what strands the pair.
 	if p.IsFullDuplex && p.HasVerifiedDataPath() {
+		durationMs := e.Peers.GetPunchDurationMs(mac)
 		e.Peers.RecordNatHolePunchResult(
 			mac,
 			p2p.NatHolePunchState_PunchStateSucceeded, 1,
 			fmt.Sprintf("punch %s observed from %s", map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
-			e.Peers.CurrentNatHoleBehaviorIndex(mac))
-		log.Printf("[P2P] Reported punch SUCCEEDED for %s to relay (from %s %s)", mac,
-			map[bool]string{true: "ACK", false: "packet"}[isAck], addr)
+			e.Peers.CurrentNatHoleBehaviorIndex(mac),
+			durationMs)
+		log.Printf("[P2P] Reported punch SUCCEEDED for %s to relay (from %s %s, duration=%dms)", mac,
+			map[bool]string{true: "ACK", false: "packet"}[isAck], addr, durationMs)
 	} else {
 		e.Peers.RecordNatHolePunchResult(
 			mac,
 			p2p.NatHolePunchState_PunchStateInProgress, 1,
 			fmt.Sprintf("punch %s observed from %s, data path not yet verified",
 				map[bool]string{true: "ACK", false: "packet"}[isAck], addr),
-			e.Peers.CurrentNatHoleBehaviorIndex(mac))
+			e.Peers.CurrentNatHoleBehaviorIndex(mac),
+			0)
 	}
 	// Tell the relay the round advanced, otherwise it keeps pushing fresh
 	// instructions at an already-established tunnel.
@@ -1120,7 +1128,8 @@ func (e *EdgeClient) handleP2P() {
 						mac,
 						p2p.NatHolePunchState_PunchStateSucceeded, 1,
 						fmt.Sprintf("verified by real data frame from %s", addr),
-						e.Peers.CurrentNatHoleBehaviorIndex(mac))
+						e.Peers.CurrentNatHoleBehaviorIndex(mac),
+						p.PunchDurationMs)
 					// Mirror the failure branch (p2p.go), which logs
 					// "Reported punch FAILED ... to relay". Without the
 					// matching success line an edge log cannot show on its
