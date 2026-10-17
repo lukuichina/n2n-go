@@ -563,10 +563,6 @@ func (e *EdgeClient) handleTAP() {
 			log.Printf("Cannot parse link layer frame for Ethertype, skipping: %v", err)
 			continue
 		}
-		if ethertype == tuntap.IPv6 {
-			//log.Printf("(warn) skipping TAP frame with IPv6 Ethertype: %v", ethertype)
-			continue
-		}
 
 		// Log ARP frames (both request/broadcast and reply/unicast)
 		if ethertype == tuntap.EthertypeARP {
