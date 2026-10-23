@@ -369,12 +369,6 @@ func (e *EdgeClient) InitialRegister() error {
 	//
 	// This mirrors FRP's client-side self-registration: the edge knows
 	// its own identity and proactively advertises its NAT-reachability.
-	natType := "unknown"
-	if e.NatFeature != nil {
-		natType = e.NatFeature.NatType
-	} else if e.NatClient != nil {
-		natType = e.NatClient.GetType()
-	}
 	p2pEndpoint := e.P2PEndpointString()
 	p2pCaps := []string{"p2p", "relay"}
 	if e.WSSTransport != nil {
@@ -382,10 +376,21 @@ func (e *EdgeClient) InitialRegister() error {
 	}
 	macBytes := make([]byte, len(e.MACAddr))
 	copy(macBytes, e.MACAddr)
+	// pubSocketString() has the side effect of populating e.NatFeature via STUN
+	// discovery. Call it BEFORE reading natType so the classified NAT type is
+	// available (previously natType was read before STUN ran, yielding "unknown"
+	// or a stale value).
+	pubSocket := e.pubSocketString()
+	natType := "unknown"
+	if e.NatFeature != nil {
+		natType = e.NatFeature.NatType
+	} else if e.NatClient != nil {
+		natType = e.NatClient.GetType()
+	}
 	meInfo := p2p.PeerInfo{
 		VirtualIp:       e.ParsedVirtualIP.String(),
 		MacAddr:         macBytes,
-		PubSocket:       e.pubSocketString(),
+		PubSocket:       pubSocket,
 		Community:       e.Community,
 		P2PEndpoint:     p2pEndpoint,
 		P2PCapabilities: p2pCaps,
@@ -480,7 +485,7 @@ func (e *EdgeClient) RequestRegister() error {
 
 	regReq := &netstruct.RegisterRequest{
 		EdgeMacAddr:        e.MACAddr.String(),
-		EdgeDesc:           e.ID,
+		EdgeDesc: func() string { h, _ := os.Hostname(); if h == "" { return e.ID }; return h }(),
 		CommunityName:      e.Community,
 		EncryptedMachineId: encMachineID,
 		P2PEndpoint:        e.P2PEndpointString(),
