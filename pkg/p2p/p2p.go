@@ -571,6 +571,7 @@ type PeerRegistry struct {
 	// already up and re-arm pairs that just failed. Without this feedback
 	// the relay is blind and either loops forever or gives up too early.
 	natHolePunchResults map[string]*NatHolePunchResult
+	lastPunchResults     map[string]*NatHolePunchResult
 	// natHoleLastRound records when a punch round last reported an outcome
 	// for a peer, and natHoleStallCount how many times
 	// ReArmStalledNatHolePeers has re-armed a pair that never reached a
@@ -677,6 +678,7 @@ func NewPeerRegistry(communityName string) *PeerRegistry {
 		natHoleInstrStartTimes: make(map[string]time.Time),
 		lastNatHoleInstrs:      make(map[string]*NatHoleInstruction),
 		natHolePunchResults:    make(map[string]*NatHolePunchResult),
+		lastPunchResults:     make(map[string]*NatHolePunchResult),
 	}
 }
 
@@ -768,6 +770,12 @@ func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
 			infos.PunchResult = res
 			infos.PunchResultPeerMac = mac
 			delivered = append(delivered, mac)
+		} else if res := reg.lastPunchResults[mac]; res != nil {
+			// Re-send the last punch result so the Worker/relay/UI can
+			// display role, ttl, behaviorIndex, punchDurationMs even after
+			// the punch is complete.
+			infos.PunchResult = res
+			infos.PunchResultPeerMac = mac
 		}
 		// Copy fields that live on Peer but not on PeerInfo so the relay
 		// can display them. Os/Platform/Arch are already on infos via setup;
@@ -798,6 +806,11 @@ func (reg *PeerRegistry) GetPeerP2PInfos() *PeerP2PInfos {
 	if len(delivered) > 0 {
 		reg.peerMu.Lock()
 		for _, mac := range delivered {
+			// Keep a copy so subsequent P2PStateInfo messages still carry
+			// the punch result (role, ttl, behaviorIndex, etc.) for the UI.
+			if r := reg.natHolePunchResults[mac]; r != nil {
+				reg.lastPunchResults[mac] = r
+			}
 			delete(reg.natHolePunchResults, mac)
 		}
 		reg.peerMu.Unlock()
