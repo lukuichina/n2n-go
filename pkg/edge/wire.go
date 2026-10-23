@@ -9,6 +9,7 @@ import (
 	"n2n-go/pkg/protocol/spec"
 	"n2n-go/pkg/tuntap"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -63,6 +64,16 @@ func (e *EdgeClient) UDPAddrWithStrategy(dst net.HardwareAddr, strategy p2p.UDPW
 			if strategy == p2p.UDPEnforceP2P {
 				return nil, false, fmt.Errorf("cannot write packet with UDPEnforceP2P (peer not found) %v", err)
 			}
+			udpSocket = e.SupernodeAddr
+			break
+		}
+
+		// IPv6-only peers (pubSocket starts with 0.0.0.0) cannot receive
+		// P2P datagrams — their UDP socket is not reachable from the
+		// public internet. Always use WSS/relay for them, regardless of
+		// P2P status, to avoid silently dropping packets.
+		if strings.HasPrefix(p.Infos.PubSocket, "0.0.0.0") {
+			log.Printf("[P2P-DEBUG] peer %s is IPv6-only (pubSocket=%s), using WSS relay", dst.String(), p.Infos.PubSocket)
 			udpSocket = e.SupernodeAddr
 			break
 		}
@@ -257,23 +268,34 @@ func (e *EdgeClient) SendVFuze(dst net.HardwareAddr, n int, payload []byte, stra
 	copy(packet[7:], payload)
 	e.PacketsSent.Add(1)
 
-	// P2P direct send takes priority over WSS
+	// P2P direct send takes priority over WSS, but fall back to WSS
+	// when the target is unreachable via P2P (e.g. IPv6-only peers that
+	// cannot receive P2P datagrams). This prevents ARP replies and other
+	// unicast VFuze packets from being silently dropped.
+	log.Printf("SendVFuze: dst=%s isP2P=%v P2PConn=%v WSSTransport=%v", dst.String(), isP2P, e.P2PConn != nil, e.WSSTransport != nil)
+	p2pSent := false
 	if isP2P && e.P2PConn != nil {
 		_, err = e.P2PConn.WriteToUDP(packet[:totalLen], udpSocket)
-		if err != nil {
-			return fmt.Errorf("failed to send P2P VFuze packet: %w", err)
+		if err == nil {
+			p2pSent = true
+		} else {
+			log.Printf("SendVFuze: P2P send to %s failed (%v), falling back to WSS/relay", dst.String(), err)
 		}
-	} else if e.WSSTransport != nil {
-		_, err = e.WSSTransport.Write(packet, nil)
-		if err != nil {
-			return fmt.Errorf("failed to send WSS packet: %w", err)
-		}
-	} else if e.Conn == nil {
-		return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
-	} else {
-		_, err = e.Conn.WriteToUDP(packet[:totalLen], udpSocket)
-		if err != nil {
-			return err
+	}
+	if !p2pSent {
+		if e.WSSTransport != nil {
+			_, err = e.WSSTransport.Write(packet, nil)
+			if err != nil {
+				return fmt.Errorf("failed to send WSS VFuze packet: %w", err)
+			}
+			log.Printf("SendVFuze: WSS write to %s succeeded", dst.String())
+		} else if e.Conn == nil {
+			return fmt.Errorf("no transport available: WSS disconnected and UDP not initialized")
+		} else {
+			_, err = e.Conn.WriteToUDP(packet[:totalLen], udpSocket)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

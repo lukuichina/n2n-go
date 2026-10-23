@@ -575,6 +575,8 @@ func (e *EdgeClient) handleTAP() {
 			}
 		}
 
+		log.Printf("handleTAP: before ProcessOutgoingPayload, ethertype=%s, n=%d", ethertype.String(), n)
+
 		payload, err := e.ProcessOutgoingPayload(frameBuf[:n])
 		if err != nil {
 			log.Printf("Failed to process Outgoing payload %v", err)
@@ -584,21 +586,49 @@ func (e *EdgeClient) handleTAP() {
 		strategy := p2p.UDPEnforceSupernode
 
 		destMAC := tuntap.FastDestination(frameBuf)
+		log.Printf("handleTAP: ethertype=%s destMAC=%s isBroadcast=%v enableVFuze=%v", ethertype.String(), destMAC.String(), tuntap.IsBroadcast(destMAC), e.enableVFuze)
 		// if destMAC is not unicat
 		// 1. We change the strategy to BestEffort so we may try P2P Direct connection
 		// 2. We switch to vFuze packets if enabled by config
-		if !tuntap.IsBroadcast(destMAC) {
-			strategy = p2p.UDPBestEffort
-			if e.enableVFuze {
-				err = e.SendVFuze(destMAC, n, payload, strategy)
-				if err != nil {
-					if strings.Contains(err.Error(), "use of closed network connection") {
-						return
-					}
-					log.Printf("Error sending packet with enableVFuze from TAP: %v", err)
+		// ARP packets (both request and reply) must always go through
+		// ProtoV/relay, never VFuze/P2P, because:
+		// 1. ARP replies to IPv6-only peers via VFuze/P2P are silently
+		//    dropped (P2P doesn't work for IPv6-only targets).
+		// 2. VFuze packets may be dropped by intermediate proxies/tunnels.
+		isARP := (ethertype == tuntap.EthertypeARP)
+
+		// Determine if target peer is reachable via P2P (FullDuplex with verified raddr)
+		useVFuze := false
+		if !tuntap.IsBroadcast(destMAC) && e.enableVFuze && !isARP {
+			if p, err := e.Peers.GetPeer(destMAC.String()); err == nil && p != nil {
+				// Only use VFuze/P2P if peer is FullDuplex with verified raddr
+				// AND not IPv6-only
+				if p.P2PStatus == p2p.P2PFullDuplex && p.GetP2PRaddr() != "" &&
+					!strings.HasPrefix(p.Infos.PubSocket, "0.0.0.0") {
+					useVFuze = true
 				}
-				continue
 			}
+		}
+
+		// For IPv6-only peers, ARP packets, or peers without verified P2P,
+		// always use ProtoV/relay (VFuze packets may be dropped by
+		// intermediate proxies/tunnels, and P2P doesn't work for them)
+		if !useVFuze {
+			if !tuntap.IsBroadcast(destMAC) {
+				log.Printf("handleTAP: using ProtoV/relay for %s (useVFuze=%v)", destMAC, useVFuze)
+			}
+		} else {
+			log.Printf("handleTAP: sending VFuze to %s (enableVFuze=true, P2P FullDuplex)", destMAC)
+			err = e.SendVFuze(destMAC, n, payload, p2p.UDPBestEffort)
+			if err != nil {
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					return
+				}
+				log.Printf("Error sending packet with enableVFuze from TAP: %v", err)
+			} else {
+				log.Printf("handleTAP: SendVFuze to %s succeeded", destMAC)
+			}
+			continue
 		}
 
 		err = e.WritePacket(spec.TypeData, destMAC, payload, strategy)
