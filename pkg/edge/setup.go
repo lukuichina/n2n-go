@@ -10,6 +10,8 @@ import (
 	"n2n-go/pkg/transport"
 	"n2n-go/pkg/tuntap"
 	"net"
+	"crypto/md5"
+	"encoding/hex"
 	"os"
 	"runtime"
 	"strconv"
@@ -485,7 +487,18 @@ func (e *EdgeClient) RequestRegister() error {
 
 	regReq := &netstruct.RegisterRequest{
 		EdgeMacAddr:        e.MACAddr.String(),
-		EdgeDesc: func() string { h, _ := os.Hostname(); if h == "" { return e.ID }; return h }(),
+		EdgeDesc: func() string {
+			h, _ := os.Hostname()
+			if h == "" { h = e.ID }
+			md5str := ""
+			if exe, err := os.Executable(); err == nil {
+				if b, err := os.ReadFile(exe); err == nil {
+					sum := md5.Sum(b)
+					md5str = hex.EncodeToString(sum[:])
+				}
+			}
+			return h + "|" + "dev" + "|" + md5str
+		}(),
 		CommunityName:      e.Community,
 		EncryptedMachineId: encMachineID,
 		P2PEndpoint:        e.P2PEndpointString(),

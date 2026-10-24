@@ -96,6 +96,8 @@ type RegisterRequest struct {
 	// in a fixed order by the punching side (assisted first), not as an
 	// unordered set.
 	AssistedSockets []string `protobuf:"bytes,10,rep,name=assisted_sockets,json=assistedSockets,proto3" json:"assisted_sockets,omitempty"`
+	EdgeVersion     string   `protobuf:"bytes,11,opt,name=edge_version,json=edgeVersion,proto3" json:"edge_version,omitempty"`
+	EdgeMD5         string   `protobuf:"bytes,12,opt,name=edge_md5,json=edgeMD5,proto3" json:"edge_md5,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
