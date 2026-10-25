@@ -18,13 +18,13 @@ const (
 	// instruction. Observed on 2026-09-30: the edge announced for 24s, gave
 	// up, and the pair sat silent for 4m38s more until the relay's periodic
 	// save alarm happened to fire.
-	punchRequestInitialWindow = 24 * time.Second
+	punchRequestInitialWindow = 60 * time.Second
 
 	// Ceiling for the slowed cadence. The relay's worst-case per-pair backoff
 	// is 300s, so announcing at 30s still leaves several chances inside it
 	// while keeping a permanently-unpunchable pair from being announced at a
 	// meaningful rate.
-	punchRequestMaxPeriod = 30 * time.Second
+	punchRequestMaxPeriod = 60 * time.Second
 )
 
 // requestNatHoleAfterRegister re-announces our P2P reachability to the supernode

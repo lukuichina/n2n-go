@@ -1318,18 +1318,35 @@ func (e *EdgeClient) handleWSS() {
 		// Set a read deadline to detect half-open/disconnected WebSocket
 		// connections (e.g. when the supernode/Worker hot-reloads and
 		// drops the connection without sending a close frame).
-		e.WSSTransport.SetReadDeadline(time.Now().Add(120 * time.Second))
+		e.WSSTransport.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		n, addr, err := e.WSSTransport.Read(packetBuf)
 		if err != nil {
 			if strings.Contains(err.Error(), "use of closed network connection") {
 				return
 			}
+			// Classify the error for better diagnostics.
+			var errType string
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("WSS read deadline exceeded (20s) — connection likely dead, reconnecting...")
+				errType = "read-timeout"
+				log.Printf("WSS read deadline exceeded (30s) — connection likely dead, reconnecting...")
+			} else if strings.Contains(err.Error(), "502") {
+				errType = "bad-gateway"
+				log.Printf("WSS 502 Bad Gateway — supernode/Worker may be restarting, reconnecting...")
+			} else if strings.Contains(err.Error(), "EOF") {
+				errType = "eof"
+				log.Printf("WSS connection closed by peer (EOF) — reconnecting...")
+			} else if strings.Contains(err.Error(), "connection reset") {
+				errType = "conn-reset"
+				log.Printf("WSS connection reset by peer — reconnecting...")
+			} else if strings.Contains(err.Error(), "close 1006") {
+				errType = "abnormal-closure"
+				log.Printf("WSS abnormal closure (1006) — reconnecting...")
 			} else {
-				log.Printf("WSS read error: %v", err)
+				errType = "unknown"
+				log.Printf("WSS read error (%s): %v", errType, err)
 			}
+			_ = errType
 			// Close and discard old transport to avoid repeated reads on failed connection
 			oldTransport := e.WSSTransport
 			e.WSSTransport = nil
