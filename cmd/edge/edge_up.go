@@ -149,10 +149,26 @@ var (
 				Aliases: []string{"R"},
 				Usage:   "Remote port forward: listen on this edge's own virtual IP as `VIP:PORT:TARGET:TPORT[/proto]` and relay to TARGET:TPORT, which is normally a service outside the overlay. Repeatable. Peers reach the service at this edge's 100.64.0.x",
 			},
+			&cli.BoolFlag{
+				Name:  "ssh",
+				Usage: "Start an SSH server on the virtual IP after setup (password + key auth, shell/exec/scp/sftp)",
+			},
+			&cli.IntFlag{
+				Name:  "ssh-port",
+				Value: 22,
+				Usage: "SSH server port (default 22)",
+			},
 			&cli.StringFlag{
-				Name:  "socks5-policy",
-				Value: "overlay",
-				Usage: "Which destinations the proxy may reach: `overlay` (default) only serves addresses inside the TAP's own subnet, `any` also serves the internet through this host. `any` turns the edge into an egress proxy, and on a non-loopback address without credentials it is an open relay",
+				Name:  "ssh-authorized-keys",
+				Usage: "Path to authorized_keys file for SSH key auth",
+			},
+			&cli.BoolFlag{
+				Name:  "ssh-allow-password",
+				Usage: "Allow password authentication for SSH",
+			},
+			&cli.StringFlag{
+				Name:  "ssh-password",
+				Usage: "Password for SSH password authentication",
 			},
 			&cli.DurationFlag{
 				Name:  "socks5-idle-timeout",
@@ -429,6 +445,21 @@ func up(c *cli.Context) {
 		os.Exit(127)
 	}
 	log.Printf("edge setup successful")
+
+	// Start SSH server if requested.
+	if c.Bool("ssh") {
+		vip := strings.Split(client.VirtualIP, "/")[0]
+		if vip == "" {
+			log.Printf("SSH requested but no virtual IP assigned yet")
+		} else {
+			err := StartSSHServer(vip, c.Int("ssh-port"), c.String("ssh-authorized-keys"), c.Bool("ssh-allow-password"), c.String("ssh-password"))
+			if err != nil {
+				log.Printf("SSH server failed to start: %v", err)
+			} else {
+				log.Printf("SSH server started on %s:%d", vip, c.Int("ssh-port"))
+			}
+		}
+	}
 	udpPort := cfg.LocalPort
 	if udpPort == 0 {
 		if client.Conn != nil {
