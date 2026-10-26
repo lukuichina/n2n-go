@@ -94,6 +94,76 @@ sudo ./edge up -c acme -s wss://host/n2n -k mysecret -C -l
 sudo ./edge up -c acme -s wss://host/n2n -F=false -l
 ```
 
+## SSH Access
+
+n2n-go includes a built-in SSH server and client for accessing peer edges over the virtual network.
+
+### SSH Server (sshd)
+
+Start an SSH server on the virtual IP:
+
+```bash
+# Standalone (positional: [user:]password@bind:port, user is placeholder)
+sudo ./edge sshd mysecret@0.0.0.0:2222
+
+# Standalone (flags)
+sudo ./edge sshd -p 2222 --allow-password --password mysecret
+
+# Or integrated with edge up
+sudo ./edge up -c acme -s wss://host/n2n -l --ssh --ssh-port 2222 --ssh-allow-password --ssh-password mysecret
+```
+
+When using the positional format `password@bind:port`, password auth is automatically enabled. The `user` part (before `:`) is a placeholder and ignored.
+
+When `--ssh-password` is specified, `--ssh-allow-password` is automatically enabled.
+
+**sshd flags:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-p` | Port to listen on | `22` |
+| `--authorized-keys` | Path to authorized_keys file | - |
+| `--allow-password` | Allow password authentication | `false` |
+| `--password` | Password for password authentication | - |
+| `--bind` | Bind address | `0.0.0.0` |
+
+Supports password and public key authentication, shell, exec, scp, and sftp.
+
+### SSH Client
+
+```bash
+# Interactive shell
+./edge ssh root@100.64.0.3 -p 2222 -w mysecret
+
+# SSH (interactive shell or remote command)
+./edge ssh [user@]host[:port] [command]
+
+# SCP file transfer
+./edge scp source dest
+
+# SFTP (interactive or command execution)
+./edge sftp [user@]host[:port] [command]
+./edge sftp source dest
+```
+
+**ssh flags:**
+
+| Flag | Alias | Description | Default |
+|------|-------|-------------|---------|
+| `--user` | `-l` | SSH username | `root` |
+| `--port` | `-p` | SSH port | `22` |
+| `--password` | `-w` | SSH password | - |
+
+**scp flags:**
+
+| Flag | Alias | Description | Default |
+|------|-------|-------------|---------|
+| `--user` | `-l` | SSH username | `root` |
+| `--port` | `-P` | SSH port | `22` |
+| `--password` | `-w` | SSH password | - |
+
+Supports `[user@]host[:port]` format for remote paths.
+
 ## Configuration
 
 Both the edge and supernode components can be configured with YAML files, environment variables, or command-line flags.

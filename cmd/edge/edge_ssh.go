@@ -22,9 +22,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var sshCommand = &cli.Command{
-	Name:  "ssh",
+var sshdCommand = &cli.Command{
+	Name:  "sshd",
 	Usage: "Run SSH server (password + key auth, shell/exec/scp/sftp)",
+	ArgsUsage: "[user:]password@bind:port",
 	Flags: []cli.Flag{
 		&cli.IntFlag{Name: "port", Aliases: []string{"p"}, Value: 22, Usage: "Port to listen on"},
 		&cli.StringFlag{Name: "authorized-keys", Usage: "Path to authorized_keys file"},
@@ -32,15 +33,60 @@ var sshCommand = &cli.Command{
 		&cli.StringFlag{Name: "password", Usage: "Password for password authentication"},
 		&cli.StringFlag{Name: "bind", Usage: "Bind address (default 0.0.0.0)"},
 	},
-	Action: sshCmd,
+	Action: sshdCmd,
 }
 
-func sshCmd(c *cli.Context) error {
+func sshdCmd(c *cli.Context) error {
 	port := c.Int("port")
 	bind := c.String("bind")
 	authorizedKeysPath := c.String("authorized-keys")
 	allowPassword := c.Bool("allow-password")
 	serverPassword := c.String("password")
+
+	// Support positional arg: [user:]pwd@host:port
+	// user is a placeholder and ignored
+	if c.Args().Len() > 0 {
+		spec := c.Args().First()
+		// Parse user:pwd@host:port
+		if idx := strings.Index(spec, "@"); idx != -1 {
+			// user:pwd part
+			userPwd := spec[:idx]
+			hostPort := spec[idx+1:]
+			// user is placeholder, password is after :
+			if colonIdx := strings.Index(userPwd, ":"); colonIdx != -1 {
+				serverPassword = userPwd[colonIdx+1:]
+			} else {
+				serverPassword = userPwd
+			}
+			// Parse host:port
+			if colonIdx := strings.LastIndex(hostPort, ":"); colonIdx != -1 {
+				fmt.Sscanf(hostPort[colonIdx+1:], "%d", &port)
+				bind = hostPort[:colonIdx]
+			} else {
+				bind = hostPort
+			}
+			if bind == "" {
+				bind = "0.0.0.0"
+			}
+			allowPassword = true
+		} else {
+			// Just host:port or port
+			if colonIdx := strings.LastIndex(spec, ":"); colonIdx != -1 {
+				fmt.Sscanf(spec[colonIdx+1:], "%d", &port)
+				bind = spec[:colonIdx]
+			} else {
+				// Just a port number
+				fmt.Sscanf(spec, "%d", &port)
+			}
+			if bind == "" {
+				bind = "0.0.0.0"
+			}
+		}
+	}
+
+	if bind == "" {
+		bind = "0.0.0.0"
+	}
 
 	err := StartSSHServer(bind, port, authorizedKeysPath, allowPassword, serverPassword)
 	if err != nil {

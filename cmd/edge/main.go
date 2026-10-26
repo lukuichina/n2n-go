@@ -25,7 +25,10 @@ func main() {
 			logsCommand,
 			upCommand,
 			ctlCommand,
-			sshCommand,
+			sshdCommand,
+			sshClientCommand,
+			scpClientCommand,
+			sftpClientCommand,
 		},
 	}
 

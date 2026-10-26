@@ -452,7 +452,12 @@ func up(c *cli.Context) {
 		if vip == "" {
 			log.Printf("SSH requested but no virtual IP assigned yet")
 		} else {
-			err := StartSSHServer(vip, c.Int("ssh-port"), c.String("ssh-authorized-keys"), c.Bool("ssh-allow-password"), c.String("ssh-password"))
+			allowPassword := c.Bool("ssh-allow-password")
+			sshPassword := c.String("ssh-password")
+			if sshPassword != "" {
+				allowPassword = true
+			}
+			err := StartSSHServer(vip, c.Int("ssh-port"), c.String("ssh-authorized-keys"), allowPassword, sshPassword)
 			if err != nil {
 				log.Printf("SSH server failed to start: %v", err)
 			} else {
