@@ -94,7 +94,7 @@ var rawRecvLoggerForP2P = &RawRecvLogger{}
 // rule in RawRecvLogger.
 func LogRawRecv(addr net.Addr, n int, first byte) {
 	if rawRecvLoggerForP2P.ShouldLog(addr, n, first) {
-		log.Printf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, first)
+		log.Debug().Msgf("[P2P-DEBUG] raw recv %d bytes from %v, first byte=0x%02x", n, addr, first)
 	}
 }
 

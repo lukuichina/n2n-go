@@ -70,7 +70,10 @@ func (e *EdgeClient) finishNatHoleAddrRefresh(probe *PendingProbe) {
 		// indistinguishable from one that never ran -- and during the
 		// 2026-10-01 deadlock that ambiguity cost hours of chasing a
 		// missing log line instead of a blocked goroutine.
-		log.Printf("[P2P] public mapping confirmed %s", after)
+		if !e.mappingConfirmedLogged {
+			e.mappingConfirmedLogged = true
+			log.Printf("[P2P] public mapping confirmed %s", after)
+		}
 		return
 	}
 

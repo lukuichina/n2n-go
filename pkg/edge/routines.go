@@ -575,7 +575,7 @@ func (e *EdgeClient) handleTAP() {
 			}
 		}
 
-		log.Printf("handleTAP: before ProcessOutgoingPayload, ethertype=%s, n=%d", ethertype.String(), n)
+		log.Debug().Msgf("handleTAP: before ProcessOutgoingPayload, ethertype=%s, n=%d", ethertype.String(), n)
 
 		payload, err := e.ProcessOutgoingPayload(frameBuf[:n])
 		if err != nil {
@@ -586,7 +586,7 @@ func (e *EdgeClient) handleTAP() {
 		strategy := p2p.UDPEnforceSupernode
 
 		destMAC := tuntap.FastDestination(frameBuf)
-		log.Printf("handleTAP: ethertype=%s destMAC=%s isBroadcast=%v enableVFuze=%v", ethertype.String(), destMAC.String(), tuntap.IsBroadcast(destMAC), e.enableVFuze)
+		log.Debug().Msgf("handleTAP: ethertype=%s destMAC=%s isBroadcast=%v enableVFuze=%v", ethertype.String(), destMAC.String(), tuntap.IsBroadcast(destMAC), e.enableVFuze)
 		// if destMAC is not unicat
 		// 1. We change the strategy to BestEffort so we may try P2P Direct connection
 		// 2. We switch to vFuze packets if enabled by config
@@ -595,7 +595,13 @@ func (e *EdgeClient) handleTAP() {
 		// 1. ARP replies to IPv6-only peers via VFuze/P2P are silently
 		//    dropped (P2P doesn't work for IPv6-only targets).
 		// 2. VFuze packets may be dropped by intermediate proxies/tunnels.
+		// Skip multicast traffic (mDNS, SSDP, LLMNR, etc.) that floods
+		// the tunnel on Windows. Only ARP and unicast/broadcast are relayed.
 		isARP := (ethertype == tuntap.EthertypeARP)
+		isMulticast := len(destMAC) >= 1 && (destMAC[0]&0x01) == 0x01
+		if isMulticast && !isARP && !tuntap.IsBroadcast(destMAC) {
+			continue
+		}
 
 		// Determine if target peer is reachable via P2P (FullDuplex with verified raddr)
 		useVFuze := false
@@ -618,7 +624,7 @@ func (e *EdgeClient) handleTAP() {
 				log.Printf("handleTAP: using ProtoV/relay for %s (useVFuze=%v)", destMAC, useVFuze)
 			}
 		} else {
-			log.Printf("handleTAP: sending VFuze to %s (enableVFuze=true, P2P FullDuplex)", destMAC)
+			log.Debug().Msgf("handleTAP: sending VFuze to %s (enableVFuze=true, P2P FullDuplex)", destMAC)
 			err = e.SendVFuze(destMAC, n, payload, p2p.UDPBestEffort)
 			if err != nil {
 				if strings.Contains(err.Error(), "use of closed network connection") {
@@ -1064,7 +1070,7 @@ func (e *EdgeClient) handleP2P() {
 
 		rawMsg, err := protocol.NewRawMessage(packetBuf[:n], addr)
 		if err != nil {
-			log.Printf("P2P: error while parsing UDP Packet: %v", err)
+			log.Debug().Msgf("P2P: error while parsing UDP Packet: %v", err)
 			continue
 		}
 

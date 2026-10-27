@@ -43,6 +43,7 @@ type EdgeClient struct {
 	// would spawn a new goroutine every tick while the previous one is still
 	// waiting.
 	natHolePunching atomic.Bool
+	mappingConfirmedLogged bool
 	// unknownPunchAck tracks the last time we answered a punch from a source
 	// that matches no known peer. The punch magic is four public bytes, so
 	// without a throttle any host that learns the socket address could use it
