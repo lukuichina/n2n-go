@@ -249,7 +249,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username s
 	defer channel.Close()
 	shell := os.Getenv("SHELL")
 	if shell == "" {
-		shell = "/bin/sh"
+		shell = defaultShell()
 	}
 	cols, rows := uint32(80), uint32(40)
 
@@ -290,7 +290,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username s
 			_ = ssh.Unmarshal(req.Payload, &payload)
 			log.Printf("SSH: exec request: %s", payload.Command)
 			go func() {
-				cmd := exec.Command("/bin/sh", "-c", payload.Command)
+				cmd := shellExecCommand(payload.Command)
 				if u, err := user.Lookup(username); err == nil {
 					setCmdUser(cmd, u, username)
 				}
@@ -304,8 +304,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username s
 				}
 				_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(exitCode)}))
 				_ = channel.Close()
-				conn.Close()
-				log.Printf("SSH: exec channel and connection closed")
+				log.Printf("SSH: exec channel closed")
 			}()
 			req.Reply(true, nil)
 		default:
