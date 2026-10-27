@@ -100,7 +100,7 @@ func StartSSHServer(virtualIP string, port int, authorizedKeysPath string, allow
 	if bind == "" {
 		bind = "0.0.0.0"
 	}
-	listenAddr := fmt.Sprintf("%s:%d", bind, port)
+	listenAddr := net.JoinHostPort(bind, fmt.Sprintf("%d", port))
 
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: keyAuthCallback(authorizedKeysPath),

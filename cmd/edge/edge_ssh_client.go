@@ -9,12 +9,59 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pkg/sftp"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
+
+// loadPrivateKey reads an SSH private key file and returns an AuthMethod.
+func loadPrivateKey(path string) (ssh.AuthMethod, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key file: %w", err)
+	}
+	signer, err := ssh.ParsePrivateKey(data)
+	if err != nil {
+		// Try with passphrase prompt
+		if _, ok := err.(*ssh.PassphraseMissingError); ok {
+			fmt.Fprintf(os.Stderr, "Enter passphrase for key %s: ", path)
+			pass, err := term.ReadPassword(int(os.Stdin.Fd()))
+			if err != nil {
+				return nil, err
+			}
+			fmt.Fprintln(os.Stderr)
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(data, pass)
+			if err != nil {
+				return nil, fmt.Errorf("parse key: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("parse key: %w", err)
+		}
+	}
+	return ssh.PublicKeys(signer), nil
+}
+
+// buildAuthMethods constructs SSH auth methods from password and/or identity file.
+func buildAuthMethods(password, identityPath string) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
+	if identityPath != "" {
+		m, err := loadPrivateKey(identityPath)
+		if err != nil {
+			return nil, err
+		}
+		methods = append(methods, m)
+	}
+	if password != "" {
+		methods = append(methods, ssh.Password(password))
+	}
+	if len(methods) == 0 {
+		return nil, fmt.Errorf("no authentication method provided (use -w password or -i identity)")
+	}
+	return methods, nil
+}
 
 // sshClientCommand implements `edge ssh [user@]host[:port] [command]`
 var sshClientCommand = &cli.Command{
@@ -25,6 +72,8 @@ var sshClientCommand = &cli.Command{
 		&cli.StringFlag{Name: "user", Aliases: []string{"l"}, Value: "root", Usage: "SSH username"},
 		&cli.IntFlag{Name: "port", Aliases: []string{"p"}, Value: 22, Usage: "SSH port"},
 		&cli.StringFlag{Name: "password", Aliases: []string{"w"}, Usage: "SSH password"},
+		&cli.StringFlag{Name: "identity", Aliases: []string{"i"}, Usage: "Path to SSH private key file"},
+		&cli.IntFlag{Name: "keepalive", Value: 30, Usage: "Keepalive interval in seconds (0 to disable)"},
 	},
 	Action: sshClientCmd,
 }
@@ -70,16 +119,20 @@ func sshClientCmd(c *cli.Context) error {
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
 	defer conn.Close()
 
+	authMethods, err := buildAuthMethods(password, c.String("identity"))
+	if err != nil {
+		return err
+	}
 	cfg := &ssh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * 1e9,
 	}
@@ -129,6 +182,27 @@ func sshClientCmd(c *cli.Context) error {
 	go io.Copy(os.Stdout, stdout)
 	go io.Copy(os.Stderr, stderr)
 
+	// Handle terminal resize in interactive mode
+	if command == "" {
+		fd := int(os.Stdin.Fd())
+		go func() {
+			// Poll for terminal size changes
+			lastW, lastH, _ := term.GetSize(fd)
+			for {
+				w, h, err := term.GetSize(fd)
+				if err != nil {
+					return
+				}
+				if w != lastW || h != lastH {
+					session.WindowChange(h, w)
+					lastW, lastH = w, h
+				}
+				// Sleep briefly
+				time.Sleep(200 * time.Millisecond)
+			}
+		}()
+	}
+
 	return session.Wait()
 }
 
@@ -141,6 +215,8 @@ var scpClientCommand = &cli.Command{
 		&cli.StringFlag{Name: "user", Aliases: []string{"l"}, Value: "root", Usage: "SSH username"},
 		&cli.IntFlag{Name: "port", Aliases: []string{"P"}, Value: 22, Usage: "SSH port"},
 		&cli.StringFlag{Name: "password", Aliases: []string{"w"}, Usage: "SSH password"},
+		&cli.StringFlag{Name: "identity", Aliases: []string{"i"}, Usage: "Path to SSH private key file"},
+		&cli.BoolFlag{Name: "recursive", Aliases: []string{"r"}, Usage: "Recursively copy entire directories"},
 	},
 	Action: scpClientCmd,
 }
@@ -225,16 +301,20 @@ func scpClientCmd(c *cli.Context) error {
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
 	defer conn.Close()
 
+	authMethods, err := buildAuthMethods(password, c.String("identity"))
+	if err != nil {
+		return err
+	}
 	cfg := &ssh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
@@ -250,10 +330,20 @@ func scpClientCmd(c *cli.Context) error {
 	}
 	defer sftpClient.Close()
 
+	recursive := c.Bool("recursive")
 	if download {
+		// Check if remote path is a directory
+		remoteInfo, err := sftpClient.Stat(remotePath)
+		isDir := err == nil && remoteInfo.IsDir()
+		if isDir && !recursive {
+			return fmt.Errorf("remote path is a directory; use -r for recursive copy")
+		}
+		if isDir {
+			// Recursive download
+			return scpDownloadDir(sftpClient, remotePath, localPath)
+		}
 		// If localPath is a directory, use remote filename
 		if info, err := os.Stat(localPath); err == nil && info.IsDir() {
-			// Extract filename from remote path
 			parts := strings.Split(remotePath, "/")
 			name := parts[len(parts)-1]
 			if strings.HasSuffix(localPath, "/") {
@@ -267,33 +357,146 @@ func scpClientCmd(c *cli.Context) error {
 			return fmt.Errorf("open remote: %w", err)
 		}
 		defer srcFile.Close()
+		fi, _ := srcFile.Stat()
 		dstFile, err := os.Create(localPath)
 		if err != nil {
 			return fmt.Errorf("create local: %w", err)
 		}
 		defer dstFile.Close()
-		n, err := io.Copy(dstFile, srcFile)
+		pw := &progressWriter{total: fi.Size(), label: remoteSpec}
+		n, err := io.Copy(io.MultiWriter(dstFile, pw), srcFile)
+		fmt.Fprintln(os.Stderr)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("%s -> %s (%d bytes)\n", remoteSpec, localPath, n)
 	} else {
+		// Check if local path is a directory
+		localInfo, err := os.Stat(localPath)
+		isDir := err == nil && localInfo.IsDir()
+		if isDir && !recursive {
+			return fmt.Errorf("local path is a directory; use -r for recursive copy")
+		}
+		if isDir {
+			// Recursive upload
+			return scpUploadDir(sftpClient, localPath, remotePath)
+		}
 		srcFile, err := os.Open(localPath)
 		if err != nil {
 			return fmt.Errorf("open local: %w", err)
 		}
 		defer srcFile.Close()
+		fi, _ := srcFile.Stat()
 		dstFile, err := sftpClient.Create(remotePath)
 		if err != nil {
 			return fmt.Errorf("create remote: %w", err)
 		}
 		defer dstFile.Close()
-		n, err := io.Copy(dstFile, srcFile)
+		pw := &progressWriter{total: fi.Size(), label: localPath}
+		n, err := io.Copy(io.MultiWriter(dstFile, pw), srcFile)
+		fmt.Fprintln(os.Stderr)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("%s -> %s (%d bytes)\n", localPath, remoteSpec, n)
 	}
+	return nil
+}
+
+// progressWriter wraps an io.Writer to display transfer progress.
+type progressWriter struct {
+	total   int64
+	written int64
+	label   string
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n := len(b)
+	p.written += int64(n)
+	if p.total > 0 {
+		pct := float64(p.written) / float64(p.total) * 100
+		fmt.Fprintf(os.Stderr, "\r%s: %d/%d bytes (%.1f%%)", p.label, p.written, p.total, pct)
+	} else {
+		fmt.Fprintf(os.Stderr, "\r%s: %d bytes", p.label, p.written)
+	}
+	return n, nil
+}
+
+// scpDownloadDir recursively downloads a remote directory.
+func scpDownloadDir(sftpClient *sftp.Client, remoteDir, localDir string) error {
+	if err := os.MkdirAll(localDir, 0755); err != nil {
+		return err
+	}
+	entries, err := sftpClient.ReadDir(remoteDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		remotePath := remoteDir + "/" + entry.Name()
+		localPath := localDir + "/" + entry.Name()
+		if entry.IsDir() {
+			if err := scpDownloadDir(sftpClient, remotePath, localPath); err != nil {
+				return err
+			}
+		} else {
+			srcFile, err := sftpClient.Open(remotePath)
+			if err != nil {
+				return err
+			}
+			dstFile, err := os.Create(localPath)
+			if err != nil {
+				srcFile.Close()
+				return err
+			}
+			n, err := io.Copy(dstFile, srcFile)
+			srcFile.Close()
+			dstFile.Close()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s -> %s (%d bytes)\n", remotePath, localPath, n)
+		}
+	}
+	fmt.Printf("directory %s downloaded\n", remoteDir)
+	return nil
+}
+
+// scpUploadDir recursively uploads a local directory.
+func scpUploadDir(sftpClient *sftp.Client, localDir, remoteDir string) error {
+	if err := sftpClient.MkdirAll(remoteDir); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(localDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		localPath := localDir + "/" + entry.Name()
+		remotePath := remoteDir + "/" + entry.Name()
+		if entry.IsDir() {
+			if err := scpUploadDir(sftpClient, localPath, remotePath); err != nil {
+				return err
+			}
+		} else {
+			srcFile, err := os.Open(localPath)
+			if err != nil {
+				return err
+			}
+			dstFile, err := sftpClient.Create(remotePath)
+			if err != nil {
+				srcFile.Close()
+				return err
+			}
+			n, err := io.Copy(dstFile, srcFile)
+			srcFile.Close()
+			dstFile.Close()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s -> %s (%d bytes)\n", localPath, remotePath, n)
+		}
+	}
+	fmt.Printf("directory %s uploaded\n", localDir)
 	return nil
 }
 
@@ -306,6 +509,7 @@ var sftpClientCommand = &cli.Command{
 		&cli.StringFlag{Name: "user", Aliases: []string{"l"}, Value: "root", Usage: "SSH username"},
 		&cli.IntFlag{Name: "port", Aliases: []string{"P"}, Value: 22, Usage: "SSH port"},
 		&cli.StringFlag{Name: "password", Aliases: []string{"w"}, Usage: "SSH password"},
+		&cli.StringFlag{Name: "identity", Aliases: []string{"i"}, Usage: "Path to SSH private key file"},
 	},
 	Action: sftpClientCmd,
 }
@@ -355,16 +559,20 @@ func sftpClientCmd(c *cli.Context) error {
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
 	defer conn.Close()
 
+	authMethods, err := buildAuthMethods(password, c.String("identity"))
+	if err != nil {
+		return err
+	}
 	cfg := &ssh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
