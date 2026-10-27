@@ -1318,7 +1318,7 @@ func (e *EdgeClient) handleWSS() {
 		// Set a read deadline to detect half-open/disconnected WebSocket
 		// connections (e.g. when the supernode/Worker hot-reloads and
 		// drops the connection without sending a close frame).
-		e.WSSTransport.SetReadDeadline(time.Now().Add(30 * time.Second))
+		e.WSSTransport.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 		n, addr, err := e.WSSTransport.Read(packetBuf)
 		if err != nil {
@@ -1329,7 +1329,7 @@ func (e *EdgeClient) handleWSS() {
 			var errType string
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				errType = "read-timeout"
-				log.Printf("WSS read deadline exceeded (30s) — connection likely dead, reconnecting...")
+				log.Printf("WSS read deadline exceeded (90s) — connection likely dead, reconnecting...")
 			} else if strings.Contains(err.Error(), "502") {
 				errType = "bad-gateway"
 				log.Printf("WSS 502 Bad Gateway — supernode/Worker may be restarting, reconnecting...")

@@ -39,8 +39,8 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			PreferIPv6:   cfg.PreferIPv6,
 			URL:          cfg.SupernodeURL,
 			SkipVerify:   true, // TODO: Make this configurable
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
+			ReadTimeout:  90 * time.Second,
+			WriteTimeout: 90 * time.Second,
 		}
 
 		wsTransport, err = transport.NewWSSTransport(wsConfig)
@@ -102,8 +102,8 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			PreferIPv6:   cfg.PreferIPv6,
 			URL:          cfg.SupernodeURL,
 			SkipVerify:   true, // TODO: Make this configurable
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
+			ReadTimeout:  90 * time.Second,
+			WriteTimeout: 90 * time.Second,
 		}
 
 		if cfg.WSSCert != "" && cfg.WSSKey != "" {
