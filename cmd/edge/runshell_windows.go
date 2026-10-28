@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
+	"strings"
 
 	"n2n-go/pkg/log"
 
@@ -15,15 +17,114 @@ import (
 
 func startInteractiveShell(channel ssh.Channel, shell, username string, cols, rows uint32) {
 	log.Printf("SSH: shell request for user=%s", username)
-	cmd := exec.Command(shell)
-	if u, err := user.Lookup(username); err == nil {
-		setCmdUser(cmd, u, username)
+	interactiveShellWindows(channel, username)
+}
+
+func interactiveShellWindows(channel ssh.Channel, username string) {
+	cwd, _ := os.Getwd()
+	if cwd == "" {
+		cwd = "C:\\"
 	}
-	cmd.Env = append(os.Environ(), fmt.Sprintf("COLUMNS=%d", cols), fmt.Sprintf("LINES=%d", rows), "TERM=xterm-256color")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = channel, channel, channel
-	err := cmd.Run()
-	log.Printf("SSH: shell exited: %v", err)
-	exitCode := getExitCode(err)
+
+	reader := bufio.NewReader(channel)
+
+	for {
+		// Print prompt
+		fmt.Fprintf(channel, "%s> ", cwd)
+
+		// Read input byte by byte until Enter
+		var line []byte
+		for {
+			b, err := reader.ReadByte()
+			if err != nil {
+				// Connection closed
+				goto done
+			}
+			if b == '\n' || b == '\r' {
+				// Echo newline
+				fmt.Fprint(channel, "\r\n")
+				break
+			}
+			if b == 0x03 { // Ctrl+C
+				fmt.Fprint(channel, "^C\r\n")
+				line = nil
+				break
+			}
+			if b == 0x04 { // Ctrl+D
+				goto done
+			}
+			if b == 0x7f || b == 0x08 { // Backspace
+				if len(line) > 0 {
+					line = line[:len(line)-1]
+					fmt.Fprint(channel, "\b \b")
+				}
+				continue
+			}
+			// Echo character
+			channel.Write([]byte{b})
+			line = append(line, b)
+		}
+
+		if line == nil {
+			continue
+		}
+
+		cmdLine := strings.TrimSpace(string(line))
+		if cmdLine == "" {
+			continue
+		}
+
+		// Handle exit/quit
+		if cmdLine == "exit" || cmdLine == "quit" {
+			fmt.Fprintln(channel, "exit")
+			break
+		}
+
+		// Handle cd command
+		if cmdLine == "cd" || strings.HasPrefix(cmdLine, "cd ") || strings.HasPrefix(cmdLine, "cd\t") {
+			parts := strings.Fields(cmdLine)
+			if len(parts) == 1 {
+				if home, err := os.UserHomeDir(); err == nil {
+					cwd = home
+				}
+			} else {
+				target := parts[1]
+				if target == "~" {
+					if home, err := os.UserHomeDir(); err == nil {
+						target = home
+					}
+				}
+				if !strings.HasPrefix(target, "\\") && !strings.Contains(target, ":") {
+					target = cwd + "\\" + target
+				}
+				target = strings.ReplaceAll(target, "/", "\\")
+				if info, err := os.Stat(target); err == nil && info.IsDir() {
+					cwd = target
+				} else {
+					fmt.Fprintf(channel, "The system cannot find the path specified: %s\r\n", target)
+				}
+			}
+			continue
+		}
+
+		// Execute command via cmd.exe /C with UTF-8 output
+		cmd := exec.Command("cmd.exe", "/C", "chcp 65001 >nul 2>&1 & "+cmdLine)
+		if u, err := user.Lookup(username); err == nil {
+			setCmdUser(cmd, u, username)
+		}
+		cmd.Dir = cwd
+		cmd.Stdout = channel
+		cmd.Stderr = channel
+		cmd.Stdin = nil
+
+		err := cmd.Run()
+		if err != nil {
+			log.Printf("SSH: command exited: %v", err)
+		}
+	}
+
+done:
+	exitCode := 0
 	if w, ok := channel.(interface{ CloseWrite() error }); ok {
 		_ = w.CloseWrite()
 	}
