@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -54,8 +53,51 @@ func startInteractiveShell(channel ssh.Channel, shell, username string, cols, ro
 		return
 	}
 
-	go func() { io.Copy(ptmx, channel) }()
-	go func() { io.Copy(channel, ptmx) }()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := channel.Read(buf)
+			if err != nil {
+				break
+			}
+			// Filter DSR (Device Status Report) escape sequences
+			data := buf[:n]
+			// Remove \x1b[6n, \x1b[5n, \x1b[0n
+			filtered := make([]byte, 0, n)
+			i := 0
+			for i < len(data) {
+				if data[i] == 0x1b && i+3 < len(data) && data[i+1] == '[' && data[i+3] == 'n' && (data[i+2] == '6' || data[i+2] == '5' || data[i+2] == '0') {
+					i += 4
+					continue
+				}
+				filtered = append(filtered, data[i])
+				i++
+			}
+			ptmx.Write(filtered)
+		}
+	}()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptmx.Read(buf)
+			if err != nil {
+				break
+			}
+			data := buf[:n]
+			// Filter [6n, [5n, [0n from output (DSR noise)
+			filtered := make([]byte, 0, n)
+			i := 0
+			for i < len(data) {
+				if data[i] == 0x1b && i+3 < len(data) && data[i+1] == '[' && data[i+3] == 'n' && (data[i+2] == '6' || data[i+2] == '5' || data[i+2] == '0') {
+					i += 4
+					continue
+				}
+				filtered = append(filtered, data[i])
+				i++
+			}
+			channel.Write(filtered)
+		}
+	}()
 
 	err = cmd.Wait()
 	log.Printf("SSH: shell exited: %v", err)

@@ -156,15 +156,19 @@ func sshClientCmd(c *cli.Context) error {
 
 	// Terminal setup for interactive mode
 	if command == "" {
+		enableVTProcessing()
 		fd := int(os.Stdin.Fd())
 		oldState, err := term.MakeRaw(fd)
 		if err == nil {
 			defer term.Restore(fd, oldState)
 		}
 		modes := ssh.TerminalModes{ssh.ECHO: 1}
-		w, h, _ := term.GetSize(fd)
-		if w == 0 {
-			w, h = 80, 24
+		w, h := getTerminalSize()
+		if w == 0 || h == 0 {
+			w, h, _ = term.GetSize(fd)
+		}
+		if w == 0 || h == 0 {
+			w, h = 120, 30
 		}
 		session.RequestPty("xterm-256color", h, w, modes)
 	}

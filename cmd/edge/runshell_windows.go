@@ -17,7 +17,13 @@ import (
 
 func startInteractiveShell(channel ssh.Channel, shell, username string, cols, rows uint32) {
 	log.Printf("SSH: shell request for user=%s", username)
-	interactiveShellWindows(channel, username)
+	startInteractiveShellConPTY(channel, cols, rows)
+	// Send exit status
+	if w, ok := channel.(interface{ CloseWrite() error }); ok {
+		_ = w.CloseWrite()
+	}
+	_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+	_ = channel.Close()
 }
 
 func interactiveShellWindows(channel ssh.Channel, username string) {
@@ -39,6 +45,23 @@ func interactiveShellWindows(channel ssh.Channel, username string) {
 			if err != nil {
 				// Connection closed
 				goto done
+			}
+			if b == 0x1b { // ESC - handle escape sequence (DSR, cursor, etc.)
+				var seq []byte
+				seq = append(seq, b)
+				for {
+					next, err := reader.ReadByte()
+					if err != nil {
+						goto done
+					}
+					seq = append(seq, next)
+					if (next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') || next == '~' {
+						break
+					}
+				}
+				// Silently consume; log for debug
+				log.Printf("SSH: consumed escape seq")
+				continue
 			}
 			if b == '\n' || b == '\r' {
 				// Echo newline
@@ -69,7 +92,11 @@ func interactiveShellWindows(channel ssh.Channel, username string) {
 			continue
 		}
 
+		// Strip any remaining escape sequences from input
 		cmdLine := strings.TrimSpace(string(line))
+		cmdLine = strings.ReplaceAll(cmdLine, "\x1b[6n", "")
+		cmdLine = strings.ReplaceAll(cmdLine, "\x1b[5n", "")
+		cmdLine = strings.ReplaceAll(cmdLine, "\x1b[0n", "")
 		if cmdLine == "" {
 			continue
 		}
@@ -109,6 +136,7 @@ func interactiveShellWindows(channel ssh.Channel, username string) {
 
 		// Execute command via cmd.exe /C with UTF-8 output
 		cmd := exec.Command("cmd.exe", "/C", "chcp 65001 >nul 2>&1 & "+cmdLine)
+		cmd.Env = append(os.Environ(), "TERM=dumb", "NO_COLOR=1")
 		if u, err := user.Lookup(username); err == nil {
 			setCmdUser(cmd, u, username)
 		}
