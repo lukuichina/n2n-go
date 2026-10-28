@@ -65,8 +65,8 @@ func buildAuthMethods(password, identityPath string) ([]ssh.AuthMethod, error) {
 
 // sshClientCommand implements `edge ssh [user@]host[:port] [command]`
 var sshClientCommand = &cli.Command{
-	Name:  "ssh",
-	Usage: "SSH to a peer edge (interactive shell or remote command)",
+	Name:      "ssh",
+	Usage:     "SSH to a peer edge (interactive shell or remote command)",
 	ArgsUsage: "[user@]host[:port] [command]",
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "user", Aliases: []string{"l"}, Value: "root", Usage: "SSH username"},
@@ -101,8 +101,13 @@ func sshClientCmd(c *cli.Context) error {
 		host = target[idx+1:]
 	}
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		fmt.Sscanf(host[idx+1:], "%d", &port)
-		host = host[:idx]
+		portStr := host[idx+1:]
+		var portNum int
+		n, _ := fmt.Sscanf(portStr, "%d", &portNum)
+		if n == 1 && portNum > 0 {
+			port = portNum
+			host = host[:idx]
+		}
 	}
 
 	password := c.String("password")
@@ -208,8 +213,8 @@ func sshClientCmd(c *cli.Context) error {
 
 // scpClientCommand implements `edge scp source dest`
 var scpClientCommand = &cli.Command{
-	Name:  "scp",
-	Usage: "Copy files to/from a peer edge via SCP",
+	Name:      "scp",
+	Usage:     "Copy files to/from a peer edge via SCP",
 	ArgsUsage: "source dest  (source/dest: [user@]host[:port]:path or local path)",
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "user", Aliases: []string{"l"}, Value: "root", Usage: "SSH username"},
@@ -281,9 +286,17 @@ func scpClientCmd(c *cli.Context) error {
 			remotePath = rest
 			host = host[:idx]
 		} else {
-			// Could be host:port (no path) - shouldn't happen
-			fmt.Sscanf(rest, "%d", &port)
-			host = host[:idx]
+			// Try to parse as port number; if it fails, treat as relative path
+			var portNum int
+			n, _ := fmt.Sscanf(rest, "%d", &portNum)
+			if n == 1 && portNum > 0 {
+				port = portNum
+				host = host[:idx]
+			} else {
+				// Relative path (e.g., "a.txt")
+				remotePath = rest
+				host = host[:idx]
+			}
 		}
 	}
 
@@ -502,8 +515,8 @@ func scpUploadDir(sftpClient *sftp.Client, localDir, remoteDir string) error {
 
 // sftpClientCommand implements `edge sftp [user@]host[:port]`
 var sftpClientCommand = &cli.Command{
-	Name:  "sftp",
-	Usage: "Interactive SFTP to a peer edge, or copy files (source dest)",
+	Name:      "sftp",
+	Usage:     "Interactive SFTP to a peer edge, or copy files (source dest)",
 	ArgsUsage: "[user@]host[:port] [command] | source dest",
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "user", Aliases: []string{"l"}, Value: "root", Usage: "SSH username"},
@@ -512,6 +525,23 @@ var sftpClientCommand = &cli.Command{
 		&cli.StringFlag{Name: "identity", Aliases: []string{"i"}, Usage: "Path to SSH private key file"},
 	},
 	Action: sftpClientCmd,
+}
+
+// resolveSftpPath resolves a path against the current directory.
+func resolveSftpPath(curDir, path string) string {
+	if curDir == "." {
+		curDir = "/"
+	}
+	if path == "." {
+		return curDir
+	}
+	if strings.HasPrefix(path, "/") {
+		return path
+	}
+	if curDir == "/" {
+		return "/" + path
+	}
+	return curDir + "/" + path
 }
 
 func sftpClientCmd(c *cli.Context) error {
@@ -532,17 +562,22 @@ func sftpClientCmd(c *cli.Context) error {
 	}
 
 	target := c.Args().First()
-	user := "root"
+	user := c.String("user")
 	host := target
-	port := 22
+	port := c.Int("port")
 
 	if idx := strings.Index(target, "@"); idx != -1 {
 		user = target[:idx]
 		host = target[idx+1:]
 	}
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		fmt.Sscanf(host[idx+1:], "%d", &port)
-		host = host[:idx]
+		portStr := host[idx+1:]
+		var portNum int
+		n, _ := fmt.Sscanf(portStr, "%d", &portNum)
+		if n == 1 && portNum > 0 {
+			port = portNum
+			host = host[:idx]
+		}
 	}
 
 	password := c.String("password")
@@ -590,6 +625,11 @@ func sftpClientCmd(c *cli.Context) error {
 
 	// Interactive SFTP shell
 	fmt.Println("SFTP connected. Type 'help' for commands, 'exit' to quit.")
+	// Track current remote directory; resolve "." against server working dir
+	curDir := "."
+	if rp, err := sftpClient.RealPath("."); err == nil {
+		curDir = rp
+	}
 	// Simple REPL
 	scanner := newScanner(os.Stdin)
 	for {
@@ -616,9 +656,9 @@ func sftpClientCmd(c *cli.Context) error {
 		parts := strings.Fields(line)
 		switch parts[0] {
 		case "ls":
-			path := "."
+			path := curDir
 			if len(parts) > 1 {
-				path = parts[1]
+				path = resolveSftpPath(curDir, parts[1])
 			}
 			entries, err := sftpClient.ReadDir(path)
 			if err != nil {
@@ -633,13 +673,26 @@ func sftpClientCmd(c *cli.Context) error {
 				fmt.Println("usage: cd path")
 				continue
 			}
-			fmt.Println("cd: not supported in this version, use absolute paths")
+			newPath := resolveSftpPath(curDir, parts[1])
+			// Verify it's a directory
+			info, err := sftpClient.Stat(newPath)
+			if err != nil {
+				fmt.Println("error:", err)
+				continue
+			}
+			if !info.IsDir() {
+				fmt.Println("error: not a directory")
+				continue
+			}
+			curDir = newPath
+			fmt.Println("Changed to", curDir)
 		case "get":
 			if len(parts) < 3 {
 				fmt.Println("usage: get remote local")
 				continue
 			}
-			src, _ := sftpClient.Open(parts[1])
+			remotePath := resolveSftpPath(curDir, parts[1])
+			src, _ := sftpClient.Open(remotePath)
 			defer src.Close()
 			dst, err := os.Create(parts[2])
 			if err != nil {
@@ -660,7 +713,7 @@ func sftpClientCmd(c *cli.Context) error {
 				continue
 			}
 			defer src.Close()
-			dst, err := sftpClient.Create(parts[2])
+			dst, err := sftpClient.Create(resolveSftpPath(curDir, parts[2]))
 			if err != nil {
 				fmt.Println("error:", err)
 				continue

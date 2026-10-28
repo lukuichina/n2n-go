@@ -209,7 +209,9 @@ func handleSSHConnection(conn net.Conn, config *ssh.ServerConfig) {
 				var sub struct{ Name string }
 				if err := ssh.Unmarshal(req.Payload, &sub); err == nil && strings.ToLower(sub.Name) == "sftp" {
 					req.Reply(true, nil)
-					srv, err := sftp.NewServer(ch)
+					exePath, _ := os.Executable()
+					workDir := filepath.Dir(exePath)
+					srv, err := sftp.NewServer(ch, sftp.WithServerWorkingDirectory(workDir))
 					if err != nil {
 						log.Printf("sftp server: %v", err)
 						ch.Close()

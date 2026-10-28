@@ -144,6 +144,10 @@ Supports password and public key authentication, shell, exec, scp, and sftp.
 # SFTP (interactive or command execution)
 ./edge sftp [user@]host[:port] [command]
 ./edge sftp source dest
+
+Interactive SFTP shell supports `cd`, `ls`, `get`, `put`, and `exit` commands.
+Relative paths are resolved against the current directory (which defaults to the
+edge binary's directory on the server). Absolute paths are also supported.
 ```
 
 **ssh flags:**
@@ -153,6 +157,10 @@ Supports password and public key authentication, shell, exec, scp, and sftp.
 | `--user` | `-l` | SSH username | `root` |
 | `--port` | `-p` | SSH port | `22` |
 | `--password` | `-w` | SSH password | - |
+| `--identity` | `-i` | Path to SSH private key file | - |
+| `--keepalive` | - | Keepalive interval in seconds (0 to disable) | `30` |
+
+Supports `[user@]host[:port]` format and remote command execution. Supports IPv6 addresses.
 
 **scp flags:**
 
@@ -161,7 +169,23 @@ Supports password and public key authentication, shell, exec, scp, and sftp.
 | `--user` | `-l` | SSH username | `root` |
 | `--port` | `-P` | SSH port | `22` |
 | `--password` | `-w` | SSH password | - |
+| `--identity` | `-i` | Path to SSH private key file | - |
+| `--recursive` | `-r` | Recursively copy entire directories | `false` |
 
+Supports `[user@]host[:port]` format for remote paths. Supports directory transfer with `-r`.
+
+**sftp flags:**
+
+| Flag | Alias | Description | Default |
+|------|-------|-------------|---------|
+| `--user` | `-l` | SSH username | `root` |
+| `--port` | `-P` | SSH port | `22` |
+| `--password` | `-w` | SSH password | - |
+| `--identity` | `-i` | Path to SSH private key file | - |
+
+Interactive SFTP shell supports `cd`, `ls`, `get`, `put`, and `exit` commands.
+Relative paths are resolved against the current directory (which defaults to the
+edge binary's directory on the server). Absolute paths are also supported.
 Supports `[user@]host[:port]` format for remote paths.
 
 ## Configuration
