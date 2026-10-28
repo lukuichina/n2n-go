@@ -17,7 +17,8 @@ import (
 
 func startInteractiveShell(channel ssh.Channel, shell, username string, cols, rows uint32) {
 	log.Printf("SSH: shell request for user=%s", username)
-	startInteractiveShellConPTY(channel, cols, rows)
+	// Use simple cmd.exe approach for reliable output
+	interactiveShellWindows(channel, username)
 	// Send exit status
 	if w, ok := channel.(interface{ CloseWrite() error }); ok {
 		_ = w.CloseWrite()

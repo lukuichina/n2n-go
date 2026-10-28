@@ -28,6 +28,12 @@ func startInteractiveShellConPTY(channel io.ReadWriter, cols, rows uint32) {
 
 	// Create pseudo console
 	var console windows.Handle
+	if cols == 0 {
+		cols = 120
+	}
+	if rows == 0 {
+		rows = 30
+	}
 	size := windows.Coord{X: int16(cols), Y: int16(rows)}
 	if err := windows.CreatePseudoConsole(size, inRead, outWrite, 0, &console); err != nil {
 		fmt.Fprintf(channel, "CreatePseudoConsole: %v\r\n", err)
