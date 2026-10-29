@@ -439,6 +439,7 @@ func up(c *cli.Context) {
 		os.Exit(0)
 	}()
 
+	client.SSHEnabled = c.Bool("ssh")
 	if err := client.InitialSetup(); err != nil {
 		log.Printf("edge setup failed: %v", err)
 		client.Close()

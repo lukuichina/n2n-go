@@ -77,6 +77,7 @@ type EdgeClient struct {
 	VirtualIP       string
 	ParsedVirtualIP net.IP
 	MACAddr         net.HardwareAddr
+	SSHEnabled      bool
 
 	machineId      []byte
 	predictableMac net.HardwareAddr

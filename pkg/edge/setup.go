@@ -470,6 +470,9 @@ func (e *EdgeClient) RequestRegister() error {
 	if e.WSSTransport != nil {
 		p2pCapabilities = append(p2pCapabilities, "wss")
 	}
+	if e.SSHEnabled {
+		p2pCapabilities = append(p2pCapabilities, "ssh")
+	}
 
 	// pubSocketString() has the side effect of populating e.NatFeature
 	// via STUN discovery. It MUST be called before the natType check below.
