@@ -381,12 +381,13 @@ func scpClientCmd(c *cli.Context) error {
 		}
 		defer dstFile.Close()
 		pw := &progressWriter{total: fi.Size(), label: remoteSpec}
-		n, err := io.Copy(io.MultiWriter(dstFile, pw), srcFile)
+		buf := make([]byte, 1024*1024)
+		n, err := io.CopyBuffer(io.MultiWriter(dstFile, pw), srcFile, buf)
 		fmt.Fprintln(os.Stderr)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s -> %s (%d bytes)\n", remoteSpec, localPath, n)
+		fmt.Printf("%s -> %s (%s bytes)\n", remoteSpec, localPath, formatInt(n))
 	} else {
 		// Check if local path is a directory
 		localInfo, err := os.Stat(localPath)
@@ -398,24 +399,51 @@ func scpClientCmd(c *cli.Context) error {
 			// Recursive upload
 			return scpUploadDir(sftpClient, localPath, remotePath)
 		}
+		// If remote path is a directory (ends with / or exists as dir), append filename
+		if strings.HasSuffix(remotePath, "/") {
+			parts := strings.Split(localPath, "/")
+			name := parts[len(parts)-1]
+			// Handle backslash paths on Windows
+			if strings.Contains(name, "\\") {
+				bparts := strings.Split(localPath, "\\")
+				name = bparts[len(bparts)-1]
+			}
+			remotePath = remotePath + name
+		} else {
+			// Check if remote path exists as a directory
+			if info, err := sftpClient.Stat(remotePath); err == nil && info.IsDir() {
+				parts := strings.Split(localPath, "/")
+				name := parts[len(parts)-1]
+				if strings.Contains(name, "\\") {
+					bparts := strings.Split(localPath, "\\")
+					name = bparts[len(bparts)-1]
+				}
+				if strings.HasSuffix(remotePath, "/") {
+					remotePath = remotePath + name
+				} else {
+					remotePath = remotePath + "/" + name
+				}
+			}
+		}
 		srcFile, err := os.Open(localPath)
 		if err != nil {
 			return fmt.Errorf("open local: %w", err)
 		}
 		defer srcFile.Close()
 		fi, _ := srcFile.Stat()
-		dstFile, err := sftpClient.Create(remotePath)
+		dstFile, err := sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 		if err != nil {
 			return fmt.Errorf("create remote: %w", err)
 		}
 		defer dstFile.Close()
 		pw := &progressWriter{total: fi.Size(), label: localPath}
-		n, err := io.Copy(io.MultiWriter(dstFile, pw), srcFile)
+		buf := make([]byte, 1024*1024)
+		n, err := io.CopyBuffer(io.MultiWriter(dstFile, pw), srcFile, buf)
 		fmt.Fprintln(os.Stderr)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s -> %s (%d bytes)\n", localPath, remoteSpec, n)
+		fmt.Printf("%s -> %s (%s bytes)\n", localPath, remoteSpec, formatInt(n))
 	}
 	return nil
 }
@@ -425,18 +453,73 @@ type progressWriter struct {
 	total   int64
 	written int64
 	label   string
+	start   time.Time
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
 	n := len(b)
+	if p.start.IsZero() {
+		p.start = time.Now()
+	}
 	p.written += int64(n)
+	elapsed := time.Since(p.start)
 	if p.total > 0 {
 		pct := float64(p.written) / float64(p.total) * 100
-		fmt.Fprintf(os.Stderr, "\r%s: %d/%d bytes (%.1f%%)", p.label, p.written, p.total, pct)
+		speed := float64(p.written) / elapsed.Seconds()
+		eta := time.Duration(0)
+		if speed > 0 {
+			remaining := float64(p.total-p.written) / speed
+			eta = time.Duration(remaining * float64(time.Second))
+		}
+		fmt.Fprintf(os.Stderr, "\r%s  %3.0f%%  %s  %.1fKB/s  %s  ETA %s\033[K",
+			p.label, pct, formatBytes(p.written), speed/1024,
+			formatDuration(elapsed), formatDuration(eta))
 	} else {
-		fmt.Fprintf(os.Stderr, "\r%s: %d bytes", p.label, p.written)
+		speed := float64(p.written) / elapsed.Seconds()
+		fmt.Fprintf(os.Stderr, "\r%s  %s  %.1fKB/s  %s\033[K",
+			p.label, formatBytes(p.written), speed/1024, formatDuration(elapsed))
 	}
 	return n, nil
+}
+
+func formatInt(n int64) string {
+	s := fmt.Sprintf("%d", n)
+	// Add commas
+	var result []byte
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, byte(c))
+	}
+	return string(result)
+}
+
+func formatBytes(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%dB", n)
+	}
+	if n < 1024*1024 {
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	}
+	if n < 1024*1024*1024 {
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	}
+	return fmt.Sprintf("%.1fGB", float64(n)/(1024*1024*1024))
+}
+
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
 // scpDownloadDir recursively downloads a remote directory.
@@ -465,13 +548,14 @@ func scpDownloadDir(sftpClient *sftp.Client, remoteDir, localDir string) error {
 				srcFile.Close()
 				return err
 			}
-			n, err := io.Copy(dstFile, srcFile)
+			buf := make([]byte, 1024*1024)
+			n, err := io.CopyBuffer(dstFile, srcFile, buf)
 			srcFile.Close()
 			dstFile.Close()
 			if err != nil {
 				return err
 			}
-			fmt.Printf("%s -> %s (%d bytes)\n", remotePath, localPath, n)
+			fmt.Printf("%s -> %s (%s bytes)\n", remotePath, localPath, formatInt(n))
 		}
 	}
 	fmt.Printf("directory %s downloaded\n", remoteDir)
@@ -499,18 +583,19 @@ func scpUploadDir(sftpClient *sftp.Client, localDir, remoteDir string) error {
 			if err != nil {
 				return err
 			}
-			dstFile, err := sftpClient.Create(remotePath)
+			dstFile, err := sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 			if err != nil {
 				srcFile.Close()
 				return err
 			}
-			n, err := io.Copy(dstFile, srcFile)
+			buf := make([]byte, 1024*1024)
+			n, err := io.CopyBuffer(dstFile, srcFile, buf)
 			srcFile.Close()
 			dstFile.Close()
 			if err != nil {
 				return err
 			}
-			fmt.Printf("%s -> %s (%d bytes)\n", localPath, remotePath, n)
+			fmt.Printf("%s -> %s (%s bytes)\n", localPath, remotePath, formatInt(n))
 		}
 	}
 	fmt.Printf("directory %s uploaded\n", localDir)
@@ -704,8 +789,9 @@ func sftpClientCmd(c *cli.Context) error {
 				continue
 			}
 			defer dst.Close()
-			n, _ := io.Copy(dst, src)
-			fmt.Printf("downloaded %d bytes\n", n)
+			buf := make([]byte, 1024*1024)
+			n, _ := io.CopyBuffer(dst, src, buf)
+			fmt.Printf("downloaded %s bytes\n", formatInt(n))
 		case "put":
 			if len(parts) < 3 {
 				fmt.Println("usage: put local remote")
@@ -717,14 +803,15 @@ func sftpClientCmd(c *cli.Context) error {
 				continue
 			}
 			defer src.Close()
-			dst, err := sftpClient.Create(resolveSftpPath(curDir, parts[2]))
+			dst, err := sftpClient.OpenFile(resolveSftpPath(curDir, parts[2]), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 			if err != nil {
 				fmt.Println("error:", err)
 				continue
 			}
 			defer dst.Close()
-			n, _ := io.Copy(dst, src)
-			fmt.Printf("uploaded %d bytes\n", n)
+			buf := make([]byte, 1024*1024)
+			n, _ := io.CopyBuffer(dst, src, buf)
+			fmt.Printf("uploaded %s bytes\n", formatInt(n))
 		default:
 			fmt.Println("unknown command:", parts[0])
 		}
