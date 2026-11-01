@@ -178,6 +178,10 @@ var (
 				Name:  "socks5-auth",
 				Usage: "Require username/password authentication, as `user:pass`. Without it the proxy offers the SOCKS5 'no authentication required' method",
 			},
+			&cli.StringFlag{
+				Name:  "sni-address",
+				Usage: "Override SNI (Server Name Indication) for TLS handshake. Defaults to the hostname from -s/--supernode URL",
+			},
 		},
 		// Positional arg: supernode URL shortcut
 		// Usage: ./edge up wss://host/n2n -l
@@ -262,6 +266,25 @@ func up(c *cli.Context) {
 
 	if c.IsSet("proxy-url") {
 		cfg.ProxyURL = c.String("proxy-url")
+	}
+
+	if c.IsSet("sni-address") {
+		cfg.SNIAddress = c.String("sni-address")
+	} else if cfg.SupernodeURL != "" {
+		// Default SNI to the hostname from the supernode URL
+		u := cfg.SupernodeURL
+		if strings.HasPrefix(u, "wss://") {
+			u = strings.TrimPrefix(u, "wss://")
+		} else if strings.HasPrefix(u, "ws://") {
+			u = strings.TrimPrefix(u, "ws://")
+		}
+		if idx := strings.Index(u, "/"); idx >= 0 {
+			u = u[:idx]
+		}
+		if idx := strings.Index(u, ":"); idx >= 0 {
+			u = u[:idx]
+		}
+		cfg.SNIAddress = u
 	}
 
 	// Not gated on IsSet: this one has a non-zero default in the other

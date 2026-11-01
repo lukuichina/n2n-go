@@ -104,6 +104,7 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			SkipVerify:   true, // TODO: Make this configurable
 			ReadTimeout:  90 * time.Second,
 			WriteTimeout: 90 * time.Second,
+			SNIAddress:   cfg.SNIAddress,
 		}
 
 		if cfg.WSSCert != "" && cfg.WSSKey != "" {

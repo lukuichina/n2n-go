@@ -144,6 +144,7 @@ type Config struct {
 	WSSEnabled   bool   `mapstructure:"wss_enabled"`
 	ProxyURL     string `mapstructure:"proxy_url" env:"N2N_PROXY_URL"`
 	PreferIPv6   bool   `mapstructure:"prefer_ipv6" env:"N2N_PREFER_IPV6"`
+	SNIAddress   string `mapstructure:"sni_address" env:"N2N_SNI_ADDRESS"`
 
 	// P2P configuration
 	P2PListenAddr string `mapstructure:"p2p_listen_addr"`

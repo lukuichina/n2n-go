@@ -36,6 +36,7 @@ type WSSTransportConfig struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	ProxyURL     string // http://, https://, socks5://, or socks5s://
+	SNIAddress   string // Override SNI (Server Name Indication) for TLS handshake. Defaults to URL hostname.
 
 	// PreferIPv6 selects the address family to dial first. The default is
 	// false, meaning IPv4 first with IPv6 used only when IPv4 is unusable;
@@ -58,6 +59,9 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: config.SkipVerify,
 			MinVersion:         tls.VersionTLS12,
+		}
+		if config.SNIAddress != "" {
+			tlsConfig.ServerName = config.SNIAddress
 		}
 
 		if config.CertFile != "" && config.KeyFile != "" {
@@ -96,7 +100,19 @@ func NewWSSTransport(config *WSSTransportConfig) (*WSSTransport, error) {
 		dialer.NetDialContext = NewFamilyDialContext(config.PreferIPv6)
 	}
 
-	conn, resp, err := dialer.Dial(config.URL, nil)
+	// When SNIAddress is set and the URL host is an IP, use SNIAddress as
+	// the HTTP Host header so CDN/reverse-proxy can route correctly.
+	headers := http.Header{}
+	if config.SNIAddress != "" {
+		u, _ := url.Parse(config.URL)
+		if u != nil {
+			host := u.Hostname()
+			if ip := net.ParseIP(host); ip != nil {
+				headers.Set("Host", config.SNIAddress)
+			}
+		}
+	}
+	conn, resp, err := dialer.Dial(config.URL, headers)
 	if err != nil {
 		errMsg := fmt.Sprintf("WS/WSS dial failed: %v", err)
 		if resp != nil {
