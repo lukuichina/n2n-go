@@ -273,8 +273,22 @@ func (s *Supernode) startWSListener() {
 	}
 }
 
+// isWebSocketUpgrade checks if the request is a WebSocket upgrade request.
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
 // handleWSUpgrade handles WebSocket upgrade requests (plain text)
 func (s *Supernode) handleWSUpgrade(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a WebSocket upgrade request
+	if !isWebSocketUpgrade(r) {
+		// Non-WebSocket request (e.g., health check, probe) — respond with 200 OK
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true // Allow all origins
@@ -304,6 +318,13 @@ func (s *Supernode) handleWSUpgrade(w http.ResponseWriter, r *http.Request) {
 
 // handleWSSUpgrade handles WebSocket upgrade requests
 func (s *Supernode) handleWSSUpgrade(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a WebSocket upgrade request
+	if !isWebSocketUpgrade(r) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+
 	log.Printf("Supernode: WSS upgrade request from %s, path: %s", r.RemoteAddr, r.URL.Path)
 	log.Printf("Supernode: WSS headers: Connection=%s, Upgrade=%s, Sec-WebSocket-Version=%s, Sec-WebSocket-Key=%s",
 		r.Header.Get("Connection"),
