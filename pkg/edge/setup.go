@@ -60,6 +60,9 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			if strings.HasPrefix(host, "ws://") {
 				host = strings.TrimPrefix(host, "ws://")
 			}
+			if idx := strings.Index(host, "?"); idx >= 0 {
+				host = host[:idx]
+			}
 			if idx := strings.Index(host, "/"); idx >= 0 {
 				host = host[:idx]
 			}
@@ -128,6 +131,9 @@ func setupNetworkComponents(cfg Config, tapcfg tuntap.Config) (*net.UDPConn, *tr
 			host = cfg.SupernodeURL
 			if strings.HasPrefix(host, "wss://") {
 				host = strings.TrimPrefix(host, "wss://")
+			}
+			if idx := strings.Index(host, "?"); idx >= 0 {
+				host = host[:idx]
 			}
 			if idx := strings.Index(host, "/"); idx >= 0 {
 				host = host[:idx]
